@@ -17,6 +17,7 @@
 #include <QGuiApplication>
 #include <QDir>
 #include <QFile>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QStandardPaths>
 #include <QLocale>
@@ -29,6 +30,7 @@
 #include <QTimer>
 
 #include <kmime/content.h>
+#include <kmime/headerparsing.h>
 #include <kmime/message.h>
 #include <kmime/types.h>
 #include <kmime/util.h>
@@ -701,6 +703,21 @@ void MailClient::setUpMaintenance()
     });
     connect(m_jobs, &MaintenanceScheduler::folderOpsFinished, this,
             &MailClient::invalidateMissingBodies);
+    connect(m_jobs, &MaintenanceScheduler::sortPageReady, this,
+            [this](const QString &scopedFolder, int column, bool descending, bool append,
+                   const QList<MessageListModel::Header> &rows) {
+        // The worker slot is free either way — even when the page below turns
+        // out to be stale, the next ask may go out.
+        m_sortPageInFlight = false;
+        // Sorting the folder takes long enough that the user can have clicked
+        // another column, or another folder, before the page lands. Either
+        // makes it a page of something that is no longer showing.
+        if (column != m_sortColumn || descending != m_sortDescending || m_searchActive
+            || scopedFolder != m_store.scopedKey(m_selectedFolder)
+            || !m_sync->sortedBrowse())
+            return;
+        applySortPage(append, rows);
+    });
     connect(m_jobs, &MaintenanceScheduler::unreadCountsReady, this,
             [this](const QHash<QString, QHash<QString, int>> &counts) {
         m_unreadByAccount = counts;
@@ -892,12 +909,40 @@ void MailClient::setDebugLogging(bool on)
 {
     m_debugLogging = on;
     appSettings().setValue(QStringLiteral("ui/debugLogging"), on);
+    applyLogFilterRules(on);
+    Q_EMIT debugLoggingChanged();
+}
+
+void MailClient::applyLogFilterRules(bool on)
+{
     // Rules, not a boolean check at each call site: disabled categories cost
     // nothing, and QT_LOGGING_RULES in the environment still wins for a
-    // developer who wants the trace without touching the setting.
-    QLoggingCategory::setFilterRules(on ? QStringLiteral("mailo.trace.debug=true")
-                                        : QStringLiteral("mailo.trace.debug=false"));
-    Q_EMIT debugLoggingChanged();
+    // developer who wants the trace without touching the setting. Static, and
+    // called at the top of main() as well: the PSL cache loads (and logs)
+    // during construction, before the settings-driven call here could quiet
+    // it.
+    //
+    // Quiet means quiet — for everyone. mailo's own categories were gated one
+    // by one until the console showed it was a losing game: KIMAP warns about
+    // sessions mailo itself closes and about keepalive lines no job owns, the
+    // viewer's page chats through "js" (its CSP blocks arrive at *error*
+    // severity, hence js.critical below), the PSL loader and wipe breadcrumbs
+    // debug by default. So logging off blankets every category's debug, info
+    // and warning. Critical stays: something exceptional enough to be
+    // critical should print even in quiet mode — except "js", where the
+    // severity is chosen by the sender's HTML, not by anything being wrong
+    // with mailo. Logging on lifts the blanket and turns the trace on.
+    QLoggingCategory::setFilterRules(on ? QStringLiteral("mailo.trace.debug=true\n"
+                                                         "mailo.psl.debug=true\n"
+                                                         "mailo.wipe.debug=true\n"
+                                                         "js.debug=true\n"
+                                                         "js.info=true\n"
+                                                         "js.warning=true\n"
+                                                         "js.critical=true")
+                                        : QStringLiteral("*.debug=false\n"
+                                                         "*.info=false\n"
+                                                         "*.warning=false\n"
+                                                         "js.critical=false"));
 }
 
 void MailClient::setMaxBodyMB(int mb)
@@ -1531,8 +1576,8 @@ void MailClient::importThunderbird(const QUrl &dir)
         m_importThread->deleteLater();
         m_importThread = nullptr;
     });
-    m_importThread->setPriority(QThread::LowPriority);
-    m_importThread->start();
+    // Priority goes to start(); setPriority() before it only warns.
+    m_importThread->start(QThread::LowPriority);
 }
 
 void MailClient::switchAccount(int index)
@@ -1620,36 +1665,75 @@ std::shared_ptr<KMime::Message> MailClient::composeMessage(
     const QString &html, const QList<QUrl> &attachments, bool strict,
     QStringList *toOut, QStringList *ccOut, QStringList *bccOut)
 {
-    // Defense against header/SMTP-command injection: no CR/LF survives, and
-    // every recipient must look like a bare address.
+    // Defense against header/SMTP-command injection: no CR/LF survives into a
+    // header. Everything past that is KMime's RFC 5322 address parser rather
+    // than a pattern of our own — it splits the list on the commas that
+    // actually separate addresses, keeps "Display Name <addr>" together
+    // (including a comma inside a quoted display name), and rejects what is
+    // not an address at all. \a hdr is filled with what was typed, display
+    // names and their encoding included; the returned bare addresses are what
+    // the SMTP envelope and the PGP key lookup want, since neither has any use
+    // for a display name.
     static const QRegularExpression crlfRe(QStringLiteral("[\\r\\n]"));
-    static const QRegularExpression addrRe(
-        QStringLiteral("^[^@\\s<>,;\"]+@[^@\\s<>,;\"]+\\.[^@\\s<>,;\"]+$"));
-    auto parseAddresses = [this, strict](QString raw, bool *ok) -> QStringList {
+    auto msg = std::make_shared<KMime::Message>();
+    auto parseAddresses = [this, strict, &msg](QString raw,
+                                               KMime::Headers::Generics::AddressList *hdr,
+                                               const char *headerName, bool *ok) -> QStringList {
         raw.remove(crlfRe);
-        QStringList out;
+        raw = raw.trimmed();
         *ok = true;
-        const QStringList parts = raw.split(QLatin1Char(','), Qt::SkipEmptyParts);
-        for (const QString &part : parts) {
-            const QString addr = part.trimmed();
-            if (!addrRe.match(addr).hasMatch() && strict) {
-                Q_EMIT sendFailed(tr("Invalid recipient address: %1").arg(addr));
+        QStringList out;
+        if (raw.isEmpty())
+            return out;
+        // Two steps because they answer two questions. parseAddressList says
+        // whether the whole list is well-formed — it returns false on a
+        // half-typed "john" where the header parse would just quietly drop it,
+        // which is the difference between refusing to send and sending to
+        // fewer people than the user typed.
+        const QByteArray bytes = raw.toUtf8();
+        const char *cursor = bytes.constData();
+        QList<KMime::Types::Address> parsed;
+        if (!KMime::HeaderParsing::parseAddressList(cursor, cursor + bytes.size(), parsed)) {
+            if (strict) {
+                Q_EMIT sendFailed(tr("Invalid recipient address: %1").arg(raw));
                 *ok = false;
                 return {};
             }
-            out.append(addr);
+            // A draft is saved from whatever is on screen, an address halfway
+            // through being typed included. An address header will not hold
+            // text that is not an address, so the draft keeps it as an
+            // unstructured one — losing what the user typed is the one thing a
+            // draft must not do.
+            auto literal = std::make_unique<KMime::Headers::Generic>(headerName);
+            literal->fromUnicodeString(raw);
+            msg->setHeader(std::move(literal));
+            return out;
+        }
+        // The header parse is the one that gets used, because unlike the raw
+        // byte parse above it knows the text is UTF-8 and encodes a non-ASCII
+        // display name accordingly instead of mangling it into latin1.
+        hdr->fromUnicodeString(raw);
+        for (const KMime::Types::Mailbox &mb : hdr->mailboxes()) {
+            if (mb.hasAddress())
+                out.append(QString::fromUtf8(mb.address()));
         }
         return out;
     };
 
     bool ok = false;
-    const QStringList toList = parseAddresses(to, &ok);
+    const QStringList toList = parseAddresses(to, msg->to(), "To", &ok);
     if (!ok)
         return {};
-    const QStringList ccList = parseAddresses(cc, &ok);
+    const QStringList ccList = parseAddresses(cc, msg->cc(), "Cc", &ok);
     if (!ok)
         return {};
-    const QStringList bccList = parseAddresses(bcc, &ok);
+    // Bcc never rides along on a message being sent — hiding those recipients
+    // is the whole point, and the envelope is what carries them. A draft is
+    // the opposite case: it is not being delivered, and a Bcc left out of the
+    // header would be gone when the draft is reopened.
+    KMime::Headers::Bcc envelopeOnlyBcc;
+    const QStringList bccList = parseAddresses(
+        bcc, strict ? &envelopeOnlyBcc : msg->bcc(), "Bcc", &ok);
     if (!ok)
         return {};
     if (toOut)
@@ -1664,7 +1748,6 @@ std::shared_ptr<KMime::Message> MailClient::composeMessage(
     // --- Build the MIME message ---
     const QString fromAddr = ownAddress();
 
-    auto msg = std::make_shared<KMime::Message>();
     // Built as a Mailbox rather than a "Name <addr>" string so KMime does the
     // quoting and RFC 2047 encoding — a display name may hold a comma, a
     // quote, or non-ASCII, none of which survive naive concatenation.
@@ -1680,13 +1763,6 @@ std::shared_ptr<KMime::Message> MailClient::composeMessage(
         org->fromUnicodeString(m_acct.organization);
         msg->setHeader(std::move(org));
     }
-    for (const QString &addr : toList)
-        msg->to()->fromUnicodeString(msg->to()->asUnicodeString().isEmpty()
-                                         ? addr.trimmed()
-                                         : msg->to()->asUnicodeString() + QStringLiteral(", ")
-                                             + addr.trimmed());
-    if (!ccList.isEmpty())
-        msg->cc()->fromUnicodeString(ccList.join(QStringLiteral(", ")));
     msg->subject()->fromUnicodeString(cleanSubject);
     msg->date()->setDateTime(QDateTime::currentDateTime());
     // The SMTP host when there is one, the sender's own domain otherwise: a
@@ -2041,15 +2117,12 @@ void MailClient::saveDraft(const QString &to, const QString &cc, const QString &
         Q_EMIT sendFailed(tr("No Drafts folder found on the server."));
         return;
     }
-    // Bcc is a header here rather than an envelope field: a draft is not being
-    // delivered, and dropping it would lose it when the draft is reopened.
+    // Bcc is a header here rather than an envelope field — a draft is not
+    // being delivered, and dropping it would lose it when the draft is
+    // reopened — which is what the non-strict composeMessage() does with it.
     auto msg = composeMessage(to, cc, bcc, subject, html, attachments, false);
     if (!msg)
         return;
-    if (!bcc.trimmed().isEmpty()) {
-        msg->bcc()->fromUnicodeString(bcc.trimmed());
-        msg->assemble();
-    }
 
     // A draft of an encrypted message is encrypted to the sender's own key
     // before it goes anywhere: the Drafts folder is on the server, and a draft
@@ -2384,10 +2457,15 @@ QStringList MailClient::recipientSuggestions(const QString &prefix)
 }
 
 void MailClient::scoreHeader(MessageListModel::Header &h, const QByteArray &head,
-                             const QSet<QString> &knownSenders)
+                             const QSet<QString> &knownSenders,
+                             const QHash<QString, MailStore::DomainHistory> &orgHistory)
 {
     SpamHeuristics::Context ctx;
-    ctx.knownCorrespondent = knownSenders.contains(SpamHeuristics::addressOf(h.from));
+    const QString fromAddr = SpamHeuristics::addressOf(h.from);
+    ctx.knownCorrespondent = knownSenders.contains(fromAddr);
+    const auto hist = orgHistory.value(SpamHeuristics::organizationalDomainOf(fromAddr));
+    ctx.seenFromOrg = hist.seen;
+    ctx.daysKnownOrg = hist.days;
     ctx.authInfo = h.authInfo;
     // headerFromImap() already reduced the trusted Authentication-Results to
     // this; re-deriving it here would be a second chance to disagree with the
@@ -2408,21 +2486,27 @@ void MailClient::appendScoredHeaders(QList<MessageListModel::Header> &out,
     QList<MessageListModel::Header> batch;
     QList<QByteArray> heads;
     QSet<QString> senders;
+    QSet<QString> orgs;
     for (const auto &info : infos) {
         if (!info.message || info.uid <= 0)
             continue;
         batch.append(headerFromBackend(info, authDomains));
         heads.append(info.message->head());
-        senders.insert(SpamHeuristics::addressOf(batch.constLast().from));
+        const QString addr = SpamHeuristics::addressOf(batch.constLast().from);
+        senders.insert(addr);
+        if (const QString org = SpamHeuristics::organizationalDomainOf(addr); !org.isEmpty())
+            orgs.insert(org);
     }
     if (batch.isEmpty())
         return;
     // One allowlist query for the whole FETCH batch rather than one per
     // message: this runs on the GUI thread between deliveries, and a few
-    // hundred round trips there would be felt in the list.
+    // hundred round trips there would be felt in the list. The domain history
+    // is batched for exactly the same reason.
     const QSet<QString> known = m_store.knownCorrespondents(senders);
+    const auto orgHistory = m_store.senderDomainHistory(orgs);
     for (qsizetype i = 0; i < batch.size(); ++i)
-        scoreHeader(batch[i], heads.at(i), known);
+        scoreHeader(batch[i], heads.at(i), known, orgHistory);
     out += batch;
 }
 
@@ -4021,6 +4105,10 @@ void MailClient::openFolder(const QString &mailBox)
         updatePageAnchor(cached);
         if (!cached.isEmpty())
             m_messageModel.setHeaders(cached);
+        // The new folder's window is newest-first like every other one, so a
+        // list sorted by anything else restarts its paging from the folder's
+        // real first page under that sort.
+        requestSortSeed();
     }
 
     if (!connected()) {
@@ -4090,12 +4178,102 @@ void MailClient::updatePageAnchor(const QList<MessageListModel::Header> &page)
 
 void MailClient::loadMoreMessages()
 {
-    m_sync->loadMoreMessages();
+    QElapsedTimer timer;
+    timer.start();
+    // A sorted browse pages in its own order — the next keyset page under the
+    // sort, appended at the end, exactly like the default walk but along a
+    // different axis.
+    if (m_sync->sortedBrowse())
+        requestSortPage(/*append=*/true);
+    else
+        m_sync->loadMoreMessages();
+    // Only calls that did something are interesting; the prefetch zone makes
+    // many that no-op out on the in-flight or exhausted guards.
+    const qint64 ms = timer.elapsed();
+    if (ms > 0) {
+        qCDebug(logTrace, "loadMoreMessages: %lld ms (%d rows shown)", ms,
+                m_messageModel.rowCount());
+    }
 }
 
 bool MailClient::loadAllCachedMessages()
 {
     return m_sync->loadAllCachedMessages();
+}
+
+void MailClient::seedSortOrder(int column, bool descending)
+{
+    if (m_sortColumn == column && m_sortDescending == descending)
+        return;
+    m_sortColumn = column;
+    m_sortDescending = descending;
+    m_sync->setSortOrder(column, descending);
+    m_sortAnchorValid = false;
+    m_sortExhausted = false;
+    if (!m_sync->sortedBrowse()) {
+        // Back to the default: the sorted pages on screen are some other slice
+        // of the folder — put the newest-first window back.
+        m_sync->reloadWindow();
+        return;
+    }
+    requestSortSeed();
+}
+
+bool MailClient::sortPagesInline() const
+{
+    return m_sortColumn == int(MessageListModel::SortColumn::Date);
+}
+
+void MailClient::requestSortSeed()
+{
+    // Newest-first by date is the order the page window is already in: its
+    // first row is the folder's first row, so there is nothing to fetch.
+    if (!m_sync->sortedBrowse() || m_selectedFolder.isEmpty() || m_searchActive)
+        return;
+    m_sortAnchorValid = false;
+    m_sortExhausted = false;
+    requestSortPage(/*append=*/false);
+}
+
+void MailClient::requestSortPage(bool append)
+{
+    if (append) {
+        // No anchor yet means the first page is still on its way; the prefetch
+        // zone will ask again once it is showing. Exhausted means the last
+        // page came back empty — there is nothing further in the cache. In
+        // flight means the answer to this exact ask is already coming.
+        if (!m_sortAnchorValid || m_sortExhausted || m_sortPageInFlight)
+            return;
+    }
+    const MessageListModel::Header *anchor = append ? &m_sortAnchor : nullptr;
+    if (sortPagesInline()) {
+        // Indexed: milliseconds, and having the rows before this returns is
+        // what keeps a held PageDown from ever reaching a bottom edge — the
+        // worker round trip (thread start, its own connection to the cache,
+        // scheduling under a scroll-busy GUI) cost more than the query.
+        applySortPage(append, m_store.sortedHeaders(m_selectedFolder, m_sortColumn,
+                                                    m_sortDescending, 500, anchor));
+        return;
+    }
+    m_sortPageInFlight = true;
+    // 2000 rows, not 500: these pages sort the folder whatever the LIMIT, so
+    // nearly all of a page's cost is per-page, not per-row — fewer, bigger
+    // pages put the next boundary four times further away for almost nothing.
+    m_jobs->startSortPage(m_store.scopedKey(m_selectedFolder), m_sortColumn, m_sortDescending,
+                          anchor, 2000);
+}
+
+void MailClient::applySortPage(bool append, const QList<MessageListModel::Header> &rows)
+{
+    if (rows.isEmpty()) {
+        // A follow-on page of nothing is the end of the cache; a first page of
+        // nothing is an empty folder. Either way, stop asking.
+        m_sortExhausted = true;
+        return;
+    }
+    m_sortAnchor = rows.last();
+    m_sortAnchorValid = true;
+    m_sync->applySortedPage(rows, /*replace=*/!append);
 }
 
 void MailClient::searchMessages(const QString &query, int field)

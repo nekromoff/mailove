@@ -90,12 +90,20 @@ Item {
 
     readonly property bool pgpAvailable: Pgp.available && Mail.accountPgpKeyFp !== ""
 
+    /// The bare addresses in the recipient fields, display names stripped:
+    /// a key lookup for "Name <a@b.com>" has to ask about a@b.com, not about
+    /// the whole string. Anything without an "@" is an address still being
+    /// typed and is left out — there is no key to look up for it yet.
     function recipientList() {
         const all = (toField.text + "," + ccField.text + "," + bccField.text).split(",")
         const out = []
         for (let i = 0; i < all.length; ++i) {
-            const a = all[i].trim()
-            if (a.length > 0 && out.indexOf(a) < 0)
+            let a = all[i].trim()
+            const lt = a.lastIndexOf("<")
+            const gt = a.lastIndexOf(">")
+            if (lt >= 0 && gt > lt)
+                a = a.substring(lt + 1, gt).trim()
+            if (a.indexOf("@") > 0 && out.indexOf(a) < 0)
                 out.push(a)
         }
         return out

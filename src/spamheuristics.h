@@ -7,6 +7,7 @@
 #include <QDateTime>
 #include <QList>
 #include <QString>
+#include <QStringList>
 
 /**
  * Header and structure based spam scoring.
@@ -66,6 +67,19 @@ struct Context {
     /// The raw trusted Authentication-Results value, for the detail line.
     QString authInfo;
 
+    /// How many messages from the From address's organizational domain are
+    /// already in the cache, and over how many days they are spread. Filled by
+    /// the caller from MailStore::senderDomainHistory().
+    ///
+    /// This is the "we have seen this domain before" signal, and it exists
+    /// because knownCorrespondent only knows who the user has *written to* —
+    /// which is nobody, for the banks, invoices and notification bots that are
+    /// otherwise the hardest mail to score. Zero means "never seen", which is
+    /// what ordinary first contact looks like and is never scored as
+    /// suspicious: familiarity can only ever earn ham credit here.
+    int seenFromOrg = 0;
+    int daysKnownOrg = 0;
+
     /// PgpMime::StoredKind — 0 none, 1 encrypted, 2 signed, 3 both. Taken as a
     /// strong ham signal without checking the key: at list-build time no
     /// signature has been verified yet, and spam that bothers to be OpenPGP
@@ -101,6 +115,14 @@ struct Message {
     QByteArray head;
     QString html;
     QString text;
+
+    /// Attachment filenames as the message declares them, in any case. Empty
+    /// at list-build time, like \a html and \a text, so the rules that read it
+    /// simply do not fire until a body has been parsed.
+    QStringList attachmentNames;
+    /// An attached archive that needs a password to open. Set by the caller,
+    /// which is the only side that has looked inside the container.
+    bool encryptedArchive = false;
 };
 
 Score score(const Message &msg, const Context &ctx);

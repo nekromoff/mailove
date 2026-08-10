@@ -1763,9 +1763,16 @@ Kirigami.ApplicationWindow {
                                                             messageList.currentIndex = -1
                                                             messageList.openedUid = -1
                                                             messageList.clearSelection()
+                                                            // Focus BEFORE the switch: switching
+                                                            // repopulates this Repeater and takes
+                                                            // this delegate with it (see the
+                                                            // right-click handler below), so a
+                                                            // line after the call runs in a dead
+                                                            // context where no id resolves —
+                                                            // "messageList is not defined".
+                                                            messageList.forceActiveFocus()
                                                             Mail.openFolderInAccount(accountSection.index,
                                                                                      modelData.mailBox)
-                                                            messageList.forceActiveFocus()
                                                         }
 
                                                         // Right-click on another account's tree.
@@ -2050,10 +2057,22 @@ Kirigami.ApplicationWindow {
                                     // scrolls the view there, so tell it not to this once.
                                     messageList.sortJumpsToTop = true
                                     Mail.messageModel.sortBy(sortColumn, sortDescending)
+                                    // The list only holds the newest page of the
+                                    // folder, so re-ordering it alone shows the
+                                    // head of that page, not of the folder —
+                                    // oldest-first began at the oldest message
+                                    // loaded so far rather than the oldest there
+                                    // is. This switches paging onto the new sort:
+                                    // the folder's real first page replaces the
+                                    // list, and scrolling down walks the cache
+                                    // in the sort's own order from there.
+                                    Mail.seedSortOrder(sortColumn, sortDescending)
                                 }
                                 Component.onCompleted: {
-                                    if (sortColumn !== 0 || !sortDescending)
+                                    if (sortColumn !== 0 || !sortDescending) {
                                         Mail.messageModel.sortBy(sortColumn, sortDescending)
+                                        Mail.seedSortOrder(sortColumn, sortDescending)
+                                    }
                                 }
 
                                 Row {
@@ -2186,6 +2205,22 @@ Kirigami.ApplicationWindow {
                                     keyNavigationEnabled: true
                                     activeFocusOnTab: true
 
+                                    // Recycle delegates instead of destroying and
+                                    // re-creating them as rows scroll by. A row here
+                                    // is an ItemDelegate, a MouseArea and a Repeater
+                                    // of per-column cells — a held PageDown built and
+                                    // tore down ~14 of those per keypress, and the
+                                    // JS garbage that leaves behind is collected in
+                                    // pauses that grow with the heap: the longer the
+                                    // scroll, the longer the freezes (a measured
+                                    // 0.4 s → 2.1 s staircase over one minute of
+                                    // paging). Pooled rows are just re-filled with
+                                    // the next row's data, so scrolling stops paying
+                                    // that tax. The delegate holds no per-row state
+                                    // outside its model properties, which is what
+                                    // makes it safe to reuse.
+                                    reuseItems: true
+
                                     // Snap to the current row instead of gliding to it.
                                     // ListView scrolls itself to follow the cursor, and
                                     // by default that scroll is *animated* at 400 px/s —
@@ -2276,8 +2311,9 @@ Kirigami.ApplicationWindow {
                                     }
                                     function requestDelete() {
                                         const rows = selectedIndexes()
-                                        console.info("mailo: requestDelete rows", JSON.stringify(rows),
-                                                     "permanent", Mail.deleteIsPermanent())
+                                        console.debug(traceLog, "mailo: requestDelete rows",
+                                                      JSON.stringify(rows),
+                                                      "permanent", Mail.deleteIsPermanent())
                                         if (rows.length === 0)
                                             return
                                         // Spam counts as permanent too when
@@ -2327,8 +2363,9 @@ Kirigami.ApplicationWindow {
                                                 // to row 0. A real folder change clears it
                                                 // explicitly at the click instead.
                                                 messageList.currentIndex = -1
-                                                console.info("mailo: msg reset: empty, keeping uid",
-                                                            messageList.openedUid)
+                                                console.debug(traceLog,
+                                                              "mailo: msg reset: empty, keeping uid",
+                                                              messageList.openedUid)
                                                 return
                                             }
                                             // A message the user opened is followed by uid,
@@ -2351,9 +2388,11 @@ Kirigami.ApplicationWindow {
                                                 messageList.openedUid =
                                                     Mail.messageModel.uidAt(messageList.currentIndex)
                                             }
-                                            console.info("mailo: msg reset: count", messageList.count,
-                                                        "wanted uid", messageList.openedUid,
-                                                        "-> row", row, "current", messageList.currentIndex)
+                                            console.debug(traceLog,
+                                                          "mailo: msg reset: count", messageList.count,
+                                                          "wanted uid", messageList.openedUid,
+                                                          "-> row", row,
+                                                          "current", messageList.currentIndex)
                                             // Only when the cursor landed on a *different*
                                             // message than the viewer is showing. A
                                             // successful restore means the same mail is
@@ -2411,9 +2450,11 @@ Kirigami.ApplicationWindow {
                                                     messageList.positionViewAtIndex(
                                                         messageList.currentIndex, ListView.Center)
                                             })
-                                            console.info("mailo: msg re-sorted: count", messageList.count,
-                                                        "uid", messageList.openedUid,
-                                                        "-> row", messageList.currentIndex)
+                                            console.debug(traceLog,
+                                                          "mailo: msg re-sorted: count",
+                                                          messageList.count,
+                                                          "uid", messageList.openedUid,
+                                                          "-> row", messageList.currentIndex)
                                         }
                                         // Incremental inserts (appendHeaders: search local
                                         // merge, load-more) shift every row at/after the
@@ -2515,6 +2556,24 @@ Kirigami.ApplicationWindow {
                                     onAtYEndChanged: {
                                         if (atYEnd && count > 0)
                                             loadMoreDebounce.restart()
+                                    }
+
+                                    // Prefetch ahead of the scroll: start loading
+                                    // the next page while the end is still well
+                                    // away, so a held PageDown reaches rows that
+                                    // already arrived instead of pausing at the
+                                    // boundary for the debounce and the fetch.
+                                    // Twelve screens ≈ 300 rows: enough runway
+                                    // that even a sender-sorted page (about half
+                                    // a second on a worker) lands before a held
+                                    // key eats through it. Each page pushes the
+                                    // boundary further out than the zone is
+                                    // deep, so this cannot cascade; the C++ side
+                                    // drops repeats while a page is in flight.
+                                    onContentYChanged: {
+                                        if (count > 0
+                                                && contentHeight - (contentY + height) < height * 12)
+                                            Mail.loadMoreMessages()
                                     }
 
                                     // Debounce so holding an arrow key doesn't fetch every row.
@@ -2768,9 +2827,10 @@ Kirigami.ApplicationWindow {
                                                     messageMenu.popup()
                                                     return
                                                 }
-                                                console.info("mailo: click row", msgDelegate.index,
-                                                             "modifiers", mouse.modifiers,
-                                                             "anchor", messageList.selectionAnchor)
+                                                console.debug(traceLog,
+                                                              "mailo: click row", msgDelegate.index,
+                                                              "modifiers", mouse.modifiers,
+                                                              "anchor", messageList.selectionAnchor)
                                                 if (mouse.modifiers & Qt.ControlModifier) {
                                                     messageList.toggleSelect(msgDelegate.index)
                                                     return
@@ -2780,8 +2840,8 @@ Kirigami.ApplicationWindow {
                                                         ? messageList.selectionAnchor
                                                         : (messageList.currentIndex >= 0
                                                            ? messageList.currentIndex : msgDelegate.index)
-                                                    console.info("mailo: shift range", anchor, "->",
-                                                                 msgDelegate.index)
+                                                    console.debug(traceLog, "mailo: shift range",
+                                                                  anchor, "->", msgDelegate.index)
                                                     messageList.selectRange(anchor, msgDelegate.index)
                                                     return
                                                 }

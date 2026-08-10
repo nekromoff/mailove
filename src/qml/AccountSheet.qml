@@ -1784,13 +1784,16 @@ Item {
                         width: Kirigami.Units.gridUnit * 1.2
                         height: width
                         radius: 3
-                        color: sheet.ui && sheet.ui[scaleRow.colorProp] !== ""
+                        // Truthiness, not !== "": a key the settings never
+                        // stored reads as undefined, which passes !== "" and
+                        // lands undefined on a QColor (a warning per row).
+                        color: sheet.ui && sheet.ui[scaleRow.colorProp]
                                ? sheet.ui[scaleRow.colorProp] : "transparent"
                         border.color: Kirigami.Theme.textColor
                         border.width: 1
                         QQC2.Label {
                             anchors.centerIn: parent
-                            visible: !sheet.ui || sheet.ui[scaleRow.colorProp] === ""
+                            visible: !sheet.ui || !sheet.ui[scaleRow.colorProp]
                             text: "?"
                             opacity: 0.8
                         }

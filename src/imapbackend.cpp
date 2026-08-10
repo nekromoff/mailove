@@ -483,12 +483,23 @@ void ImapBackend::withFolderSelected(
         }
         auto *sel = static_cast<KIMAP::SelectJob *>(job);
         m_selectedFolder = folder;
-        m_selectedReadWrite = readWrite;
+        // What the server GRANTED, not what was asked: a SELECT can succeed
+        // and still answer [READ-ONLY] (an ACL-restricted or otherwise
+        // write-protected mailbox). Recording the request here marked such a
+        // folder writable, and the STORE that followed was refused with the
+        // server's "NO STORE attempt on READ-ONLY folder".
+        m_selectedReadWrite = !sel->isOpenReadOnly();
         // EXISTS and UIDVALIDITY come free with every SELECT; positional
         // windows need the first, and the caller compares the second against
         // what it stored to notice a mailbox the server regenerated.
         m_messageCounts[folder] = sel->messageCount();
         m_lastUidValidity = sel->uidValidity();
+        if (readWrite && !m_selectedReadWrite) {
+            // Failing here spares the round trip a doomed write costs and
+            // turns the server's cryptic refusal into a statement of fact.
+            then(false, tr("%1 is read-only on the server").arg(folder));
+            return;
+        }
         then(true, QString());
     });
     select->start();

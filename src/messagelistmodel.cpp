@@ -7,6 +7,7 @@
 
 #include <QDebug>
 #include <QElapsedTimer>
+#include <QLoggingCategory>
 
 #include <algorithm>
 
@@ -15,6 +16,15 @@ namespace
 /// Same contract as MailStore's SlowGuard: anything above one frame spent in
 /// here is spent with the window frozen, so say so instead of letting it hide.
 constexpr qint64 kSlowMs = 20;
+
+/// The paging trend, for chasing "scrolling gets slower the longer I hold the
+/// key": every append logs its size and cost when mailo.trace is on, so a cost
+/// that grows with the model shows up as a rising series, not a one-off spike.
+const QLoggingCategory &logModel()
+{
+    static const QLoggingCategory cat("mailo.trace");
+    return cat;
+}
 }
 
 int MessageListModel::rowCount(const QModelIndex &parent) const
@@ -113,6 +123,8 @@ int MessageListModel::appendHeaders(const QList<Header> &headers)
 {
     if (headers.isEmpty())
         return 0;
+    QElapsedTimer timer;
+    timer.start();
     int added = 0;
     // Sorted inserts instead of a model reset, so the ListView keeps its
     // scroll position when older messages arrive.
@@ -185,6 +197,13 @@ int MessageListModel::appendHeaders(const QList<Header> &headers)
             m_rows[row + k] = fresh.at(i + k);
         endInsertRows();
         i += run;
+    }
+    const qint64 totalMs = timer.elapsed();
+    qCDebug(logModel(), "append %lld rows (%d new) -> %lld total, %lld ms",
+            qint64(headers.size()), added, qint64(m_all.size()), totalMs);
+    if (totalMs > kSlowMs) {
+        qWarning() << "messagelist: SLOW append" << headers.size() << "rows (" << added
+                   << "new ) at" << m_all.size() << "total," << totalMs << "ms";
     }
     return added;
 }

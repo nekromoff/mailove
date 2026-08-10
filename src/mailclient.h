@@ -231,6 +231,10 @@ public:
     QString selectedFolder() const { return m_selectedFolder; }
     bool debugLogging() const { return m_debugLogging; }
     void setDebugLogging(bool on);
+    /// Installs the logging filter rules for quiet (default) or verbose mode.
+    /// Static and called first thing in main(): parts of the app log during
+    /// construction, before the settings-driven setDebugLogging() runs.
+    static void applyLogFilterRules(bool on);
     void setRefreshMinutes(int minutes);
     QString dateFormat() const { return m_dateFormat; }
     void setDateFormat(const QString &format);
@@ -363,6 +367,15 @@ public:
     /// the End key can reach the oldest message instead of the oldest one
     /// scrolled to so far. Returns true if anything was added.
     Q_INVOKABLE bool loadAllCachedMessages();
+    /// Tells the client which sort the list is showing, so the head of the
+    /// folder under that sort can be pulled in from the cache.
+    ///
+    /// The model can only order what has been loaded, and what has been loaded
+    /// is the newest page of the folder. Sorting by date ascending therefore
+    /// showed the oldest message of the last page or so rather than the oldest
+    /// there is — and by sender or subject, the first name of that page rather
+    /// than of the folder. Call this whenever the sort changes.
+    Q_INVOKABLE void seedSortOrder(int column, bool descending);
 
     /// True when the currently open folder is the trash folder.
     Q_INVOKABLE bool isTrashFolder() const;
@@ -705,6 +718,20 @@ private:
     /// Remembers the oldest (date, uid) shown from the disk cache, so
     /// loadMoreMessages() can page the next cached chunk in from there.
     void updatePageAnchor(const QList<MessageListModel::Header> &page);
+    /// Fetches the open folder's first page under the list's sort (which
+    /// replaces the list). A no-op for the newest-first default, which is what
+    /// the page window already holds.
+    void requestSortSeed();
+    /// Fetches the page after m_sortAnchor — the sorted browse's "scrolled
+    /// near the end, load more".
+    void requestSortPage(bool append);
+    /// Puts a fetched sorted page into the model and moves the keyset anchor
+    /// past it; an empty page marks the cache exhausted under this sort.
+    void applySortPage(bool append, const QList<MessageListModel::Header> &rows);
+    /// Date pages by either direction are one indexed lookup, the same cost as
+    /// the default path's — those run right here on the GUI thread. The other
+    /// columns sort the whole folder per page and go through the worker.
+    bool sortPagesInline() const;
     /// Fetches the given uids as search results; when \a localMergeKeyword is
     /// set, local partial-match hits are merged into the result list.
     void fetchHeadersByUids(const QList<qint64> &uids, const QString &localMergeKeyword = {},
@@ -777,10 +804,12 @@ private:
     /// Records the To/Cc addresses of a message from the Sent folder in the
     /// recipient-autocompletion store.
     void harvestRecipients(const KMime::Message *msg, const QString &folder, qint64 uid);
-    /// Fills in the spam fields of \a h from its raw \a head. \a knownSenders is
-    /// the pre-resolved allowlist for the batch (see appendScoredHeaders).
+    /// Fills in the spam fields of \a h from its raw \a head. \a knownSenders
+    /// and \a orgHistory are the pre-resolved allowlist and sender-domain
+    /// history for the whole batch (see appendScoredHeaders).
     void scoreHeader(MessageListModel::Header &h, const QByteArray &head,
-                     const QSet<QString> &knownSenders);
+                     const QSet<QString> &knownSenders,
+                     const QHash<QString, MailStore::DomainHistory> &orgHistory);
     /// Turns one header delivery into scored list rows and appends them to
     /// \a out. Single place where a backend's header batch becomes rows, so
     /// the allowlist lookup stays batched and no fetch path can quietly skip
@@ -883,6 +912,23 @@ private:
     QString m_allMailFolder;
     QChar m_folderSeparator; ///< hierarchy delimiter reported by LIST
     int m_maxBodyMB = 5; ///< bodies above this are not cached (0 = no limit)
+
+    /// The sort the list is showing, as last reported by seedSortOrder(). Kept
+    /// so a folder change can re-seed under it, and so a seed that arrives
+    /// after the user has clicked another column can be recognised as stale.
+    int m_sortColumn = 0;
+    bool m_sortDescending = true;
+    /// Keyset anchor of the sorted browse: the last row of the last page shown,
+    /// which the next page continues after. Invalid until the first page lands.
+    MessageListModel::Header m_sortAnchor;
+    bool m_sortAnchorValid = false;
+    /// The cache ran dry under this sort — stop asking until it changes.
+    bool m_sortExhausted = false;
+    /// A sorted page is on its way. The prefetch zone asks on every scroll
+    /// tick it spends inside the zone; only the first ask may reach the worker
+    /// — by sender that query costs half a second per pass, and re-running it
+    /// for the same anchor returns rows the model would just throw away.
+    bool m_sortPageInFlight = false;
     bool m_authVerification = true; ///< DKIM/ARC/SPF/DMARC checking and display
     bool m_debugLogging = false;
 

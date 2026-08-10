@@ -72,6 +72,28 @@ void collectBodies(KMime::Content *node, QString *text, QString *html)
         *text = node->decodedText();
 }
 
+/// Filenames of the parts that present themselves as attachments. Name only:
+/// the scorer judges what a part claims to be, which is the same thing the
+/// reader is being invited to click.
+void collectAttachments(KMime::Content *node, QStringList *names)
+{
+    if (!node)
+        return;
+    const auto children = node->contents();
+    if (!children.isEmpty()) {
+        for (KMime::Content *child : children)
+            collectAttachments(child, names);
+        return;
+    }
+    QString name;
+    if (auto *cd = node->contentDisposition(); cd && !cd->filename().isEmpty())
+        name = cd->filename();
+    else if (auto *ct = node->contentType(); ct && !ct->name().isEmpty())
+        name = ct->name();
+    if (!name.isEmpty())
+        names->append(name);
+}
+
 struct Totals {
     int ham = 0;
     int unsure = 0;
@@ -93,9 +115,23 @@ struct Totals {
 /// Scores one file. Returns false when it could not be read.
 /// Scores one message that is already in memory. \a label names it in the
 /// output — a file name, or a cache location for --msgid.
+/// \a base carries everything the caller simulates for the whole run — the
+/// authentication verdict, the crypto kind, the sender-domain history. Only
+/// knownCorrespondent is per-message, because only it can be answered from the
+/// message itself plus the allowlist.
+///
+/// The message's own Authentication-Results is deliberately NOT read. In the
+/// client only a header stamped by our own receiving server counts, and here
+/// there is no "our server" to compare an authserv-id against — trusting the
+/// file's own header would measure the filter against a value the sender
+/// controls. --auth-fail / --auth-pass simulate the verdict instead, which is
+/// the only way to exercise the known-contact-spoofed rule offline.
+///
+/// X-Spam-Status is different and *is* read, by the scorer itself: its
+/// provenance test is positional (above the topmost Received), so it needs no
+/// knowledge of which server we trust and holds just as well on a file.
 bool scoreRaw(const QByteArray &raw, const QString &label, const QSet<QString> &known,
-              bool alwaysScore, bool authFailed, bool authPassed, int crypto, bool quiet,
-              Totals *totals)
+              const SpamHeuristics::Context &base, bool quiet, Totals *totals)
 {
     KMime::Message msg;
     msg.setContent(KMime::CRLFtoLF(raw));
@@ -104,22 +140,12 @@ bool scoreRaw(const QByteArray &raw, const QString &label, const QSet<QString> &
     SpamHeuristics::Message m;
     m.head = msg.head();
     collectBodies(&msg, &m.text, &m.html);
+    collectAttachments(&msg, &m.attachmentNames);
 
-    SpamHeuristics::Context ctx;
-    ctx.alwaysScore = alwaysScore;
-    ctx.crypto = crypto;
+    SpamHeuristics::Context ctx = base;
     const QString from = msg.from() ? msg.from()->asUnicodeString() : QString();
     const QString addr = SpamHeuristics::addressOf(from);
     ctx.knownCorrespondent = known.contains(addr);
-
-    // The message's own Authentication-Results is deliberately NOT read. In the
-    // client only a header stamped by our own receiving server counts, and here
-    // there is no "our server" to compare an authserv-id against — trusting the
-    // file's own header would measure the filter against a value the sender
-    // controls. --auth-fail / --auth-pass simulate the verdict instead, which
-    // is the only way to exercise the known-contact-spoofed rule offline.
-    ctx.authFailed = authFailed;
-    ctx.authPassed = authPassed;
 
     const SpamHeuristics::Score s = SpamHeuristics::score(m, ctx);
     totals->count(s);
@@ -140,16 +166,15 @@ bool scoreRaw(const QByteArray &raw, const QString &label, const QSet<QString> &
     return true;
 }
 
-bool scoreFile(const QString &path, const QSet<QString> &known, bool alwaysScore,
-               bool authFailed, bool authPassed, int crypto, bool quiet, Totals *totals)
+bool scoreFile(const QString &path, const QSet<QString> &known,
+               const SpamHeuristics::Context &base, bool quiet, Totals *totals)
 {
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly)) {
         std::fprintf(stderr, "cannot open %s\n", qPrintable(path));
         return false;
     }
-    return scoreRaw(f.readAll(), QFileInfo(path).fileName(), known, alwaysScore, authFailed,
-                    authPassed, crypto, quiet, totals);
+    return scoreRaw(f.readAll(), QFileInfo(path).fileName(), known, base, quiet, totals);
 }
 
 QStringList emlsUnder(const QString &dir)
@@ -193,8 +218,7 @@ QSqlDatabase openCacheReadOnly(const QString &explicitPath)
 
 /// Every cached copy of \a msgid, scored. Returns how many were found.
 int scoreByMessageId(QSqlDatabase &db, const QString &rawMsgid, const QSet<QString> &known,
-                     bool alwaysScore, bool authFailed, bool authPassed, int crypto,
-                     bool quiet, Totals *totals)
+                     const SpamHeuristics::Context &base, bool quiet, Totals *totals)
 {
     // Stored with the angle brackets stripped (MessageListModel::Header::msgid),
     // but people paste them in, so accept either form.
@@ -235,11 +259,12 @@ int scoreByMessageId(QSqlDatabase &db, const QString &rawMsgid, const QSet<QStri
             continue;
         }
         // A cached body whose large attachments were lifted into the file store
-        // is a stub. The text and HTML parts stay inline, so scoring sees what
-        // it needs; only rules about attachment payloads would be affected, and
-        // there are none.
-        scoreRaw(b.value(0).toByteArray(), where, known, alwaysScore, authFailed,
-                 authPassed, crypto, quiet, totals);
+        // is a stub. The text and HTML parts stay inline, so the body rules see
+        // what they need. The attachment rules are the exception: they read the
+        // declared filename, and a lifted part leaves only a stub behind — so a
+        // message scored from the cache can score lower here than the same
+        // message scored from its .eml. Tune those weights against files.
+        scoreRaw(b.value(0).toByteArray(), where, known, base, quiet, totals);
         ++scored;
     }
     return scored;
@@ -273,10 +298,7 @@ int main(int argc, char **argv)
     QStringList hamDirs;
     QStringList spamDirs;
     QSet<QString> known;
-    bool alwaysScore = false;
-    bool authFailed = false;
-    bool authPassed = false;
-    int crypto = 0;
+    SpamHeuristics::Context base;
     bool quiet = false;
     QStringList msgids;
     QString dbPath;
@@ -295,13 +317,19 @@ int main(int argc, char **argv)
         else if (arg == QLatin1String("--known"))
             known.insert(SpamHeuristics::normalizeAddress(next()));
         else if (arg == QLatin1String("--always-score"))
-            alwaysScore = true;
+            base.alwaysScore = true;
         else if (arg == QLatin1String("--auth-fail"))
-            authFailed = true;
+            base.authFailed = true;
         else if (arg == QLatin1String("--auth-pass"))
-            authPassed = true;
+            base.authPassed = true;
         else if (arg == QLatin1String("--crypto"))
-            crypto = next().toInt();
+            base.crypto = next().toInt();
+        // Simulated sender-domain history, the way --auth-pass simulates a
+        // verdict: a corpus on disk has no cache behind it to have a history in.
+        else if (arg == QLatin1String("--seen-from-org"))
+            base.seenFromOrg = next().toInt();
+        else if (arg == QLatin1String("--days-known-org"))
+            base.daysKnownOrg = next().toInt();
         else if (arg == QLatin1String("--msgid"))
             msgids.append(next());
         else if (arg == QLatin1String("--db"))
@@ -331,27 +359,26 @@ int main(int argc, char **argv)
 
     Totals plain;
     for (const QString &f : std::as_const(files))
-        scoreFile(f, known, alwaysScore, authFailed, authPassed, crypto, quiet, &plain);
+        scoreFile(f, known, base, quiet, &plain);
 
     if (!msgids.isEmpty()) {
         QSqlDatabase db = openCacheReadOnly(dbPath);
         if (!db.isOpen())
             return 2;
         for (const QString &id : std::as_const(msgids)) {
-            scoreByMessageId(db, id, known, alwaysScore, authFailed, authPassed, crypto,
-                             quiet, &plain);
+            scoreByMessageId(db, id, known, base, quiet, &plain);
         }
     }
 
     Totals hamTotals;
     for (const QString &d : std::as_const(hamDirs)) {
         for (const QString &f : emlsUnder(d))
-            scoreFile(f, known, alwaysScore, authFailed, authPassed, crypto, quiet, &hamTotals);
+            scoreFile(f, known, base, quiet, &hamTotals);
     }
     Totals spamTotals;
     for (const QString &d : std::as_const(spamDirs)) {
         for (const QString &f : emlsUnder(d))
-            scoreFile(f, known, alwaysScore, authFailed, authPassed, crypto, quiet, &spamTotals);
+            scoreFile(f, known, base, quiet, &spamTotals);
     }
 
     std::printf("\n");

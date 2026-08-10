@@ -288,10 +288,23 @@ void SyncEngine::fetchNewerThanCache(qint64 maxCachedUid, int cachedCount)
             // backfill cursor belong to whatever folder is open NOW.
             if (folder != m_selectedFolder || m_searchActive)
                 return;
-            const auto merged = m_store.cachedHeaders(m_selectedFolder);
-            updatePageAnchor(merged);
-            m_messages.setHeaders(merged);
-            Q_EMIT folderRefreshed();
+            // In a sorted browse the visible list is keyset pages in another
+            // order; reloading the newest-first window over it would throw the
+            // user's position away. The rows are cached above either way.
+            if (!sortedBrowse()) {
+                const auto merged = m_store.cachedHeaders(m_selectedFolder);
+                if (m_messages.totalCount() > 0) {
+                    // Already showing rows — merge, don't reset (see
+                    // applyHeadersFetched for the full story: a reset is a
+                    // 40–120 ms freeze, and mid-scroll it also throws the
+                    // browsed rows away).
+                    m_messages.appendHeaders(merged);
+                } else {
+                    updatePageAnchor(merged);
+                    m_messages.setHeaders(merged);
+                }
+                Q_EMIT folderRefreshed();
+            }
             // Cached block + newly fetched mail occupy the top of the mailbox;
             // everything below is still-unfetched history for the backfill.
             m_fetchedFromNewest = qMin(m_folderMessageCount,
@@ -430,7 +443,7 @@ void SyncEngine::applyMessagesVanished(const QString &folder, const QStringList 
         uids.append(m_backend->localKeyFor(remoteId));
     m_store.removeMessages(folder, uids);
     Q_EMIT unreadRecountNeeded();
-    if (folder != m_selectedFolder || m_searchActive)
+    if (folder != m_selectedFolder || m_searchActive || sortedBrowse())
         return;
     m_messages.setHeaders(m_store.cachedHeaders(folder));
     Q_EMIT folderRefreshed();
@@ -544,6 +557,11 @@ void SyncEngine::loadMoreMessages()
 {
     if (m_searchActive)
         return;
+    // A sorted browse pages through MailClient::loadMoreMessages() →
+    // startSortPage(); this newest-first walk would insert rows into the
+    // middle of the sorted list.
+    if (sortedBrowse())
+        return;
     // Older mail already cached on disk appears instantly, without touching
     // the network; the server is only asked below the end of the cache.
     if (m_pageUid > 0) {
@@ -560,7 +578,10 @@ void SyncEngine::loadMoreMessages()
 
 bool SyncEngine::loadAllCachedMessages()
 {
-    if (m_searchActive || m_pageUid <= 0)
+    // In a sorted browse "everything" means sorting the whole folder into the
+    // model at once — by sender that is the folder's slowest query times its
+    // size in rows. End-of-list stays paged there.
+    if (m_searchActive || sortedBrowse() || m_pageUid <= 0)
         return false;
     // One unlimited query rather than a loop of pages: the folder index
     // already orders these rows, so the cost is in handing them to the model,
@@ -574,6 +595,36 @@ bool SyncEngine::loadAllCachedMessages()
     updatePageAnchor(rest);
     m_messages.appendHeaders(rest);
     return true;
+}
+
+void SyncEngine::setSortOrder(int column, bool descending)
+{
+    m_sortColumn = column;
+    m_sortDescending = descending;
+}
+
+bool SyncEngine::applySortedPage(const QList<MessageListModel::Header> &rows, bool replace)
+{
+    if (m_searchActive || m_selectedFolder.isEmpty())
+        return false;
+    // The newest-first page anchor is left alone: it belongs to the default
+    // window, which reloadWindow() restores when the sorted browse ends.
+    if (replace) {
+        m_messages.setHeaders(rows);
+        return true;
+    }
+    // Follow-on pages arrive already in list order and sort after everything
+    // shown, so this is a run appended at the end — the model's cheap path.
+    return m_messages.appendHeaders(rows) > 0;
+}
+
+void SyncEngine::reloadWindow()
+{
+    if (m_searchActive || m_selectedFolder.isEmpty())
+        return;
+    const auto merged = m_store.cachedHeaders(m_selectedFolder);
+    updatePageAnchor(merged);
+    m_messages.setHeaders(merged);
 }
 
 void SyncEngine::fetchOlderFromServer()
@@ -664,7 +715,14 @@ void SyncEngine::applyFetchedHeaders(const QString &folder, qint64 reachedFromNe
     // already-fetched history look unfetched again.
     m_fetchedFromNewest = qMax(m_fetchedFromNewest, reachedFromNewest);
     const bool moreHistory = m_fetchedFromNewest < m_folderMessageCount;
-    if (append) {
+    // In a sorted browse none of this window handling touches the list: the
+    // fetched rows are cached (that already happened) and the sorted pages
+    // read them from there. Wedging newest-first rows into a list held in
+    // another order is what put 500-row inserts into its middle — the cursor
+    // and status keep updating below either way.
+    if (sortedBrowse()) {
+        // nothing — visible list is fed by applySortedPage()
+    } else if (append) {
         const int added = m_messages.appendHeaders(headers); // dedupes by uid
         if (added == 0 && moreHistory && !background) {
             // This window was already on screen from the cache — keep walking
@@ -677,8 +735,23 @@ void SyncEngine::applyFetchedHeaders(const QString &folder, qint64 reachedFromNe
         // Union of fresh fetch + everything cached, so previously scrolled-in
         // older messages stay visible across sessions.
         const auto merged = m_store.cachedHeaders(m_selectedFolder);
-        updatePageAnchor(merged);
-        m_messages.setHeaders(merged);
+        if (m_messages.totalCount() > 0) {
+            // A background refresh (the poll timer, IDLE, a reconnect) landing
+            // as setHeaders() here was a full model reset over a list already
+            // showing: every paged-in row thrown away, every delegate rebuilt
+            // (a 40–120 ms freeze), the cursor re-found by uid — felt as the
+            // list going heavy at whatever moment the refresh landed, and
+            // worst mid-scroll, where it also discarded everything paged in.
+            // Merging leaves the shown rows and the page anchor alone;
+            // refreshed rows update in place and new mail sorts in at the
+            // top. Only rows deleted on the server linger until the folder's
+            // expunge event or its next open — those come through
+            // applyMessagesVanished, not this refresh.
+            m_messages.appendHeaders(merged);
+        } else {
+            updatePageAnchor(merged);
+            m_messages.setHeaders(merged);
+        }
         Q_EMIT folderRefreshed();
     }
     if (moreHistory) {

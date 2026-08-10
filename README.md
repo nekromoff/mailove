@@ -15,13 +15,13 @@ Security-minded KDE-only IMAP and JMAP mail client, blazing fast.
 - **Local cache with full-text search** — headers, read bodies and folders in SQLite: folders open instantly, offline included. IMAP SEARCH → FTS5 (accent-folding) → regex; `/pattern/` is a case-insensitive regex.
 
 ### UI
-- **Fast by design** — a 20 ms limit on the GUI thread, one frame: anything slower runs on a worker. Pages in from the cache as you scroll, prefetches bodies, sorts in memory.
-- **UX to taste** — Look and feel sets row density, background colour and whether the composer is a tab or a window; Shortcuts rebinds every action, and the colour labels — No label plus five of your own — carry their own keys; General sets the date format, refresh interval, spam retention and cache limits.
+- **Fast by design** — a 20 ms limit on the GUI thread, one frame: anything slower runs on a worker. Nothing ever snaps or stalls mid-scroll.
+- **UX to taste** — Look and feel sets row density, background colour and whether the composer is a tab or a window; Message sorting by any column; Shortcuts rebinds every action; Color labels for messages; Change the date format, refresh interval, spam retention, cache limits and debug logging
 - **Compose & send** — SMTP with rich text, attachments, signature and resumable drafts.
 - **Attachments** — click to open, right-click to save. Stored zstd-compressed and deduplicated outside the database.
 - **OpenPGP** — read and send signed and encrypted mail through GnuPG. Key manager, WKD discovery. Decrypted plaintext is never indexed, never cached, and is wiped from memory when the message closes.
 - **Spam handling** — local heuristics score every message; J files one as spam, Shift+J takes the mark off and allowlists the sender for good. Spam older than a chosen number of days is cleared out automatically.
-- **Keyboard-first** — arrows, Page Up/Down, Home/End, Enter to open, Ctrl+W to close a tab, and the keyboard follows the folder you open. Right-click a message to mark it unread, file it as spam, or delete it.
+- **Keyboard-first** — arrows, Page Up/Down, Home/End, Enter to open, Ctrl+W to close a tab, and the keyboard follows the folder you open.
 - **Tabs** — Compose, Settings and opened messages are tabs. Ctrl+W closes; Compose can be set to open in a window if preferred.
 - **Folders moving** — drag a folder onto another to reparent it, or onto the account name to move it to the top level. Rename from the context menu; where the protocol forbids it, the menu says so instead.
 - **Unread counts** — a pill on every folder, blue on the inbox. A collapsed folder shows what is unread in the subfolders folded beneath it.

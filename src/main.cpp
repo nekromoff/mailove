@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include <QApplication>
+#include <QElapsedTimer>
 #include <QGuiApplication>
 #include <QIcon>
+#include <QTimer>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
@@ -22,9 +24,9 @@
 
 Q_DECLARE_LOGGING_CATEGORY(logTrace)
 
-/// Drops two Qt warnings that say nothing about mailo and everything about the
-/// mail being read. Both come out of QTextDocument while it parses a sender's
-/// HTML for the plain-text preview and the search index:
+/// Drops Qt warnings that say nothing about mailo. Two come out of
+/// QTextDocument while it parses a sender's HTML for the plain-text preview
+/// and the search index:
 ///
 ///   QFont::setPixelSize: Pixel size <= 0        — "font-size:0", the standard
 ///                                                 way to hide preheader text
@@ -33,7 +35,13 @@ Q_DECLARE_LOGGING_CATEGORY(logTrace)
 ///
 /// Neither is actionable, both fire per message, and their volume is chosen by
 /// the sender — a single message can bury the log in them, which is enough to
-/// make real diagnostics unreadable. Anything else is passed through untouched.
+/// make real diagnostics unreadable.
+///
+/// The third is Kirigami's: ToolBarPageHeader.qml binds
+/// `root.pageRow?.separatorVisible && …` to a bool, and with no PageRow (mailo
+/// does not use one) the ?. yields undefined and the assignment warns —
+/// upstream's bug, one line per header built. Anything else is passed through
+/// untouched.
 static QtMessageHandler g_previousHandler = nullptr;
 
 static void filterMailHtmlNoise(QtMsgType type, const QMessageLogContext &context,
@@ -42,6 +50,9 @@ static void filterMailHtmlNoise(QtMsgType type, const QMessageLogContext &contex
     if (message.startsWith(QLatin1String("QFont::setPixelSize: Pixel size <= 0"))
         || message.startsWith(QLatin1String("QTextHtmlParser::applyAttributes: "
                                             "Unknown color name")))
+        return;
+    if (message.contains(QLatin1String("ToolBarPageHeader.qml"))
+        && message.contains(QLatin1String("Unable to assign [undefined] to bool")))
         return;
     if (g_previousHandler)
         g_previousHandler(type, context, message);
@@ -52,6 +63,11 @@ static void filterMailHtmlNoise(QtMsgType type, const QMessageLogContext &contex
 int main(int argc, char *argv[])
 {
     g_previousHandler = qInstallMessageHandler(filterMailHtmlNoise);
+    // Quiet from the first instruction: the PSL cache and other startup work
+    // log before MailClient reads the debug-logging setting and re-applies
+    // the rules that match it. QT_LOGGING_RULES in the environment still
+    // overrides both.
+    MailClient::applyLogFilterRules(false);
 
     ViewerSchemeHandler::registerScheme();
     QtWebEngineQuick::initialize();
@@ -83,6 +99,26 @@ int main(int argc, char *argv[])
         QIcon::setThemeName(QStringLiteral("breeze"));
     }
     QGuiApplication::setWindowIcon(QIcon::fromTheme(QStringLiteral("org.mailo.Mailo")));
+
+    // GUI-thread stall detector: a 100 ms heartbeat whose late firing is the
+    // definition of a frozen UI. Everything instrumented so far (cache
+    // queries, model appends) reports fast while scrolling still hitches, so
+    // this pins down when the event loop itself stops turning and for how
+    // long — anything above half a second is loud, smaller gaps go to the
+    // trace. Purely an observer: one timer, no per-event cost.
+    {
+        auto *beat = new QTimer(&app);
+        auto *last = new QElapsedTimer;
+        last->start();
+        QObject::connect(beat, &QTimer::timeout, &app, [last] {
+            const qint64 gap = last->restart();
+            if (gap > 500)
+                qWarning("mailo: GUI thread stalled ~%lld ms", gap - 100);
+            else if (gap > 220)
+                qCDebug(logTrace, "GUI heartbeat late: %lld ms", gap - 100);
+        });
+        beat->start(100);
+    }
 
     if (qEnvironmentVariableIsEmpty("QT_QUICK_CONTROLS_STYLE"))
         QQuickStyle::setStyle(QStringLiteral("org.kde.desktop"));

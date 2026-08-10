@@ -116,6 +116,9 @@ public:
     void setHeaders(QList<Header> headers);
     /// Returns the number of rows actually inserted (uid duplicates skipped).
     int appendHeaders(const QList<Header> &headers);
+    /// Every loaded row, visible or filtered out — the measure of how far the
+    /// user has paged, where rowCount() only counts what a filter lets show.
+    int totalCount() const { return int(m_all.size()); }
     void clear();
     Q_INVOKABLE qint64 uidAt(int row) const;
     /// The backend's own id for the message at \a row — what MailBackend

@@ -52,6 +52,9 @@ MaintenanceScheduler::~MaintenanceScheduler()
         m_reindexThread->wait();
     if (m_unreadThread)
         m_unreadThread->wait();
+    m_sortPagePending = false; // nothing may start a new worker from here on
+    if (m_sortPageThread)
+        m_sortPageThread->wait();
     // A vacuum cannot be interrupted; joining is the only safe option, and it
     // is why the UI warns before starting one.
     if (m_vacuumThread)
@@ -69,8 +72,9 @@ void MaintenanceScheduler::queueBodyWrite(MailStore::BodyWrite &&write)
     if (!m_bodyWriterThread) {
         m_bodyWriterStop.storeRelaxed(0);
         m_bodyWriterThread = QThread::create([this] { runBodyWriter(); });
-        m_bodyWriterThread->setPriority(QThread::LowPriority);
-        m_bodyWriterThread->start();
+        // Priority goes to start(): setPriority() on a thread that is not
+        // running yet does nothing but warn ("Cannot set priority").
+        m_bodyWriterThread->start(QThread::LowPriority);
     }
     m_bodyWriteWake.wakeOne();
 }
@@ -123,6 +127,10 @@ void MaintenanceScheduler::runBodyWriter()
     }
     MailStore::writeBodiesOn(db, rest);
     db.close();
+    // Drop the handle before removeDatabase — a live one is "still in use"
+    // to Qt and the removal warns at shutdown (same rule as the scoped
+    // handles in the other workers).
+    db = QSqlDatabase();
     QSqlDatabase::removeDatabase(QStringLiteral("mailstore-bodies"));
 }
 
@@ -335,8 +343,8 @@ void MaintenanceScheduler::startAttachmentMigration()
         m_migrateThread->deleteLater();
         m_migrateThread = nullptr;
     });
-    m_migrateThread->setPriority(QThread::LowestPriority);
-    m_migrateThread->start();
+    // Priority goes to start(); setPriority() before it only warns.
+    m_migrateThread->start(QThread::LowestPriority);
 }
 
 void MaintenanceScheduler::stopAttachmentMigration()
@@ -380,9 +388,8 @@ void MaintenanceScheduler::startAllMailPurge(const QString &scopedKey)
         m_purgeThread->deleteLater();
         m_purgeThread = nullptr;
     });
-    m_purgeThread->start();
     // Below the UI's own work: this must never make a folder switch wait.
-    m_purgeThread->setPriority(QThread::LowestPriority);
+    m_purgeThread->start(QThread::LowestPriority);
 }
 
 /// Stops the purge worker and waits for it, so no connection outlives the
@@ -502,8 +509,8 @@ void MaintenanceScheduler::reindexPendingBodies()
         m_reindexThread->deleteLater();
         m_reindexThread = nullptr;
     });
-    m_reindexThread->setPriority(QThread::LowestPriority);
-    m_reindexThread->start();
+    // Priority goes to start(); setPriority() before it only warns.
+    m_reindexThread->start(QThread::LowestPriority);
 }
 
 void MaintenanceScheduler::startIndexRebuild()
@@ -609,11 +616,15 @@ void MaintenanceScheduler::startUnreadRecount()
 
     auto result = std::make_shared<QHash<QString, QHash<QString, int>>>();
     m_unreadThread = QThread::create([accounts, result] {
-        QSqlDatabase db = MailStore::openWorkerConnection(QStringLiteral("mailstore-unread"));
-        if (db.isOpen()) {
-            for (const QString &account : accounts)
-                result->insert(account, MailStore::unreadCountsOn(db, account));
-            db.close();
+        // Scoped so the handle is gone before removeDatabase — a live handle
+        // is "still in use" to Qt and the removal voids it noisily.
+        {
+            QSqlDatabase db = MailStore::openWorkerConnection(QStringLiteral("mailstore-unread"));
+            if (db.isOpen()) {
+                for (const QString &account : accounts)
+                    result->insert(account, MailStore::unreadCountsOn(db, account));
+                db.close();
+            }
         }
         QSqlDatabase::removeDatabase(QStringLiteral("mailstore-unread"));
     });
@@ -628,4 +639,67 @@ void MaintenanceScheduler::startUnreadRecount()
     });
     // The sidebar is never worth a stutter in the list the user is reading.
     m_unreadThread->start(QThread::LowestPriority);
+}
+
+// --- sorted paging ---------------------------------------------------------
+
+void MaintenanceScheduler::startSortPage(const QString &scopedFolder, int column, bool descending,
+                                         const MessageListModel::Header *after, int limit)
+{
+    if (scopedFolder.isEmpty())
+        return;
+    m_sortPageFolder = scopedFolder;
+    m_sortPageColumn = column;
+    m_sortPageDescending = descending;
+    m_sortPageLimit = limit;
+    m_sortPageHasAnchor = after != nullptr;
+    if (after)
+        m_sortPageAnchor = *after;
+    m_sortPagePending = true;
+    startSortPageNow();
+}
+
+void MaintenanceScheduler::startSortPageNow()
+{
+    if (m_sortPageThread || !m_sortPagePending)
+        return;
+    m_sortPagePending = false;
+    const QString folder = m_sortPageFolder;
+    const int column = m_sortPageColumn;
+    const bool descending = m_sortPageDescending;
+    const int limit = m_sortPageLimit;
+    const bool append = m_sortPageHasAnchor;
+    const MessageListModel::Header anchor = m_sortPageAnchor;
+
+    auto rows = std::make_shared<QList<MessageListModel::Header>>();
+    m_sortPageThread = QThread::create([folder, column, descending, limit, append, anchor, rows] {
+        // Scoped for the same reason as the unread worker: the handle must be
+        // gone before removeDatabase.
+        {
+            QSqlDatabase db =
+                MailStore::openWorkerConnection(QStringLiteral("mailstore-sortpage"));
+            if (db.isOpen()) {
+                *rows = MailStore::sortedHeadersOn(db, folder, column, descending, limit,
+                                                   append ? &anchor : nullptr);
+                db.close();
+            }
+        }
+        QSqlDatabase::removeDatabase(QStringLiteral("mailstore-sortpage"));
+    });
+    connect(m_sortPageThread, &QThread::finished, this,
+            [this, folder, column, descending, append, rows] {
+        m_sortPageThread->deleteLater();
+        m_sortPageThread = nullptr;
+        // Empty pages are reported too: an empty follow-on page is the end of
+        // the cache, and the client stops asking once told.
+        Q_EMIT sortPageReady(folder, column, descending, append, *rows);
+        // A click that landed while this one ran is what the user is waiting
+        // to see, so it goes now.
+        startSortPageNow();
+    });
+    // Normal priority, unlike the recount: the user is scrolling toward the
+    // rows this fetches, and at lowest priority the thread is starved by the
+    // very scroll activity that made the request — the page then lands only
+    // after the scrolling pauses, which is the stall it exists to prevent.
+    m_sortPageThread->start(QThread::NormalPriority);
 }

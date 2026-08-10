@@ -50,6 +50,28 @@ public:
     /// — keyset pagination for endless scrolling through the disk cache.
     QList<MessageListModel::Header> cachedHeadersBefore(const QString &folder, qint64 dateSecs,
                                                         qint64 uid, int limit = 500);
+    /// A page of the folder under the sort the list is showing: the first
+    /// \a limit rows when \a after is null, else the \a limit rows that follow
+    /// \a after — keyset pagination in the sort's own direction, so scrolling
+    /// down appends the next contiguous block and never leaves a gap. \a column
+    /// is a MessageListModel::SortColumn; the ordering mirrors the model's
+    /// lessThan() so the pages arrive already in list order.
+    ///
+    /// Static and taking its own \a db because only "date" has an index behind
+    /// it: by sender or subject every page sorts the folder, which on a
+    /// 50k-message folder is half a second — it must not run on the GUI
+    /// thread. \a scopedFolder is what scopedKey() returns for the folder.
+    static QList<MessageListModel::Header> sortedHeadersOn(QSqlDatabase &db,
+                                                           const QString &scopedFolder,
+                                                           int column, bool descending, int limit,
+                                                           const MessageListModel::Header *after);
+    /// Same on the GUI thread's connection — for the date column only, where
+    /// idx_messages_date makes a page a few milliseconds in either direction,
+    /// exactly like cachedHeadersBefore(). The other columns sort the folder
+    /// per page and must go through sortedHeadersOn() on a worker.
+    QList<MessageListModel::Header> sortedHeaders(const QString &folder, int column,
+                                                  bool descending, int limit,
+                                                  const MessageListModel::Header *after);
     /// Number of cached headers of a folder (no row limit).
     int cachedHeaderCount(const QString &folder);
     /// Highest cached uid of a folder (0 when nothing is cached).
@@ -394,6 +416,16 @@ public:
     /// Batched isKnownCorrespondent() for a whole FETCH worth of senders.
     /// Returns the subset of \a addresses that are known, normalized.
     QSet<QString> knownCorrespondents(const QSet<QString> &addresses);
+
+    /// How much of a history one sending organization has here.
+    struct DomainHistory {
+        int seen = 0; ///< messages cached from it
+        int days = 0; ///< since the oldest of them
+    };
+    /// History for a batch of organizational domains, missing entries meaning
+    /// "never seen". Reads the sender_domains aggregate — never the messages
+    /// table, which has no index that could answer this.
+    QHash<QString, DomainHistory> senderDomainHistory(const QSet<QString> &orgs);
 
     /// Attachment heuristic on a raw RFC-2822 head: top-level multipart/mixed.
     /// Works on the raw bytes because KMime downgrades multipart/* to

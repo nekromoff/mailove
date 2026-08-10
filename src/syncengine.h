@@ -98,6 +98,23 @@ public:
     /// Pages in every remaining cached header of the open folder at once.
     /// Returns true if anything was added.
     bool loadAllCachedMessages();
+    /// Tells the engine which sort the list is showing. Anything other than
+    /// the newest-first default puts it in a "sorted browse": the visible list
+    /// is then fed by keyset pages in that sort's order (via
+    /// MaintenanceScheduler), and the engine's own newest-first window
+    /// handling — cache paging and the post-refresh window reload — stands
+    /// down so it cannot clobber the browsed list or wedge pages into its
+    /// middle. Header syncing itself is unaffected: fetched mail still lands
+    /// in the cache, where the sorted pages read it.
+    void setSortOrder(int column, bool descending);
+    /// True when a non-default sort is showing (see setSortOrder()).
+    bool sortedBrowse() const { return m_sortColumn != 0 || !m_sortDescending; }
+    /// Puts one sorted page into the model: the first page replaces the list,
+    /// a follow-on page appends. Returns true if anything changed.
+    bool applySortedPage(const QList<MessageListModel::Header> &rows, bool replace);
+    /// Reloads the newest-first cache window into the model — what leaving a
+    /// sorted browse shows again.
+    void reloadWindow();
     /// Declares the open folder's history fully fetched, which is what
     /// disables "load more" while search results are showing in place of it.
     void markFullySynced() { m_fetchedFromNewest = m_folderMessageCount; }
@@ -231,6 +248,10 @@ private:
 
     qint64 m_pageDate = 0; ///< disk-cache paging anchor: oldest shown date
     qint64 m_pageUid = 0;  ///< …and its uid (keyset pagination tiebreaker)
+
+    // The sort the list is showing — see setSortOrder().
+    int m_sortColumn = 0;
+    bool m_sortDescending = true;
 
     QList<QPair<QString, qint64>> m_prefetchQueue; ///< (folder, uid) waiting for a body fetch
 

@@ -4,6 +4,7 @@
 import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
+import QtQuick.Window
 import QtWebEngine
 import org.kde.kirigami as Kirigami
 import Mailo.Core

@@ -163,6 +163,20 @@ bool MailStore::open()
     q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS remote_senders ("
                           " sender TEXT PRIMARY KEY)"));
 
+    // How much mail each sending organization has a history of here — the
+    // spam scorer's familiarity signal (SpamHeuristics::Context::seenFromOrg).
+    //
+    // An aggregate rather than a query over messages, because the question
+    // "how many messages are from this domain" has no index that can answer it:
+    // messages.sender holds a full mailbox value, so any direct answer is a
+    // full scan of the largest table in the cache, on the GUI thread, per
+    // sender. Counting forward as mail is stored costs one indexed upsert per
+    // new message instead.
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS sender_domains ("
+                          " org TEXT PRIMARY KEY, seen INTEGER NOT NULL DEFAULT 0,"
+                          " first_seen INTEGER NOT NULL DEFAULT 0,"
+                          " last_seen INTEGER NOT NULL DEFAULT 0)"));
+
     // Addresses mail was sent to, for compose autocompletion.
     q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS recipients ("
                           " account TEXT NOT NULL, address TEXT NOT NULL,"
@@ -555,6 +569,106 @@ QList<MessageListModel::Header> MailStore::cachedHeadersBefore(const QString &fo
     return readHeaderRows(q);
 }
 
+/// The sort key expressions behind MessageListModel::lessThan(), by column.
+/// lower() is ASCII-only where the model case-folds in full, so around a page
+/// boundary the two can disagree on a name starting with an accented capital.
+/// The model re-sorts whatever arrives, so that only ever moves the boundary
+/// of a page by a row or two — it cannot misorder one; at worst a row near the
+/// boundary is fetched twice and deduped by uid.
+static QString sortKeySql(int column)
+{
+    switch (MessageListModel::SortColumn(column)) {
+    case MessageListModel::SortColumn::From:
+        return QStringLiteral("IFNULL(lower(sender), '')");
+    case MessageListModel::SortColumn::Subject:
+        return QStringLiteral("IFNULL(lower(subject), '')");
+    case MessageListModel::SortColumn::Attachment:
+        return QStringLiteral("(IFNULL(attach, 0) IN (1, 2))");
+    default:
+        return QStringLiteral("date");
+    }
+}
+
+/// The anchor row's value of that key, as a bind value.
+static QVariant sortKeyValue(int column, const MessageListModel::Header &h)
+{
+    switch (MessageListModel::SortColumn(column)) {
+    case MessageListModel::SortColumn::From:
+        return h.from.toLower();
+    case MessageListModel::SortColumn::Subject:
+        return h.subject.toLower();
+    case MessageListModel::SortColumn::Attachment:
+        return int(MessageListModel::kindHasAttachment(h.attachKind));
+    default:
+        return h.date.isValid() ? h.date.toSecsSinceEpoch() : 0;
+    }
+}
+
+QList<MessageListModel::Header> MailStore::sortedHeaders(const QString &folder, int column,
+                                                         bool descending, int limit,
+                                                         const MessageListModel::Header *after)
+{
+    SlowGuard guard("sortedHeaders");
+    return sortedHeadersOn(m_db, scoped(folder), column, descending, limit, after);
+}
+
+QList<MessageListModel::Header> MailStore::sortedHeadersOn(QSqlDatabase &db,
+                                                           const QString &scopedFolder,
+                                                           int column, bool descending, int limit,
+                                                           const MessageListModel::Header *after)
+{
+    if (!db.isOpen() || scopedFolder.isEmpty())
+        return {};
+
+    const bool byAttachment =
+        MessageListModel::SortColumn(column) == MessageListModel::SortColumn::Attachment;
+    const QString key = sortKeySql(column);
+    const QLatin1String dir(descending ? " DESC" : " ASC");
+    const QLatin1String rev(descending ? " ASC" : " DESC");
+    // Ties break on uid exactly as lessThan() does, which makes the ordering
+    // total: every row has one place, so "the next page" is well-defined.
+    // Inside an attachment group the model orders chronologically *against*
+    // the group direction, hence `rev` on the date there.
+    QString order = QStringLiteral(" ORDER BY ") + key + dir;
+    if (byAttachment)
+        order += QStringLiteral(", date") + rev;
+    order += QStringLiteral(", uid") + dir;
+
+    // Keyset predicate: strictly after \a after in that total order.
+    const QLatin1String cmp(descending ? "<" : ">");
+    const QLatin1String cmpRev(descending ? ">" : "<");
+    QString where;
+    if (after) {
+        if (byAttachment)
+            where = QStringLiteral(" AND (%1 %2 ? OR (%1 = ? AND (date %3 ?"
+                                   " OR (date = ? AND uid %2 ?))))")
+                        .arg(key, cmp, cmpRev);
+        else
+            where = QStringLiteral(" AND (%1 %2 ? OR (%1 = ? AND uid %2 ?))").arg(key, cmp);
+    }
+
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
+                             " color, crypto, spam_score, spam_state, spam_detail,"
+                             " IFNULL(remote_id, CAST(uid AS TEXT))"
+                             " FROM messages WHERE folder = ?")
+              + where + order + QStringLiteral(" LIMIT ?"));
+    q.addBindValue(scopedFolder);
+    if (after) {
+        const QVariant anchor = sortKeyValue(column, *after);
+        q.addBindValue(anchor);
+        q.addBindValue(anchor);
+        if (byAttachment) {
+            const qint64 date = after->date.isValid() ? after->date.toSecsSinceEpoch() : 0;
+            q.addBindValue(date);
+            q.addBindValue(date);
+        }
+        q.addBindValue(after->uid);
+    }
+    q.addBindValue(limit);
+    return readHeaderRows(q);
+}
+
 QList<MessageListModel::Header> MailStore::headersByColor(const QString &folder, int color,
                                                           int limit)
 {
@@ -671,7 +785,40 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
             " WHERE m.folder = ? AND m.uid = ?"
             " AND NOT EXISTS (SELECT 1 FROM fts WHERE rowid = m.rowid)"));
     }
+    // Familiarity counts messages, not sightings: storeHeaders runs again over
+    // mail already cached on every refresh and rescore, so a blind increment
+    // would let one much-refreshed folder invent a history the user never had.
+    // The primary-key probe below is what makes it idempotent.
+    QSqlQuery seenBefore(db);
+    seenBefore.prepare(QStringLiteral(
+        "SELECT 1 FROM messages WHERE folder = ? AND uid = ?"));
+    QSqlQuery bumpOrg(db);
+    bumpOrg.prepare(QStringLiteral(
+        "INSERT INTO sender_domains (org, seen, first_seen, last_seen)"
+        " VALUES (?, 1, ?, ?)"
+        " ON CONFLICT(org) DO UPDATE SET"
+        "  seen = seen + 1,"
+        "  first_seen = MIN(first_seen, excluded.first_seen),"
+        "  last_seen = MAX(last_seen, excluded.last_seen)"));
+
     for (const auto &h : headers) {
+        seenBefore.addBindValue(key);
+        seenBefore.addBindValue(h.uid);
+        const bool isNew = !(seenBefore.exec() && seenBefore.next());
+        seenBefore.finish();
+        if (isNew) {
+            const QString org =
+                SpamHeuristics::organizationalDomainOf(SpamHeuristics::addressOf(h.from));
+            const qint64 when = h.date.isValid() ? h.date.toSecsSinceEpoch() : 0;
+            if (!org.isEmpty() && when > 0) {
+                bumpOrg.addBindValue(org);
+                bumpOrg.addBindValue(when);
+                bumpOrg.addBindValue(when);
+                bumpOrg.exec();
+                bumpOrg.finish();
+            }
+        }
+
         q.addBindValue(key);
         q.addBindValue(h.uid);
         q.addBindValue(h.subject);
@@ -2139,6 +2286,44 @@ QSet<QString> MailStore::knownCorrespondents(const QSet<QString> &addresses)
             continue;
         while (q.next())
             out.insert(q.value(0).toString());
+    }
+    return out;
+}
+
+QHash<QString, MailStore::DomainHistory>
+MailStore::senderDomainHistory(const QSet<QString> &orgs)
+{
+    QHash<QString, DomainHistory> out;
+    if (!m_db.isOpen() || orgs.isEmpty())
+        return out;
+    const QStringList list(orgs.cbegin(), orgs.cend());
+    // Same chunking as knownCorrespondents, for the same reason: one statement
+    // per FETCH batch rather than one per message, and never more bound
+    // parameters than SQLite's default limit allows.
+    constexpr int chunk = 500;
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    for (qsizetype start = 0; start < list.size(); start += chunk) {
+        const QStringList slice = list.mid(start, chunk);
+        const QString placeholders =
+            QStringList(slice.size(), QStringLiteral("?")).join(QLatin1Char(','));
+        QSqlQuery q(m_db);
+        q.prepare(QStringLiteral("SELECT org, seen, first_seen FROM sender_domains"
+                                 " WHERE org IN (%1)")
+                      .arg(placeholders));
+        for (const QString &o : slice)
+            q.addBindValue(o);
+        if (!q.exec())
+            continue;
+        while (q.next()) {
+            DomainHistory h;
+            h.seen = q.value(1).toInt();
+            const qint64 first = q.value(2).toLongLong();
+            // Age is measured to now rather than to last_seen: what the scorer
+            // is asking is "has this domain been around a while", and a domain
+            // that wrote fifty times last Tuesday should not read as old.
+            h.days = first > 0 && now > first ? static_cast<int>((now - first) / 86400) : 0;
+            out.insert(q.value(0).toString(), h);
+        }
     }
     return out;
 }

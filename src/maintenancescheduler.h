@@ -121,6 +121,20 @@ public:
     /// rather than queueing one pass per call.
     void scheduleUnreadRecount();
 
+    // --- sorted paging -----------------------------------------------------
+    /// Reads one page of \a scopedFolder under the sort the list is showing and
+    /// hands it back through sortPageReady(): the first page when \a after is
+    /// null, else the page following \a after (keyset, in the sort's own
+    /// direction). Sorting by sender or subject has no index behind it and so
+    /// sorts the whole folder per page, which is why this is a worker job and
+    /// not a call on the store.
+    ///
+    /// Only the newest request matters — the user clicking through three column
+    /// headers wants the third one — so a request arriving while a worker runs
+    /// replaces whatever was waiting rather than queueing behind it.
+    void startSortPage(const QString &scopedFolder, int column, bool descending,
+                       const MessageListModel::Header *after, int limit = 500);
+
 Q_SIGNALS:
     /// A breadcrumb for the status line.
     void statusMessage(const QString &text);
@@ -138,6 +152,14 @@ Q_SIGNALS:
     void folderOpsFinished();
     /// Fresh unread counts for every account, by storage key.
     void unreadCountsReady(const QHash<QString, QHash<QString, int>> &counts);
+    /// One page of \a scopedFolder under (\a column, \a descending). The sort
+    /// and folder are echoed back because the answer arrives after a click or
+    /// a folder switch may have moved on, and a stale page must not be shown.
+    /// \a append distinguishes a follow-on page from a first page (which
+    /// replaces the list); an empty \a rows with \a append set means the end
+    /// of the cache was reached.
+    void sortPageReady(const QString &scopedFolder, int column, bool descending, bool append,
+                       const QList<MessageListModel::Header> &rows);
 
 private:
     /// Writer-thread loop: drains m_bodyWriteQueue into batched transactions.
@@ -154,6 +176,9 @@ private:
     /// parses the raw message and writes its text into the FTS index.
     void reindexPendingBodies();
     void startUnreadRecount();
+    /// Runs the pending sorted-page request, if there is one and no worker
+    /// holds the slot.
+    void startSortPageNow();
 
     MailStore &m_store;
     std::function<QString(KMime::Message *)> m_indexText;
@@ -193,4 +218,13 @@ private:
     QThread *m_unreadThread = nullptr;  ///< unread-count recount for the sidebar
     bool m_unreadRecountQueued = false; ///< a request arrived while one was running
     QTimer m_unreadDebounce;
+
+    QThread *m_sortPageThread = nullptr; ///< reads one sorted page of the folder
+    bool m_sortPagePending = false;      ///< m_sortPage* holds a request not yet run
+    QString m_sortPageFolder;
+    int m_sortPageColumn = 0;
+    bool m_sortPageDescending = true;
+    int m_sortPageLimit = 500;
+    bool m_sortPageHasAnchor = false; ///< false = first page, true = page after the anchor
+    MessageListModel::Header m_sortPageAnchor;
 };
