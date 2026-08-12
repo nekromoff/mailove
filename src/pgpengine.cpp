@@ -13,7 +13,7 @@
 
 #include <algorithm>
 
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
 #include <gpgme++/context.h>
 #include <gpgme++/decryptionresult.h>
 #include <gpgme++/encryptionresult.h>
@@ -45,10 +45,10 @@
 
 namespace
 {
-/// Its own category rather than mailo.trace: this file is also linked into
+/// Its own category rather than mailove.trace: this file is also linked into
 /// pgpkeytool, which has no MailClient and so no trace category to borrow.
-/// Enable with QT_LOGGING_RULES="mailo.pgp.debug=true".
-Q_LOGGING_CATEGORY(logPgp, "mailo.pgp")
+/// Enable with QT_LOGGING_RULES="mailove.pgp.debug=true".
+Q_LOGGING_CATEGORY(logPgp, "mailove.pgp")
 
 PgpEngine *g_instance = nullptr;
 }
@@ -97,7 +97,7 @@ QVariantMap PgpKey::toVariantMap() const
 class PgpEngine::Private
 {
 public:
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
     /// The GpgME keys behind the m_keys snapshot. Looked up by fingerprint,
     /// not by position — m_keys is sorted for display and the two are not
     /// parallel.
@@ -115,7 +115,7 @@ public:
 #endif
 };
 
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
 namespace
 {
 QString cstr(const char *s)
@@ -200,13 +200,13 @@ PgpEngine::PgpEngine(QObject *parent)
     // The reasons a machine has no OpenPGP, in the order they are worth
     // checking. Each one ends here: nothing below talks to gpg, and the UI
     // shows the reason in place of the encryption settings.
-    if (qEnvironmentVariableIsSet("MAILO_NO_OPENPGP")) {
+    if (qEnvironmentVariableIsSet("MAILOVE_NO_OPENPGP")) {
         // The off switch, for a session that should not touch gpg at all —
         // and the only way to see the degraded UI on a machine that has it.
         m_unavailableReason = tr("OpenPGP encryption is switched off "
-                                 "(MAILO_NO_OPENPGP is set).");
+                                 "(MAILOVE_NO_OPENPGP is set).");
     }
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
     else if (const GpgME::Error initErr = GpgME::initializeLibrary(0)) {
         // Must run before any other GpgME call, and is safe to repeat.
         qCWarning(logPgp, "openpgp: library init failed: %s",
@@ -228,7 +228,7 @@ PgpEngine::PgpEngine(QObject *parent)
     }
 #else
     else {
-        m_unavailableReason = tr("This build of Mailo has no OpenPGP support.");
+        m_unavailableReason = tr("This build of Mailove has no OpenPGP support.");
     }
 #endif
 
@@ -289,7 +289,7 @@ void PgpEngine::refresh()
 {
     if (!m_available)
         return;
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
     if (m_refreshing) {
         // Whatever changed the keyring did so after the running listing read
         // it, so that listing's answer is already out of date.
@@ -430,7 +430,7 @@ void PgpEngine::importKeyData(const QByteArray &keyData)
         Q_EMIT importFinished(0, 0, m_unavailableReason);
         return;
     }
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
     if (keyData.isEmpty()) {
         Q_EMIT importFinished(0, 0, tr("There is no key here to import."));
         return;
@@ -513,7 +513,7 @@ void PgpEngine::exportPublicKey(const QString &fingerprint, const QUrl &fileUrl)
         Q_EMIT exportFinished(path, m_unavailableReason);
         return;
     }
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
     QGpgME::ExportJob *job = QGpgME::openpgp()->publicKeyExportJob(true);
     if (!job) {
         Q_EMIT exportFinished(path, tr("Keys cannot be exported."));
@@ -551,7 +551,7 @@ void PgpEngine::setOwnerTrust(const QString &fingerprint, int trust)
         reportUnavailable();
         return;
     }
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
     const GpgME::Key key = d->rawKey(fingerprint);
     if (key.isNull()) {
         Q_EMIT errorOccurred(tr("That key is no longer in the keyring."));
@@ -599,7 +599,7 @@ void PgpEngine::deletePublicKey(const QString &fingerprint)
         reportUnavailable();
         return;
     }
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
     const GpgME::Key key = d->rawKey(fingerprint);
     if (key.isNull()) {
         Q_EMIT errorOccurred(tr("That key is no longer in the keyring."));
@@ -647,7 +647,7 @@ void PgpEngine::generateKey(const QString &name, const QString &email, int expir
         Q_EMIT keyGenerated(QString(), m_unavailableReason);
         return;
     }
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
     // The parameter block is line-oriented and unescaped, so a colon or a
     // newline in either field would write a parameter of the attacker's
     // choosing — the same header-injection shape the compose fields guard
@@ -666,7 +666,7 @@ void PgpEngine::generateKey(const QString &name, const QString &email, int expir
 
     // Ed25519 for signing with a Curve25519 encryption subkey: the modern
     // default, and what gpg --quick-gen-key produces. %ask-passphrase sends
-    // the passphrase prompt to pinentry — it never passes through mailo.
+    // the passphrase prompt to pinentry — it never passes through mailove.
     QString params = QStringLiteral(
         "<GnupgKeyParms format=\"internal\">\n"
         "%ask-passphrase\n"
@@ -723,7 +723,7 @@ void PgpEngine::generateKey(const QString &name, const QString &email, int expir
 #endif
 }
 
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
 namespace
 {
 /// Turns GpgME's verdict into the one the UI states, and names the signer from
@@ -759,12 +759,12 @@ PgpSignatureInfo convertSignature(const GpgME::Signature &sig, const QList<PgpKe
                || sig.status().code() == GPG_ERR_BAD_SIGNATURE) {
         out.status = PgpSignatureInfo::NotVerified;
         // Deliberately not "this signature is invalid". See the note on
-        // PgpSignatureInfo: mailo cannot yet prove it is checking the original
+        // PgpSignatureInfo: mailove cannot yet prove it is checking the original
         // octets, and every mailing list in the world rewrites them.
         out.detail = PgpEngine::tr(
-            "The signature does not match the message as Mailo reconstructed "
+            "The signature does not match the message as Mailove reconstructed "
             "it. That happens whenever anything on the way — a mailing list, a "
-            "forwarder — rewrites the message, and Mailo cannot tell that apart "
+            "forwarder — rewrites the message, and Mailove cannot tell that apart "
             "from a bad signature, so it claims neither.");
     } else if (sig.status()) {
         out.status = PgpSignatureInfo::Error;
@@ -831,7 +831,7 @@ quint64 PgpEngine::verifyDetached(const QByteArray &signedOctets, const QByteArr
         reportUnavailable();
         return 0;
     }
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
     if (signedOctets.isEmpty() || signature.isEmpty())
         return 0;
     QGpgME::VerifyDetachedJob *job = QGpgME::openpgp()->verifyDetachedJob();
@@ -895,7 +895,7 @@ quint64 PgpEngine::signDetached(const QByteArray &data, const QString &signerFin
         reportUnavailable();
         return 0;
     }
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
     const GpgME::Key signer = d->rawKey(signerFingerprint);
     if (data.isEmpty() || signer.isNull()) {
         Q_EMIT signFinished(0, {}, {}, tr("The signing key is not in your keyring."));
@@ -948,7 +948,7 @@ quint64 PgpEngine::encryptTo(const QByteArray &data, const QStringList &fingerpr
         reportUnavailable();
         return 0;
     }
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
     std::vector<GpgME::Key> recipients;
     for (const QString &fp : fingerprints) {
         const GpgME::Key k = d->rawKey(fp);
@@ -977,7 +977,7 @@ quint64 PgpEngine::encryptTo(const QByteArray &data, const QStringList &fingerpr
                 }
                 Q_EMIT encryptFinished(id, cipherText, QString());
             });
-    // AlwaysTrust: the user chose these keys through mailo's own UI, which only
+    // AlwaysTrust: the user chose these keys through mailove's own UI, which only
     // offers keys that are in the keyring and usable. Without it gpg refuses
     // any key the user has not signed, which for mail is nearly all of them.
     const GpgME::Error err = job->start(recipients, data, GpgME::Context::AlwaysTrust);
@@ -1000,7 +1000,7 @@ quint64 PgpEngine::decrypt(const QByteArray &cipherText)
         reportUnavailable();
         return 0;
     }
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
     if (cipherText.isEmpty())
         return 0;
     QGpgME::DecryptVerifyJob *job = QGpgME::openpgp()->decryptVerifyJob();

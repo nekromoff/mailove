@@ -1,4 +1,4 @@
-# Packaging Mailo
+# Packaging Mailove
 
 ## Debian package (.deb)
 
@@ -8,7 +8,7 @@ CPack is configured in the top-level `CMakeLists.txt`:
 cmake -B build -S . && cmake --build build --target package-deb
 ```
 
-That leaves `mailo_<version>_<arch>.deb` — the version being the one in
+That leaves `mailove_<version>_<arch>.deb` — the version being the one in
 `project()` — in the **project root**, not inside the build tree, and removes
 CPack's `_CPack_Packages` staging directory afterwards. `cd build && cpack -G DEB`
 still works and produces the same package, but leaves both where CPack put them.
@@ -30,29 +30,29 @@ Debian has no `License` control field — the author and licence live elsewhere:
 |-------|------|
 | `Maintainer:` control field | `CPACK_PACKAGE_CONTACT` in `CMakeLists.txt` |
 | `Homepage:` control field | `CPACK_DEBIAN_PACKAGE_HOMEPAGE` |
-| `/usr/share/doc/mailo/copyright` | `packaging/copyright` (DEP-5, LGPL-3.0-or-later) |
-| `/usr/share/doc/mailo/changelog.gz` | `packaging/changelog` — mandatory for a native package |
-| `/usr/share/man/man1/mailo.1.gz` | `packaging/mailo.1` |
+| `/usr/share/doc/mailove/copyright` | `packaging/copyright` (DEP-5, LGPL-3.0-or-later) |
+| `/usr/share/doc/mailove/changelog.gz` | `packaging/changelog` — mandatory for a native package |
+| `/usr/share/man/man1/mailove.1.gz` | `packaging/mailove.1` |
 | Software-centre "developer" | `<developer>` in the AppStream metainfo |
 
-Bumping the version means editing `project(mailo VERSION …)` **and** adding a
+Bumping the version means editing `project(mailove VERSION …)` **and** adding a
 `packaging/changelog` entry plus a `<release>` line in the metainfo.
 
 The package is lintian-clean; check after changes with:
 
 ```sh
-lintian build/mailo_1.0_amd64.deb
+lintian build/mailove_1.0_amd64.deb
 ```
 
-# Packaging Mailo as an AppImage
+# Packaging Mailove as an AppImage
 
 ## Files here
 
 | File | Purpose |
 |------|---------|
-| `org.mailo.Mailo.desktop` | Desktop entry (required by AppImage). |
-| `org.mailo.Mailo.svg` | Application icon (scalable). |
-| `org.mailo.Mailo.metainfo.xml` | AppStream metadata. |
+| `org.mailove.Mailove.desktop` | Desktop entry (required by AppImage). |
+| `org.mailove.Mailove.svg` | Application icon (scalable). |
+| `org.mailove.Mailove.metainfo.xml` | AppStream metadata. |
 | `build-appimage.sh` | Builds the AppImage end to end. |
 
 All three data files are installed by CMake into the standard XDG locations
@@ -61,12 +61,12 @@ All three data files are installed by CMake into the standard XDG locations
 ## Build
 
 ```sh
-packaging/build-appimage.sh          # → <project root>/Mailo-<version>-x86_64.AppImage
+packaging/build-appimage.sh          # → <project root>/Mailove-<version>-x86_64.AppImage
 cmake --build build --target packages   # both the .deb and the AppImage
 ```
 
 The version comes from `project()` in `CMakeLists.txt`, which the configure step
-writes to `mailo-version.txt` in the AppImage build tree — the script reads it
+writes to `mailove-version.txt` in the AppImage build tree — the script reads it
 from there rather than keeping a second copy of the number. The artifact lands
 in the project root whichever directory the script is run from.
 
@@ -76,7 +76,7 @@ wrong for your distro.
 
 ## Prerequisites
 
-- Full build toolchain and Mailo's build deps: Qt6 (Core, Gui, Network, Qml,
+- Full build toolchain and Mailove's build deps: Qt6 (Core, Gui, Network, Qml,
   Quick, QuickControls2, Sql, **WebEngineQuick**), KPim6 IMAP/Mime/SMTP, qtkeychain.
 - **Internet on first run** — the script downloads `linuxdeploy` and
   `linuxdeploy-plugin-qt` into `./tools` (cached afterwards).

@@ -513,7 +513,7 @@ Q_SIGNALS:
     void busyChanged();
     void statusTextChanged();
     /// Fired when a full message body has been fetched and parsed.
-    /// bodyUrl is a mailo:// URL the viewer should load.
+    /// bodyUrl is a mailove:// URL the viewer should load.
     void messageLoaded(const QString &subject, const QString &from,
                        const QString &to, const QString &cc,
                        const QString &date, const QString &bodyUrl,

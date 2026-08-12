@@ -244,8 +244,8 @@ int main(int argc, char *argv[])
                                  // separate --verify run, which is the only
                                  // proof that a recipient's client would accept
                                  // what we built.
-                                 if (qEnvironmentVariableIsSet("MAILO_ROUNDTRIP_OUT")) {
-                                     QFile f(qEnvironmentVariable("MAILO_ROUNDTRIP_OUT"));
+                                 if (qEnvironmentVariableIsSet("MAILOVE_ROUNDTRIP_OUT")) {
+                                     QFile f(qEnvironmentVariable("MAILOVE_ROUNDTRIP_OUT"));
                                      if (f.open(QIODevice::WriteOnly))
                                          f.write(signedMsg);
                                  }

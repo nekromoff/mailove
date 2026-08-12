@@ -7,7 +7,7 @@
 
 #include <qt6keychain/keychain.h>
 
-static const auto kWalletService = QStringLiteral("mailo");
+static const auto kWalletService = QStringLiteral("mailove");
 static const auto kWalletKey = QStringLiteral("imap-password");
 
 /// SslTls — the enumerator lives on MailClient, which this class deliberately
@@ -21,7 +21,7 @@ AccountStore::AccountStore(QObject *parent)
 
 QSettings AccountStore::settings()
 {
-    return QSettings(QStringLiteral("mailo"), QStringLiteral("mailo"));
+    return QSettings(QStringLiteral("mailove"), QStringLiteral("mailove"));
 }
 
 QString AccountStore::walletKeyFor(const QString &user, const QString &host)
@@ -661,7 +661,7 @@ void AccountStore::readSecret(const AccountConfig &cfg)
             return;
         }
         if (read->error() != QKeychain::EntryNotFound) {
-            qWarning() << "mailo: wallet read failed:" << read->errorString();
+            qWarning() << "mailove: wallet read failed:" << read->errorString();
             finish();
             return;
         }

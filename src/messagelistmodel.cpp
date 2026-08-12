@@ -18,11 +18,11 @@ namespace
 constexpr qint64 kSlowMs = 20;
 
 /// The paging trend, for chasing "scrolling gets slower the longer I hold the
-/// key": every append logs its size and cost when mailo.trace is on, so a cost
+/// key": every append logs its size and cost when mailove.trace is on, so a cost
 /// that grows with the model shows up as a rising series, not a one-off spike.
 const QLoggingCategory &logModel()
 {
-    static const QLoggingCategory cat("mailo.trace");
+    static const QLoggingCategory cat("mailove.trace");
     return cat;
 }
 }

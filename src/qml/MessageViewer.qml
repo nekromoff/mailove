@@ -7,7 +7,7 @@ import QtQuick.Layouts
 import QtQuick.Window
 import QtWebEngine
 import org.kde.kirigami as Kirigami
-import Mailo.Core
+import Mailove.Core
 
 ColumnLayout {
     id: viewer
@@ -69,7 +69,7 @@ ColumnLayout {
     /// carries the From address — signerTrusted. A valid signature from an
     /// unrelated key is exactly what a forger's own key produces, so it gets
     /// the warning wording instead of a reassuring one. And nothing here ever
-    /// says "invalid": Mailo cannot prove it is checking the octets that were
+    /// says "invalid": Mailove cannot prove it is checking the octets that were
     /// signed, so a mismatch is reported as unverified (doc/openpgp.md §3).
     function signatureText() {
         if (!context)
@@ -819,7 +819,7 @@ ColumnLayout {
 
         onLoadingChanged: function (loadInfo) {
             if (loadInfo.status === WebEngineView.LoadFailedStatus)
-                console.warn("mailo viewer: load failed:", loadInfo.errorString, loadInfo.url)
+                console.warn("mailove viewer: load failed:", loadInfo.errorString, loadInfo.url)
             // A new document (another message, or the same one switched to
             // Text/Source) has no highlighting and no counts — search it again.
             if (loadInfo.status === WebEngineView.LoadSucceededStatus) {

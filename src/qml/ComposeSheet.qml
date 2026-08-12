@@ -6,7 +6,7 @@ import QtQuick.Controls as QQC2
 import QtQuick.Dialogs
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
-import Mailo.Core
+import Mailove.Core
 
 /// The composer. A tab page, not a window: the tab strip in Main.qml hosts it.
 /// See the page contract there — title, present(), closeRequested.
@@ -573,7 +573,7 @@ Item {
                     return "Looking for a published key for " + who + "…"
                 return "This message is set to be encrypted, but no OpenPGP key "
                      + "is available for " + who + ".\n\n"
-                     + "Mailo will not encrypt to the others and quietly leave "
+                     + "Mailove will not encrypt to the others and quietly leave "
                      + who + " out, and it will not send in the clear without "
                      + "asking. Look the key up, send this one unencrypted, or "
                      + "cancel and deal with it later."
@@ -891,7 +891,7 @@ Item {
                              + "this message can be encrypted."
                     return "No OpenPGP key available for " + missing.join(", ")
                          + (Mail.accountPgpAutoWkd
-                            ? " — Mailo is asking their domain for one."
+                            ? " — Mailove is asking their domain for one."
                             : " — encryption is unavailable for this message.")
                 }
                 QQC2.ToolTip.visible: hovered

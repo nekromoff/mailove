@@ -24,7 +24,7 @@
 
 Q_DECLARE_LOGGING_CATEGORY(logTrace)
 
-/// Drops Qt warnings that say nothing about mailo. Two come out of
+/// Drops Qt warnings that say nothing about mailove. Two come out of
 /// QTextDocument while it parses a sender's HTML for the plain-text preview
 /// and the search index:
 ///
@@ -38,7 +38,7 @@ Q_DECLARE_LOGGING_CATEGORY(logTrace)
 /// make real diagnostics unreadable.
 ///
 /// The third is Kirigami's: ToolBarPageHeader.qml binds
-/// `root.pageRow?.separatorVisible && …` to a bool, and with no PageRow (mailo
+/// `root.pageRow?.separatorVisible && …` to a bool, and with no PageRow (mailove
 /// does not use one) the ?. yields undefined and the assignment warns —
 /// upstream's bug, one line per header built. Anything else is passed through
 /// untouched.
@@ -78,14 +78,14 @@ int main(int argc, char *argv[])
     // instead — no Places sidebar, and colors of their own rather than the
     // desktop's. Nothing else here uses a widget.
     QApplication app(argc, argv);
-    QGuiApplication::setOrganizationName(QStringLiteral("mailo"));
-    QGuiApplication::setApplicationName(QStringLiteral("mailo"));
-    QGuiApplication::setApplicationVersion(QStringLiteral(MAILO_VERSION));
+    QGuiApplication::setOrganizationName(QStringLiteral("mailove"));
+    QGuiApplication::setApplicationName(QStringLiteral("mailove"));
+    QGuiApplication::setApplicationVersion(QStringLiteral(MAILOVE_VERSION));
     // Wayland matches a window to its .desktop entry (and hence its icon) by
     // app_id, which Qt takes from the desktop file name — it must be the
     // desktop entry's basename, not the application name. X11 uses the window
     // icon instead, so set both.
-    QGuiApplication::setDesktopFileName(QStringLiteral("org.mailo.Mailo"));
+    QGuiApplication::setDesktopFileName(QStringLiteral("org.mailove.Mailove"));
 
     // The UI asks for named icons (mail-attachment, arrow-down, …), which only
     // resolve once an icon theme is set. A KDE session sets one; anything else
@@ -98,7 +98,7 @@ int main(int argc, char *argv[])
         || !QIcon::hasThemeIcon(QStringLiteral("mail-message-new"))) {
         QIcon::setThemeName(QStringLiteral("breeze"));
     }
-    QGuiApplication::setWindowIcon(QIcon::fromTheme(QStringLiteral("org.mailo.Mailo")));
+    QGuiApplication::setWindowIcon(QIcon::fromTheme(QStringLiteral("org.mailove.Mailove")));
 
     // GUI-thread stall detector: a 100 ms heartbeat whose late firing is the
     // definition of a frozen UI. Everything instrumented so far (cache
@@ -113,7 +113,7 @@ int main(int argc, char *argv[])
         QObject::connect(beat, &QTimer::timeout, &app, [last] {
             const qint64 gap = last->restart();
             if (gap > 500)
-                qWarning("mailo: GUI thread stalled ~%lld ms", gap - 100);
+                qWarning("mailove: GUI thread stalled ~%lld ms", gap - 100);
             else if (gap > 220)
                 qCDebug(logTrace, "GUI heartbeat late: %lld ms", gap - 100);
         });
@@ -143,20 +143,20 @@ int main(int argc, char *argv[])
     client.setPgpEngine(&pgp);
 
     QQmlApplicationEngine engine;
-    qmlRegisterSingletonInstance("Mailo.Core", 1, 0, "Mail", &client);
-    qmlRegisterSingletonInstance("Mailo.Core", 1, 0, "Pgp", &pgp);
-    qmlRegisterType<DocumentHandler>("Mailo.Core", 1, 0, "DocumentHandler");
+    qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "Mail", &client);
+    qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "Pgp", &pgp);
+    qmlRegisterType<DocumentHandler>("Mailove.Core", 1, 0, "DocumentHandler");
     // Created per view: the key manager and each key picker filter differently
     // over the one keyring snapshot PgpEngine holds.
-    qmlRegisterType<PgpKeyModel>("Mailo.Core", 1, 0, "PgpKeyModel");
+    qmlRegisterType<PgpKeyModel>("Mailove.Core", 1, 0, "PgpKeyModel");
     // Created only by MailClient (reading pane + detached message windows).
     qmlRegisterUncreatableType<MessageContext>(
-        "Mailo.Core", 1, 0, "MessageContext",
+        "Mailove.Core", 1, 0, "MessageContext",
         QStringLiteral("MessageContext instances come from Mail"));
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed,
                      &app, [] { QCoreApplication::exit(1); },
                      Qt::QueuedConnection);
-    engine.loadFromModule("Mailo", "Main");
+    engine.loadFromModule("Mailove", "Main");
 
     const int rc = app.exec();
     // Bracket the teardown: if the window disappears but the process does not,

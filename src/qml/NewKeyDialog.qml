@@ -5,11 +5,11 @@ import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
-import Mailo.Core
+import Mailove.Core
 
 /// Key generation, shared by the account page and the key manager. gpg-agent
 /// asks for the passphrase through pinentry — no passphrase is typed into
-/// mailo — so all this collects is what gpg cannot infer: who the key is for
+/// mailove — so all this collects is what gpg cannot infer: who the key is for
 /// and how long it should last.
 ///
 /// The result arrives on Pgp.keyGenerated(), which the two openers report in
@@ -82,7 +82,7 @@ QQC2.Dialog {
             Layout.maximumWidth: Kirigami.Units.gridUnit * 24
             Layout.fillWidth: true
             text: "GnuPG will ask you for a passphrase to protect the key. "
-                  + "Mailo never sees that passphrase, and the key itself "
+                  + "Mailove never sees that passphrase, and the key itself "
                   + "stays in GnuPG's own storage."
             wrapMode: Text.Wrap
             opacity: 0.8

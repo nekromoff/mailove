@@ -120,7 +120,7 @@ QSet<QString> FolderModel::savedCollapsed(const QString &accountKey)
 {
     if (accountKey.isEmpty())
         return {};
-    QSettings s(QStringLiteral("mailo"), QStringLiteral("mailo"));
+    QSettings s(QStringLiteral("mailove"), QStringLiteral("mailove"));
     const QStringList saved = s.value(collapsedSettingsKey(accountKey)).toStringList();
     return QSet<QString>(saved.begin(), saved.end());
 }
@@ -129,7 +129,7 @@ void FolderModel::toggleSavedCollapsed(const QString &accountKey, const QString 
 {
     if (accountKey.isEmpty() || mailBox.isEmpty())
         return;
-    QSettings s(QStringLiteral("mailo"), QStringLiteral("mailo"));
+    QSettings s(QStringLiteral("mailove"), QStringLiteral("mailove"));
     const QString key = collapsedSettingsKey(accountKey);
     QStringList saved = s.value(key).toStringList();
     if (saved.removeAll(mailBox) == 0)
@@ -150,7 +150,7 @@ void FolderModel::saveCollapsed() const
 {
     if (m_accountKey.isEmpty())
         return;
-    QSettings s(QStringLiteral("mailo"), QStringLiteral("mailo"));
+    QSettings s(QStringLiteral("mailove"), QStringLiteral("mailove"));
     s.setValue(collapsedSettingsKey(m_accountKey), QStringList(m_collapsed.values()));
 }
 

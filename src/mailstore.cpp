@@ -66,12 +66,12 @@ bool MailStore::open()
     QFile::setPermissions(dir, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
 
     m_db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("mailstore"));
-    m_db.setDatabaseName(dir + QStringLiteral("/mailo.db"));
+    m_db.setDatabaseName(dir + QStringLiteral("/mailove.db"));
     if (!m_db.open()) {
         qWarning() << "mailstore: cannot open database:" << m_db.lastError().text();
         return false;
     }
-    QFile::setPermissions(dir + QStringLiteral("/mailo.db"),
+    QFile::setPermissions(dir + QStringLiteral("/mailove.db"),
                           QFile::ReadOwner | QFile::WriteOwner);
 
     SlowGuard guard("open");
@@ -1341,7 +1341,7 @@ QSqlDatabase MailStore::openWorkerConnection(const QString &name)
 {
     QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), name);
     db.setDatabaseName(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
-                       + QStringLiteral("/mailo.db"));
+                       + QStringLiteral("/mailove.db"));
     if (!db.open()) {
         qWarning() << "mailstore: worker connection failed:" << db.lastError().text();
         return {};
@@ -1881,7 +1881,7 @@ int MailStore::purgeChunkOn(QSqlDatabase &db, const QString &key, int limit)
     q.exec();
     // The refs go with the rows they point at, but no recipient is pruned
     // here: this is cache eviction, not deletion. Nobody threw the mail away,
-    // mailo just stopped keeping a copy of it, and forgetting who it was
+    // mailove just stopped keeping a copy of it, and forgetting who it was
     // addressed to is not part of that bargain.
     q.prepare(QStringLiteral("DELETE FROM recipient_refs WHERE folder = ? AND uid IN (%1)")
                   .arg(uidIn));
@@ -1907,7 +1907,7 @@ void MailStore::purgeFolder(const QString &scopedFolder, const QAtomicInt &cance
     {
         QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), name);
         db.setDatabaseName(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
-                           + QStringLiteral("/mailo.db"));
+                           + QStringLiteral("/mailove.db"));
         if (db.open()) {
             QSqlQuery pragma(db);
             // The GUI thread is the other writer. Chunks are small enough that
@@ -1959,7 +1959,7 @@ bool MailStore::vacuum(QString *error)
     {
         QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), name);
         db.setDatabaseName(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
-                           + QStringLiteral("/mailo.db"));
+                           + QStringLiteral("/mailove.db"));
         if (!db.open()) {
             if (error)
                 *error = db.lastError().text();

@@ -1,4 +1,4 @@
-mailo (2.1) unstable; urgency=medium
+mailove (2.1) unstable; urgency=medium
 
   * Accounts other than the open one now sync their mail in the background,
     not just their unread counts. Each refresh walks that account's folders —
@@ -13,7 +13,7 @@ mailo (2.1) unstable; urgency=medium
 
  -- Daniel Duris <dusoft@staznosti.sk>  Fri, 07 Aug 2026 12:00:00 +0200
 
-mailo (2.0) unstable; urgency=medium
+mailove (2.0) unstable; urgency=medium
 
   * JMAP support (RFC 8620/8621). An account now chooses its protocol: IMAP
     as before, or JMAP, which discovers its own endpoints from the address
@@ -43,7 +43,7 @@ mailo (2.0) unstable; urgency=medium
 
  -- Daniel Duris <dusoft@staznosti.sk>  Wed, 05 Aug 2026 12:00:00 +0200
 
-mailo (1.5) unstable; urgency=medium
+mailove (1.5) unstable; urgency=medium
 
   * Unread counts in the folder pane: a pill on every folder, blue on the
     inbox, and an outline on a collapsed folder standing in for the unread
@@ -72,7 +72,7 @@ mailo (1.5) unstable; urgency=medium
 
  -- Daniel Duris <dusoft@staznosti.sk>  Tue, 04 Aug 2026 12:00:00 +0200
 
-mailo (1.1) unstable; urgency=medium
+mailove (1.1) unstable; urgency=medium
 
   * Compose, Settings and opened messages are tabs in the main window rather
     than separate windows; the composer can still be a window of its own
@@ -90,7 +90,7 @@ mailo (1.1) unstable; urgency=medium
 
  -- Daniel Duris <dusoft@staznosti.sk>  Sun, 02 Aug 2026 12:00:00 +0200
 
-mailo (1.0) unstable; urgency=medium
+mailove (1.0) unstable; urgency=medium
 
   * Attachments are stored as content-addressed files outside the database,
     deduplicated and zstd-compressed; existing caches are migrated in place.
@@ -107,7 +107,7 @@ mailo (1.0) unstable; urgency=medium
 
  -- Daniel Duris <dusoft@staznosti.sk>  Fri, 31 Jul 2026 12:00:00 +0200
 
-mailo (0.9) unstable; urgency=medium
+mailove (0.9) unstable; urgency=medium
 
   * Initial release.
 

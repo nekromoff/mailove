@@ -41,7 +41,7 @@ QByteArray compressibleData(int size)
 QByteArray incompressibleData(int size)
 {
     QByteArray out;
-    QByteArray seed("mailo-seed");
+    QByteArray seed("mailove-seed");
     while (out.size() < size) {
         seed = QCryptographicHash::hash(seed, QCryptographicHash::Sha256);
         out += seed;
@@ -53,8 +53,8 @@ QByteArray incompressibleData(int size)
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
-    QCoreApplication::setOrganizationName(QStringLiteral("mailo-test"));
-    QCoreApplication::setApplicationName(QStringLiteral("mailo-test"));
+    QCoreApplication::setOrganizationName(QStringLiteral("mailove-test"));
+    QCoreApplication::setApplicationName(QStringLiteral("mailove-test"));
 
     // Never touch the real cache.
     const QString root = AttachmentStore::rootDir();

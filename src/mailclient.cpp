@@ -53,7 +53,7 @@ static QSettings appSettings()
 
 /// The keyring "service" every entry of ours is filed under. The keys within
 /// it are AccountStore's to name — see walletKeyFor()/oauthWalletKeyFor().
-static const auto kWalletService = QStringLiteral("mailo");
+static const auto kWalletService = QStringLiteral("mailove");
 
 // Background-sync pacing. Headers are cheap, bodies move real bandwidth, so
 // they are fetched in modest windows with a deliberate pause between windows
@@ -314,7 +314,7 @@ static QString countNoun(qint64 n, const char *singular, const char *plural)
 
 /// Opt-in diagnostics (Settings -> General -> "Log activity to console"). Off
 /// by default so a normal run stays quiet; toggling needs no restart.
-Q_LOGGING_CATEGORY(logTrace, "mailo.trace")
+Q_LOGGING_CATEGORY(logTrace, "mailove.trace")
 
 /// Condense a verbose/multi-line error (often a raw server or KJob string)
 /// into a terse status crumb: first line only, trailing punctuation trimmed,
@@ -734,6 +734,31 @@ static QChar folderSeparatorOf(const QString &mailBox)
     return mailBox.contains(QLatin1Char('/')) ? QLatin1Char('/') : QLatin1Char('.');
 }
 
+/// Gmail hangs its default folders — Sent Mail, Drafts, Trash, Spam, Starred,
+/// Important — off a "[Gmail]" mailbox that is \Noselect: a namespace marker,
+/// not a folder. The user's labels are plain top-level mailboxes beside it.
+/// "[Google Mail]" is the same thing under Google's UK/DE branding.
+static bool isGmailNamespace(const QString &component)
+{
+    return component.compare(QLatin1String("[Gmail]"), Qt::CaseInsensitive) == 0
+        || component.compare(QLatin1String("[Google Mail]"), Qt::CaseInsensitive) == 0;
+}
+
+/// Sort rank of one path component: the inbox above its siblings at every
+/// level, and — at the root only — Gmail's namespace above the user's labels.
+/// Its contents are the default folders every other account shows directly
+/// under the inbox, and flattenGmailNamespace() below moves them there; the
+/// rank is what keeps the group in that spot, rather than letting '[' decide
+/// where it lands among the label names.
+static int componentRank(const QString &component, int depth)
+{
+    if (component.compare(QLatin1String("inbox"), Qt::CaseInsensitive) == 0)
+        return 0;
+    if (depth == 0 && isGmailNamespace(component))
+        return 1;
+    return 2;
+}
+
 /// Depth-first order with parents directly above their children — the order
 /// the sidebar's tree rendering depends on (a plain string sort could wedge
 /// "Inbox-old" between "Inbox" and "Inbox/Work").
@@ -747,10 +772,10 @@ static bool mailBoxPathLess(const QString &a, const QString &b, QChar sep)
     const QStringList pa = a.split(sep);
     const QStringList pb = b.split(sep);
     for (int i = 0; i < pa.size() && i < pb.size(); ++i) {
-        const bool ai = pa.at(i).compare(QLatin1String("inbox"), Qt::CaseInsensitive) == 0;
-        const bool bi = pb.at(i).compare(QLatin1String("inbox"), Qt::CaseInsensitive) == 0;
-        if (ai != bi)
-            return ai;
+        const int ra = componentRank(pa.at(i), i);
+        const int rb = componentRank(pb.at(i), i);
+        if (ra != rb)
+            return ra < rb;
         const int c = QString::compare(pa.at(i), pb.at(i), Qt::CaseInsensitive);
         if (c != 0)
             return c < 0;
@@ -829,6 +854,45 @@ static QList<PathRow> pathRows(const QStringList &boxes, QChar knownSep = {})
     return rows;
 }
 
+/// Draws Gmail's namespace the way Gmail's own web UI and Thunderbird do:
+/// the "[Gmail]" container row goes, and the default folders behind it move up
+/// beside the inbox. Left literal, the sidebar showed one unopenable row with
+/// Sent, Drafts and Trash indented under it — and collapsed, which is the
+/// state it is usually in, the account's default folders were not on screen at
+/// all. Labels are unaffected: they are top-level mailboxes already.
+///
+/// Presentation only. mailBox keeps the real IMAP path, which is what SELECT,
+/// the message cache, the special-folder bookkeeping and every rename use.
+static void flattenGmailNamespace(QList<FolderModel::Folder> *folders)
+{
+    // Whether the server listed the container itself is what decides the
+    // indent: its presence is what put its children a step in (pathRows()
+    // counts only the ancestors that are really mailboxes), and its absence is
+    // what leaves the namespace sitting in their display names.
+    int container = -1;
+    for (int i = 0; i < folders->size(); ++i) {
+        if (isGmailNamespace(folders->at(i).mailBox)) {
+            container = i;
+            break;
+        }
+    }
+
+    for (int i = folders->size() - 1; i >= 0; --i) {
+        if (i == container) {
+            folders->removeAt(i);
+            continue;
+        }
+        FolderModel::Folder &f = (*folders)[i];
+        const int cut = f.mailBox.indexOf(folderSeparatorOf(f.mailBox));
+        if (cut < 0 || !isGmailNamespace(f.mailBox.left(cut)))
+            continue;
+        if (container >= 0)
+            f.level = qMax(0, f.level - 1);
+        else if (f.displayName == f.mailBox)
+            f.displayName = f.mailBox.mid(cut + 1);
+    }
+}
+
 QList<FolderModel::Folder> MailClient::foldersFromPaths(const QStringList &paths)
 {
     const QList<PathRow> rows = pathRows(paths);
@@ -841,6 +905,7 @@ QList<FolderModel::Folder> MailClient::foldersFromPaths(const QStringList &paths
         f.displayName = rows.at(i).name;
         folders.append(f);
     }
+    flattenGmailNamespace(&folders);
     return folders;
 }
 
@@ -922,19 +987,19 @@ void MailClient::applyLogFilterRules(bool on)
     // during construction, before the settings-driven call here could quiet
     // it.
     //
-    // Quiet means quiet — for everyone. mailo's own categories were gated one
+    // Quiet means quiet — for everyone. mailove's own categories were gated one
     // by one until the console showed it was a losing game: KIMAP warns about
-    // sessions mailo itself closes and about keepalive lines no job owns, the
+    // sessions mailove itself closes and about keepalive lines no job owns, the
     // viewer's page chats through "js" (its CSP blocks arrive at *error*
     // severity, hence js.critical below), the PSL loader and wipe breadcrumbs
     // debug by default. So logging off blankets every category's debug, info
     // and warning. Critical stays: something exceptional enough to be
     // critical should print even in quiet mode — except "js", where the
     // severity is chosen by the sender's HTML, not by anything being wrong
-    // with mailo. Logging on lifts the blanket and turns the trace on.
-    QLoggingCategory::setFilterRules(on ? QStringLiteral("mailo.trace.debug=true\n"
-                                                         "mailo.psl.debug=true\n"
-                                                         "mailo.wipe.debug=true\n"
+    // with mailove. Logging on lifts the blanket and turns the trace on.
+    QLoggingCategory::setFilterRules(on ? QStringLiteral("mailove.trace.debug=true\n"
+                                                         "mailove.psl.debug=true\n"
+                                                         "mailove.wipe.debug=true\n"
                                                          "js.debug=true\n"
                                                          "js.info=true\n"
                                                          "js.warning=true\n"
@@ -1021,30 +1086,32 @@ QVariantList MailClient::cachedFolderList(int index)
     if (local)
         boxes = sortedLocalFolders(boxes);
     // Rows of the WHOLE list up front: hasChildren must see the next row even
-    // when a collapsed ancestor hides it from the output.
-    const QList<PathRow> rows = pathRows(boxes);
+    // when a collapsed ancestor hides it from the output. Built the same way
+    // the connected account's tree is — Gmail's namespace flattened included,
+    // so an account draws the same whether or not it is the current one.
+    const QList<FolderModel::Folder> rows = foldersFromPaths(boxes);
 
     // Which rows the collapse state hides, and — for the rows that stay — how
     // much unread is folded away underneath them. Same rule as
     // FolderModel::recomputeHiddenUnread(): a folded subfolder must not be
     // able to hide new mail from the parent that stands in for it.
-    QList<bool> hidden(boxes.size(), false);
+    QList<bool> hidden(rows.size(), false);
     {
         int skip = -1;
-        for (int i = 0; i < boxes.size(); ++i) {
+        for (int i = 0; i < rows.size(); ++i) {
             const int level = rows.at(i).level;
             if (skip >= 0 && level > skip) {
                 hidden[i] = true;
                 continue;
             }
-            skip = collapsed.contains(boxes.at(i)) ? level : -1;
+            skip = collapsed.contains(rows.at(i).mailBox) ? level : -1;
         }
     }
-    QList<int> hiddenUnread(boxes.size(), 0);
-    for (int i = 0; i < boxes.size(); ++i) {
+    QList<int> hiddenUnread(rows.size(), 0);
+    for (int i = 0; i < rows.size(); ++i) {
         if (!hidden.at(i))
             continue;
-        const int count = unread.value(boxes.at(i), 0);
+        const int count = unread.value(rows.at(i).mailBox, 0);
         if (count == 0)
             continue;
         for (int j = i - 1, level = rows.at(i).level; j >= 0 && level > 0; --j) {
@@ -1056,19 +1123,19 @@ QVariantList MailClient::cachedFolderList(int index)
     }
 
     int skipDeeperThan = -1; // hide rows below a collapsed ancestor
-    for (int i = 0; i < boxes.size(); ++i) {
-        const QString &mailBox = boxes.at(i);
+    for (int i = 0; i < rows.size(); ++i) {
+        const QString &mailBox = rows.at(i).mailBox;
         const int level = rows.at(i).level;
         if (skipDeeperThan >= 0 && level > skipDeeperThan)
             continue;
         const bool isCollapsed = collapsed.contains(mailBox);
         skipDeeperThan = isCollapsed ? level : -1;
         out.append(QVariantMap{
-            {QStringLiteral("name"), rows.at(i).name},
+            {QStringLiteral("name"), rows.at(i).displayName},
             {QStringLiteral("mailBox"), mailBox},
             {QStringLiteral("level"), level},
             {QStringLiteral("hasChildren"),
-             i + 1 < boxes.size() && rows.at(i + 1).level > level},
+             i + 1 < rows.size() && rows.at(i + 1).level > level},
             {QStringLiteral("expanded"), !isCollapsed},
             {QStringLiteral("unread"), unread.value(mailBox, 0)},
             {QStringLiteral("hiddenUnread"), hiddenUnread.at(i)},
@@ -1611,6 +1678,13 @@ void MailClient::switchAccountInternal(int index, const QString &sessionPassword
     teardownSession();
     m_folderModel.setFolders({});
     m_messageModel.clear();
+    // And the reading pane with it — the same reason openFolder() does it, and
+    // a stronger one: what is in the pane belongs to the account being left.
+    // The list below auto-selects the switched-to account's top row, but its
+    // body is often not cached and the session was just torn down, so the fetch
+    // that follows bails out without presenting anything — leaving the previous
+    // account's mail on screen under this account's selected row.
+    m_reading->clear();
     setSearchActive(false);
     m_sync->resetFolderCursor();
     // Queued \Seen stores name messages of the account being left, and the
@@ -1773,7 +1847,7 @@ std::shared_ptr<KMime::Message> MailClient::composeMessage(
         : fromAddr.section(QLatin1Char('@'), 1);
     msg->messageID()->generate(idDomain.toUtf8());
     msg->userAgent()->fromUnicodeString(
-        QStringLiteral("mailo/" MAILO_VERSION " (https://github.com/nekromoff/mailo)"));
+        QStringLiteral("mailove/" MAILOVE_VERSION " (https://github.com/nekromoff/mailove)"));
 
     const QString plain = QTextDocumentFragment::fromHtml(html).toPlainText();
 
@@ -1872,7 +1946,7 @@ QString MailClient::accountPgpKey() const
 /// One of the active account's boolean OpenPGP settings. Read from QSettings
 /// rather than cached: they change in the settings page, which rewrites the
 /// array wholesale, and a stale copy here would sign mail the user just told
-/// mailo not to sign.
+/// mailove not to sign.
 static bool accountPgpFlag(int index, const char *key, bool fallback)
 {
     QSettings s = appSettings();
@@ -1942,7 +2016,7 @@ void MailClient::applyOutgoingCrypto(const std::shared_ptr<KMime::Message> &msg,
             Q_EMIT sendFailed(tr("No OpenPGP key for %1. The message was not "
                                  "sent — encrypting to the others would leave "
                                  "them out, and sending in the clear is not "
-                                 "something Mailo will do on its own.")
+                                 "something Mailove will do on its own.")
                                   .arg(missing.join(QStringLiteral(", "))));
             return;
         }
@@ -2991,13 +3065,19 @@ void MailClient::applyFolderListing(const QList<MailBackend::FolderInfo> &listed
         }
     }
     Q_EMIT draftsFolderChanged();
-    m_folderModel.setFolders(folders);
-    // A fresh folder list restarts the all-folders background sync pass.
-    m_sync->restartFolderQueue();
+    // Everything the server listed, before the sidebar drops what it does not
+    // draw: the cache is this account's record of which mailboxes exist, and
+    // the tree is rebuilt from it (with the same flattening applied) whenever
+    // the account is shown without being connected.
     QStringList names;
     names.reserve(folders.size());
     for (const auto &f : std::as_const(folders))
         names.append(f.mailBox);
+
+    flattenGmailNamespace(&folders);
+    m_folderModel.setFolders(folders);
+    // A fresh folder list restarts the all-folders background sync pass.
+    m_sync->restartFolderQueue();
     m_store.storeFolders(accountKey(), names);
     scheduleUnreadRecount(); // the tree just changed; so did which pills exist
     sweepOldSpam(); // needs junkFolderName(), which the listing just settled
@@ -3146,7 +3226,7 @@ void MailClient::deleteMessages(const QVariantList &rows)
     // No in-progress crumb — the busy spinner covers it; only the result shows.
 
     // Cache and model are updated only once the server has confirmed, so a
-    // failure never leaves mail on the server that mailo has forgotten.
+    // failure never leaves mail on the server that mailove has forgotten.
     const auto done = [this, uids](const QString &crumb) {
         return [this, uids, crumb](MailBackend::Error error, const QString &message) {
             setBusy(false);
@@ -3932,7 +4012,7 @@ void MailClient::sweepOldSpam()
     qCDebug(logTrace, "spam sweep: folder=%s older than %d days",
             qUtf8Printable(junk), m_spamRetentionDays);
 
-    // Which messages are old is decided from the dates mailo already holds,
+    // Which messages are old is decided from the dates mailove already holds,
     // not from a server-side search.
     //
     // Both IMAP criteria were tried and both matched nothing. BEFORE is
@@ -3968,7 +4048,7 @@ void MailClient::sweepOldSpam()
     }
 
     // Cache rows go only once the server has confirmed, so a failure never
-    // leaves mail on the server that mailo has forgotten.
+    // leaves mail on the server that mailove has forgotten.
     const auto settle = [this, junk, uids](const QString &crumb) {
         m_store.removeMessages(junk, uids);
         if (m_selectedFolder == junk)
@@ -4542,7 +4622,7 @@ void MailClient::refineAttachKind(const QString &folder, qint64 uid, KMime::Mess
     if (uid < 0)
         return;
     // The head can only say "multipart/mixed", which is a guess: plenty of
-    // messages — the ones Mailo itself sent before it stopped wrapping a bare
+    // messages — the ones Mailove itself sent before it stopped wrapping a bare
     // body in a mixed part — declare it and carry no attachment at all. The
     // body settles it, and the answer here is exactly the list the reading
     // pane shows (collectAttachments walks the same parts).
@@ -4797,7 +4877,7 @@ void MailClient::markMessageRead(int row)
                         {QStringLiteral("seen")}, {},
                         [](MailBackend::Error error, const QString &message) {
         if (error != MailBackend::Error::None)
-            qWarning() << "mailo: storing \\Seen failed:" << message;
+            qWarning() << "mailove: storing \\Seen failed:" << message;
     });
 }
 
@@ -4846,8 +4926,15 @@ void MailClient::fetchMessage(int row)
         }
     }
 
+    // Neither path below presents anything, so the pane keeps whatever it was
+    // showing — a message from a different row, folder or account — while
+    // m_uid above already names the row that failed to load. That pairing is
+    // what openMessageInWindow() reads to skip the fetch, so a double-click
+    // would then detach the *previous* message into a window. Clearing puts
+    // both back in agreement: nothing is being read.
     if (!connected()) {
         m_detachPending = false;
+        m_reading->clear();
         setStatus(tr("Not cached — connect to load"));
         return;
     }
@@ -4855,6 +4942,7 @@ void MailClient::fetchMessage(int row)
     const QString remoteId = m_messageModel.remoteIdAt(row);
     if (remoteId.isEmpty()) {
         m_detachPending = false;
+        m_reading->clear();
         setStatus(tr("Message load failed"));
         return;
     }
@@ -4930,6 +5018,10 @@ void MailClient::requestMessageBody(int row, const QString &remoteId, bool isRet
 
             setBusy(false);
             m_detachPending = false;
+            // Same as the bail-outs in fetchMessage(): the request is over and
+            // nothing was presented, so the pane must not go on showing the
+            // previously read message under the selected row.
+            m_reading->clear();
             setStatus(tr("Message load failed"));
             if (error != MailBackend::Error::None && !message.isEmpty())
                 Q_EMIT errorOccurred(message);
@@ -5183,7 +5275,7 @@ void MailClient::presentMessage(const std::shared_ptr<KMime::Message> &message)
     if (pgp.kind == PgpMime::Kind::Partial) {
         ctx->m_cryptoState = QStringLiteral("partial");
         ctx->m_cryptoDetail =
-            tr("Part of this message is encrypted. Mailo does not decrypt a "
+            tr("Part of this message is encrypted. Mailove does not decrypt a "
                "fragment of a message: shown together with the parts that were "
                "never encrypted, there would be no way to tell which was which.");
     } else if (pgp.isEncrypted()) {

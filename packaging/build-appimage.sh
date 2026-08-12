@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# Build a self-contained AppImage for Mailo.
+# Build a self-contained AppImage for Mailove.
 #
 # Prerequisites (not installed by this script):
-#   - A working build toolchain + all of Mailo's build deps (Qt6, KPim6*, qtkeychain).
+#   - A working build toolchain + all of Mailove's build deps (Qt6, KPim6*, qtkeychain).
 #   - Internet access on first run to download the linuxdeploy tools into ./tools.
 #   - FUSE (for the resulting AppImage to run; not needed to build it).
 #
 # Usage:
 #   packaging/build-appimage.sh            # release build, downloads tools if missing
-#   OUTPUT=mailo.AppImage packaging/build-appimage.sh
+#   OUTPUT=mailove.AppImage packaging/build-appimage.sh
 #
-# The result is written to the project root as Mailo-<version>-x86_64.AppImage,
+# The result is written to the project root as Mailove-<version>-x86_64.AppImage,
 # whatever directory the script is invoked from — the version comes from
 # project() in CMakeLists.txt via the file the configure step writes.
 #
@@ -93,18 +93,18 @@ cmake -S "$here" -B "$build_dir" \
 
 # Written by the configure step above, so the AppImage carries the same version
 # as the .deb and neither is a copy of the number kept somewhere else.
-version="$(cat "$build_dir/mailo-version.txt" 2>/dev/null || true)"
-[[ -n "$version" ]] || { echo "no version from $build_dir/mailo-version.txt" >&2; exit 1; }
+version="$(cat "$build_dir/mailove-version.txt" 2>/dev/null || true)"
+[[ -n "$version" ]] || { echo "no version from $build_dir/mailove-version.txt" >&2; exit 1; }
 # Absolute: linuxdeploy writes into the working directory, and the artifact
 # belongs in the project root however the script was invoked. An OUTPUT that is
 # already a path is taken as given — the rooting is a default, not a rule.
-output="${OUTPUT:-Mailo-$version-x86_64.AppImage}"
+output="${OUTPUT:-Mailove-$version-x86_64.AppImage}"
 [[ "$output" == /* ]] || output="$here/$output"
 
 log "Building"
-# mailo-docs too: `install` pulls in the gzipped man page, and building only
-# the mailo target left it missing so the install step below failed.
-cmake --build "$build_dir" --parallel "$jobs" --target mailo mailo-docs
+# mailove-docs too: `install` pulls in the gzipped man page, and building only
+# the mailove target left it missing so the install step below failed.
+cmake --build "$build_dir" --parallel "$jobs" --target mailove mailove-docs
 
 log "Installing into AppDir"
 rm -rf "$appdir"
@@ -169,7 +169,7 @@ done
 log "Writing AppRun hooks"
 hooks="$appdir/apprun-hooks"
 mkdir -p "$hooks"
-cat > "$hooks/mailo-env.sh" <<'HOOK'
+cat > "$hooks/mailove-env.sh" <<'HOOK'
 #!/bin/bash
 here="$(dirname "$(readlink -f "$0")")"
 # WebEngine sandbox needs a userns; AppImages often run where it's unavailable.
@@ -183,7 +183,7 @@ export QML2_IMPORT_PATH="$here/usr/qml${QML2_IMPORT_PATH:+:$QML2_IMPORT_PATH}"
 # Prefer the bundled Breeze icons.
 export XDG_DATA_DIRS="$here/usr/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
 HOOK
-chmod +x "$hooks/mailo-env.sh"
+chmod +x "$hooks/mailove-env.sh"
 
 # --- 5. deploy Qt + pack the AppImage ------------------------------------
 log "Running linuxdeploy + Qt plugin"
@@ -198,12 +198,12 @@ cd "$here"
 "$tools_dir/linuxdeploy" \
   --appdir "$appdir" \
   --plugin qt \
-  --desktop-file "$appdir/usr/share/applications/org.mailo.Mailo.desktop" \
-  --icon-file "$appdir/usr/share/icons/hicolor/scalable/apps/org.mailo.Mailo.svg" \
+  --desktop-file "$appdir/usr/share/applications/org.mailove.Mailove.desktop" \
+  --icon-file "$appdir/usr/share/icons/hicolor/scalable/apps/org.mailove.Mailove.svg" \
   --output appimage
 
 # linuxdeploy names it from the desktop file, unversioned; normalise to $output.
-produced="$(ls -t "$here"/Mailo*.AppImage 2>/dev/null | head -1 || true)"
+produced="$(ls -t "$here"/Mailove*.AppImage 2>/dev/null | head -1 || true)"
 if [[ -n "$produced" && "$produced" != "$output" ]]; then
   mv -f "$produced" "$output"
 fi

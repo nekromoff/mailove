@@ -17,7 +17,7 @@
 ///    account from a fixed key list, so a key missing from that list is a key
 ///    silently dropped from every account.
 ///
-/// Runs against a test-only QSettings scope — the real ~/.config/mailo is
+/// Runs against a test-only QSettings scope — the real ~/.config/mailove is
 /// never opened. Nothing here touches the keyring: every case passes an empty
 /// password, which is what stops AccountStore from starting a wallet job.
 ///
@@ -67,7 +67,7 @@ int main(int argc, char **argv)
     QCoreApplication app(argc, argv);
     QStandardPaths::setTestModeEnabled(true);
 
-    // AccountStore::settings() names the file itself ("mailo"/"mailo"), so the
+    // AccountStore::settings() names the file itself ("mailove"/"mailove"), so the
     // isolation has to come from test mode alone. Prove it landed somewhere
     // disposable before writing a single key.
     const QString path = AccountStore::settings().fileName();

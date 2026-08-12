@@ -36,7 +36,7 @@ QByteArray messageCsp(bool allowRemote);
 
 /**
  * Blocks every network request from the message viewer except inline data
- * and our own mailo: message scheme. Remote content (tracking pixels,
+ * and our own mailove: message scheme. Remote content (tracking pixels,
  * external images) never leaves the machine. A per-message "load remote
  * images" opt-in can relax this later.
  */
@@ -59,12 +59,12 @@ private:
 };
 
 /**
- * Serves message bodies under mailo:message/<context>/<n>.
+ * Serves message bodies under mailove:message/<context>/<n>.
  *
  * WebEngineView.loadHtml() routes through a data: URL, which Chromium caps
  * at ~2 MB — larger HTML mails render as a blank page. Serving the bytes
  * through a scheme handler has no size limit and gives us a place to serve
- * cid: inline attachments (mailo:cid/<context>/<contentId>).
+ * cid: inline attachments (mailove:cid/<context>/<contentId>).
  *
  * Bodies are keyed by a context id so several messages can be on screen at
  * once — the reading pane plus any number of detached message windows. Each
@@ -89,7 +89,7 @@ public:
     /// (cache-busting) URL for it.
     QString setMessageHtml(quint64 context, const QByteArray &html);
 
-    /// Registers an inline MIME part served as mailo:cid/<context>/<contentId>.
+    /// Registers an inline MIME part served as mailove:cid/<context>/<contentId>.
     void setInlinePart(quint64 context, const QString &contentId,
                        const QByteArray &mimeType, const QByteArray &data);
     /// Drops \a context's inline parts (call before loading a new message).

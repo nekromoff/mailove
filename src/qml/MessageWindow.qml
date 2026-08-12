@@ -4,7 +4,7 @@
 import QtQuick
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
-import Mailo.Core
+import Mailove.Core
 
 /// A message opened in its own tab (double-click in the list). Owns a
 /// MessageContext, so it keeps showing — and serving inline images,

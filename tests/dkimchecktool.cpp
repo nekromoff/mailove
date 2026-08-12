@@ -1,4 +1,4 @@
-// Runs the real DkimVerifier over .eml files exported from the mailo cache,
+// Runs the real DkimVerifier over .eml files exported from the mailove cache,
 // reproducing exactly what MailClient::submitDkimVerification() does.
 #include "../src/dkimverifier.h"
 

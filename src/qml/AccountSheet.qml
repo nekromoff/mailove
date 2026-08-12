@@ -6,7 +6,7 @@ import QtQuick.Controls as QQC2
 import QtQuick.Dialogs
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
-import Mailo.Core
+import Mailove.Core
 
 /// The settings pages. A tab page, not a window: the tab strip in Main.qml
 /// hosts it. See the page contract there — title, present(), closeRequested.
@@ -152,7 +152,7 @@ Item {
     //
     // The account stores a fingerprint and nothing else; everything shown here
     // is looked up in the keyring each time, so a key deleted or expired
-    // outside mailo shows up as what it now is rather than as a stale label.
+    // outside mailove shows up as what it now is rather than as a stale label.
 
     /// Fingerprint of the key chosen for this account; "" = encryption off.
     property string pgpKeyFp: ""
@@ -557,7 +557,7 @@ Item {
             signature: signatureEdit.text,
             htmlMail: htmlMailBox.checked,
             // Only a pointer into the keyring — no key material is ever
-            // written to mailo's settings.
+            // written to mailove's settings.
             pgpKeyFp: sheet.pgpKeyFp,
             // Without a key both are meaningless, and a stale "sign by
             // default" left behind after the key was cleared would fail on
@@ -604,7 +604,7 @@ Item {
         }
 
         contentItem: QQC2.Label {
-            text: "Remove \"" + (Mail.accountNames[sheet.editIndex] ?? "") + "\" from Mailo?\n\n"
+            text: "Remove \"" + (Mail.accountNames[sheet.editIndex] ?? "") + "\" from Mailove?\n\n"
                   + "Its settings and saved password are deleted from this computer. "
                   + "Mail on the server is not touched."
             wrapMode: Text.Wrap
@@ -620,7 +620,7 @@ Item {
 
     /// Points GnuPG at a private key that is not in its keyring yet — an
     /// exported backup, or a key moved from another machine. GnuPG asks for the
-    /// file's passphrase itself if it has one; Mailo never sees the key
+    /// file's passphrase itself if it has one; Mailove never sees the key
     /// material. From then on it is an ordinary key in the keyring, which is
     /// also the honest thing to tell the user (the label below says so).
     FileDialog {
@@ -1009,7 +1009,7 @@ Item {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
                 text: "Server settings are set up automatically. When you save, "
-                      + "your browser opens to sign in — Mailo picks up the "
+                      + "your browser opens to sign in — Mailove picks up the "
                       + "sign-in automatically and remembers it in the system keyring."
                 wrapMode: Text.Wrap
                 opacity: 0.7
@@ -1097,7 +1097,7 @@ Item {
                 opacity: 0.7
                 text: "The token is sent as an Authorization: Bearer header. "
                       + "Most JMAP servers issue one from their own settings "
-                      + "page — check with your provider. Mailo cannot obtain "
+                      + "page — check with your provider. Mailove cannot obtain "
                       + "one for you: its OAuth sign-in is only for Gmail and "
                       + "Microsoft, both of which it talks to over IMAP."
             }
@@ -1266,7 +1266,7 @@ Item {
                 text: "These set how the compose window opens; both stay "
                       + "switchable per message.\n\n"
                       + "Encrypting needs a public key for each recipient. When "
-                      + "one is missing, Mailo leaves encryption off for that "
+                      + "one is missing, Mailove leaves encryption off for that "
                       + "message and says so — it never quietly sends in the "
                       + "clear.\n\n"
                       + "The subject line is never encrypted — it travels in the "
@@ -1617,7 +1617,7 @@ Item {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
                 text: "Prints folder, account and sync activity to the terminal "
-                      + "mailo was started from. Useful when reporting a bug; "
+                      + "mailove was started from. Useful when reporting a bug; "
                       + "takes effect immediately, no restart needed."
                 wrapMode: Text.Wrap
                 opacity: 0.8
@@ -1971,7 +1971,7 @@ Item {
                 Kirigami.Separator {
                     // Same source as the main-bar version label: whatever the
                     // binary was built with.
-                    Kirigami.FormData.label: "Mailo v" + Qt.application.version
+                    Kirigami.FormData.label: "Mailove v" + Qt.application.version
                     Kirigami.FormData.isSection: true
                 }
                 QQC2.Label {

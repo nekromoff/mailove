@@ -8,7 +8,7 @@
 /// That one is load-bearing: DKIM verifies the bytes as they travelled, and
 /// MessageVerifier hands it LFtoCRLF(ctx->m_raw), which is encodedContent()
 /// of the parsed message. If a KMime upgrade ever stops round-tripping there,
-/// every signature silently starts failing its body hash and mailo reports
+/// every signature silently starts failing its body hash and mailove reports
 /// perfectly good mail as unverified. This asserts it so that lands here
 /// instead of in the badge.
 ///
@@ -98,7 +98,7 @@ int main(int argc, char **argv)
     if (msg->contents().isEmpty())
         msg->parse();
 
-    // The invariant mailo depends on. Asserted.
+    // The invariant mailove depends on. Asserted.
     if (!report("encodedContent()", KMime::LFtoCRLF(msg->encodedContent()), original)) {
         printf("FAIL: encodedContent() no longer round-trips — DKIM body hashes\n"
                "      will fail against every freshly fetched message.\n");

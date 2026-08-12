@@ -183,7 +183,7 @@ QString MessagePresenter::htmlViewUrl(MessageContext *ctx)
     static const QRegularExpression cssCidRe(
         QStringLiteral("(url\\(\\s*[\"']?)cid:"), QRegularExpression::CaseInsensitiveOption);
     const QString cidBase =
-        QStringLiteral("\\1mailo:cid/") + QString::number(ctx->viewerContext())
+        QStringLiteral("\\1mailove:cid/") + QString::number(ctx->viewerContext())
         + QLatin1Char('/');
     html.replace(attrCidRe, cidBase);
     html.replace(cssCidRe, cidBase);
@@ -319,7 +319,7 @@ void MessagePresenter::openAttachment(MessageContext *ctx, int index)
     // unpredictable name, which closes all three. Process-lifetime static:
     // cleaned up on exit, and files must outlive this call so the handler
     // application can still read them.
-    static QTemporaryDir tempDir(QDir::tempPath() + QStringLiteral("/mailo-attachments-XXXXXX"));
+    static QTemporaryDir tempDir(QDir::tempPath() + QStringLiteral("/mailove-attachments-XXXXXX"));
     if (!tempDir.isValid()) {
         Q_EMIT errorOccurred(tr("Could not create a private temporary directory: %1")
                                  .arg(tempDir.errorString()));
@@ -434,7 +434,7 @@ void MessagePresenter::applyBodyParts(MessageContext *ctx, KMime::Message *root,
             : ctx->m_cryptoDetail;
     } else if (ctx->m_htmlBody.isEmpty() && ctx->m_textBody.isEmpty()) {
         const auto *ct = std::as_const(*root).contentType();
-        qWarning() << "mailo: no displayable part found. content-type:"
+        qWarning() << "mailove: no displayable part found. content-type:"
                    << (ct ? ct->mimeType() : QByteArrayLiteral("(none)"))
                    << "children:" << root->contents().size()
                    << "raw size:" << ctx->m_raw.size();

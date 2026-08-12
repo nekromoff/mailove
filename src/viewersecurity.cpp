@@ -18,11 +18,11 @@ QByteArray messageCsp(bool allowRemote)
     const QByteArray remote = allowRemote ? QByteArrayLiteral(" https: http:") : QByteArray();
     return QByteArrayLiteral("<meta http-equiv=\"Content-Security-Policy\" content=\""
                              "default-src 'none'; ")
-        + QByteArrayLiteral("img-src mailo: data:") + remote + QByteArrayLiteral("; ")
-        + QByteArrayLiteral("style-src 'unsafe-inline' mailo: data:") + remote
+        + QByteArrayLiteral("img-src mailove: data:") + remote + QByteArrayLiteral("; ")
+        + QByteArrayLiteral("style-src 'unsafe-inline' mailove: data:") + remote
         + QByteArrayLiteral("; ")
-        + QByteArrayLiteral("font-src mailo: data:") + remote + QByteArrayLiteral("; ")
-        + QByteArrayLiteral("media-src mailo: data:") + remote + QByteArrayLiteral("; ")
+        + QByteArrayLiteral("font-src mailove: data:") + remote + QByteArrayLiteral("; ")
+        + QByteArrayLiteral("media-src mailove: data:") + remote + QByteArrayLiteral("; ")
         + QByteArrayLiteral("script-src 'none'; object-src 'none'; frame-src 'none'; "
                             "child-src 'none'; worker-src 'none'; form-action 'none'; "
                             "base-uri 'none'; connect-src 'none'\">");
@@ -109,7 +109,7 @@ void ViewerRequestInterceptor::interceptRequest(QWebEngineUrlRequestInfo &info)
     // Our own scheme carries the message document and its inline parts. Framing
     // it is not one of those jobs: a message that frames itself, or an inline
     // part, gets a document rendered inside this scheme's origin.
-    if (scheme == QLatin1String("mailo")
+    if (scheme == QLatin1String("mailove")
         && (type == QWebEngineUrlRequestInfo::ResourceTypeMainFrame
             || isPassiveSubresource(type)))
         return;
@@ -136,7 +136,7 @@ void ViewerRequestInterceptor::interceptRequest(QWebEngineUrlRequestInfo &info)
 
 /// The MIME type an inline part is served as. The sender chooses the part's
 /// declared Content-Type, so it cannot be passed through: a part declared
-/// text/html and referenced as <iframe src="mailo:cid/…"> would render sender
+/// text/html and referenced as <iframe src="mailove:cid/…"> would render sender
 /// markup as a document inside our own scheme's origin, which is registered as
 /// a SecureScheme. Only the passive types a cid: reference legitimately
 /// resolves to keep their declared type; everything else becomes an opaque
@@ -168,7 +168,7 @@ void ViewerSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
 {
     const QString path = job->requestUrl().path();
 
-    // Inline attachments: mailo:cid/<context>/<contentId>
+    // Inline attachments: mailove:cid/<context>/<contentId>
     if (path.startsWith(QLatin1String("cid/"))) {
         quint64 context = 0;
         QString cid;
@@ -263,12 +263,12 @@ QString ViewerSchemeHandler::setMessageHtml(quint64 context, const QByteArray &h
     it->html = html;
     // The serial only busts WebEngine's cache — the context id is what picks
     // the body.
-    return QStringLiteral("mailo:message/%1/%2").arg(context).arg(++m_serial);
+    return QStringLiteral("mailove:message/%1/%2").arg(context).arg(++m_serial);
 }
 
 void ViewerSchemeHandler::registerScheme()
 {
-    QWebEngineUrlScheme scheme(QByteArrayLiteral("mailo"));
+    QWebEngineUrlScheme scheme(QByteArrayLiteral("mailove"));
     scheme.setSyntax(QWebEngineUrlScheme::Syntax::Path);
     scheme.setFlags(QWebEngineUrlScheme::SecureScheme);
     QWebEngineUrlScheme::registerScheme(scheme);
@@ -282,6 +282,6 @@ ViewerSchemeHandler *ViewerSchemeHandler::install()
     profile->setUrlRequestInterceptor(interceptor);
     auto *handler = new ViewerSchemeHandler(profile);
     handler->m_interceptor = interceptor;
-    profile->installUrlSchemeHandler(QByteArrayLiteral("mailo"), handler);
+    profile->installUrlSchemeHandler(QByteArrayLiteral("mailove"), handler);
     return handler;
 }

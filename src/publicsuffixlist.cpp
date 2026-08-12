@@ -22,7 +22,7 @@
 
 namespace
 {
-Q_LOGGING_CATEGORY(logPsl, "mailo.psl")
+Q_LOGGING_CATEGORY(logPsl, "mailove.psl")
 
 constexpr auto kRefreshInterval = std::chrono::hours(24 * 7);
 /// How often we wake up to notice the list has gone stale. The list changes a

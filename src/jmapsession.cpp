@@ -154,7 +154,7 @@ void JmapSession::guardRedirects(QNetworkReply *reply) const
         // server answers with somebody else's URL is not one whose answer can
         // be trusted either, and the caller's error path already knows what to
         // do with a connection that ended early.
-        qWarning() << "mailo: refusing JMAP redirect off-origin:" << target.host()
+        qWarning() << "mailove: refusing JMAP redirect off-origin:" << target.host()
                    << "is not" << origin.host();
         reply->abort();
     });

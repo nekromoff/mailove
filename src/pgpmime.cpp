@@ -221,7 +221,7 @@ Structure classify(KMime::Content *root)
         return out;
     }
 
-    // Legacy inline PGP. Receive-only: mailo never produces it.
+    // Legacy inline PGP. Receive-only: mailove never produces it.
     if (type == "text/plain" || type.isEmpty()) {
         const QByteArray body = root->decodedBody();
         const QByteArray block = wholeArmoredBlock(body);
@@ -299,7 +299,7 @@ QByteArray signedOctets(const Structure &s)
     if (s.kind != Kind::Signed || !s.signedPart)
         return {};
     // RFC 3156 §5: the signature is over the part as it travels, with CRLF
-    // line endings. Everything inside mailo holds messages LF-normalised
+    // line endings. Everything inside mailove holds messages LF-normalised
     // (KMime::CRLFtoLF on the way in), so the octets have to be put back the
     // way they were signed or nothing ever verifies. Normalising first makes
     // this idempotent whatever the tree happens to hold.

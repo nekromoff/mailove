@@ -21,7 +21,7 @@ class KeyDiscovery;
 ///
 /// Deliberately a plain value type. Nothing above this line includes a GpgME
 /// header, so the whole application builds — with encryption unavailable —
-/// when the backend is not present at build time (see MAILO_HAVE_OPENPGP in
+/// when the backend is not present at build time (see MAILOVE_HAVE_OPENPGP in
 /// CMakeLists.txt), and QML never sees a type it cannot own.
 struct PgpKey {
     QString fingerprint;
@@ -104,7 +104,7 @@ struct PgpSignatureInfo {
 /**
  * Thin, non-blocking wrapper over QGpgME's key operations.
  *
- * Key material stays in the user's GnuPG home: mailo never reads, writes or
+ * Key material stays in the user's GnuPG home: mailove never reads, writes or
  * caches a private key or a passphrase — gpg-agent/pinentry owns that, which
  * is also what makes a smartcard work without any code here. What this class
  * owns is a snapshot of the public keyring for the UI to bind to, refreshed
@@ -116,7 +116,7 @@ struct PgpSignatureInfo {
  * would, given the chance.
  *
  * When the backend is missing — built without it, gnupg not installed, or
- * MAILO_NO_OPENPGP set in the environment — available() is false,
+ * MAILOVE_NO_OPENPGP set in the environment — available() is false,
  * unavailableReason() says why in one line, and nothing here ever calls gpg:
  * no keyring is listed, no lookup is made, and every operation returns after
  * reporting the same reason. Callers do not need to branch; the settings page
@@ -179,9 +179,9 @@ public:
     Q_INVOKABLE void importKeyData(const QByteArray &keyData);
     /// Same, from a file chosen in the UI. Handles both halves: a file that
     /// carries a *private* key is imported as one, so a user whose key lives
-    /// in a backup file rather than in GnuPG's keyring can point Mailo at it
+    /// in a backup file rather than in GnuPG's keyring can point Mailove at it
     /// and be done. GnuPG prompts for the file's passphrase if it has one, and
-    /// from then on the key is in its keyring like any other — Mailo still
+    /// from then on the key is in its keyring like any other — Mailove still
     /// never sees the key material or the passphrase.
     Q_INVOKABLE void importKeyFile(const QUrl &fileUrl);
 
@@ -195,7 +195,7 @@ public:
     ///
     /// This is a statement about a person, not about bytes: gpg folds it into
     /// the validity it computes for this key *and* for keys that one has
-    /// signed. It is the only trust input mailo offers, and it is deliberately
+    /// signed. It is the only trust input mailove offers, and it is deliberately
     /// reversible.
     Q_INVOKABLE void setOwnerTrust(const QString &fingerprint, int trust);
 
@@ -206,7 +206,7 @@ public:
 
     /// Creates a key for \a name <\a email> expiring in \a expiryYears (0 =
     /// never). gpg-agent prompts for the passphrase through pinentry; no
-    /// passphrase passes through mailo. Reports through keyGenerated().
+    /// passphrase passes through mailove. Reports through keyGenerated().
     Q_INVOKABLE void generateKey(const QString &name, const QString &email, int expiryYears);
 
     /// Web Key Directory lookup — asks the address's own domain, so it is safe

@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>org.mailo.Mailo</id>
+  <id>org.mailove.Mailove</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>LGPL-3.0-or-later</project_license>
-  <name>Mailo</name>
+  <name>Mailove</name>
   <summary>A fast, security-minded IMAP mail client for the KDE desktop</summary>
   <description>
     <p>
-      Mailo is an IMAP mail client focused on speed and safe message viewing.
+      Mailove is an IMAP mail client focused on speed and safe message viewing.
       It caches headers, bodies and the folder tree in SQLite for instant,
       offline-capable browsing and full-text search, and renders HTML mail in a
       sandboxed QtWebEngine view that blocks all remote content until you opt in
@@ -17,15 +17,15 @@
   <developer id="sk.staznosti">
     <name>Daniel Duris</name>
   </developer>
-  <url type="homepage">https://github.com/nekromoff/mailo</url>
-  <url type="bugtracker">https://github.com/nekromoff/mailo/issues</url>
+  <url type="homepage">https://github.com/nekromoff/mailove</url>
+  <url type="bugtracker">https://github.com/nekromoff/mailove/issues</url>
   <!-- Links the component to the Debian package. Without it Discover cannot
        match this metadata to the installed package and falls back to the
        control file, which has no author or licence field. -->
-  <pkgname>mailo</pkgname>
-  <launchable type="desktop-id">org.mailo.Mailo.desktop</launchable>
+  <pkgname>mailove</pkgname>
+  <launchable type="desktop-id">org.mailove.Mailove.desktop</launchable>
   <provides>
-    <binary>mailo</binary>
+    <binary>mailove</binary>
   </provides>
   <categories>
     <category>Network</category>

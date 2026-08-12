@@ -1,7 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: mailo
+Upstream-Name: mailove
 Upstream-Contact: Daniel Duris <dusoft@staznosti.sk>
-Source: https://github.com/nekromoff/mailo
+Source: https://github.com/nekromoff/mailove
 
 Files: *
 Copyright: 2026 Daniel Duris <dusoft@staznosti.sk>

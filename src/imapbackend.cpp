@@ -223,7 +223,7 @@ void ImapBackend::startSyncSession()
     configureLogin(login);
     connect(login, &KJob::result, this, [this, drop](KJob *job) {
         if (job->error() || !m_syncSession) {
-            qWarning() << "mailo: sync-session login failed:" << job->errorString();
+            qWarning() << "mailove: sync-session login failed:" << job->errorString();
             drop();
             return;
         }
@@ -287,7 +287,7 @@ void ImapBackend::startPush(const QString &folder)
     configureLogin(login);
     connect(login, &KJob::result, this, [this, folder](KJob *job) {
         if (job->error() || !m_idleSession) {
-            qWarning() << "mailo: idle login failed:" << job->errorString();
+            qWarning() << "mailove: idle login failed:" << job->errorString();
             return;
         }
         auto *select = new KIMAP::SelectJob(m_idleSession);
@@ -295,7 +295,7 @@ void ImapBackend::startPush(const QString &folder)
         select->setOpenReadOnly(true);
         connect(select, &KJob::result, this, [this, folder](KJob *job) {
             if (job->error() || !m_idleSession) {
-                qWarning() << "mailo: idle select failed:" << job->errorString();
+                qWarning() << "mailove: idle select failed:" << job->errorString();
                 return;
             }
             auto *idle = new KIMAP::IdleJob(m_idleSession);
@@ -309,7 +309,7 @@ void ImapBackend::startPush(const QString &folder)
                 // Server ended IDLE (timeout, capability missing, …) — retry
                 // later unless the session was torn down by us.
                 if (job->error())
-                    qWarning() << "mailo: idle ended:" << job->errorString();
+                    qWarning() << "mailove: idle ended:" << job->errorString();
                 if (m_idleSession && m_connected) {
                     const QString folder = m_pushFolder;
                     QTimer::singleShot(30 * 1000, this, [this, folder] { startPush(folder); });
@@ -696,7 +696,7 @@ void ImapBackend::openFolder(const QString &folder, const QString &syncToken)
         const QString current = m_lastUidValidity > 0 ? QString::number(m_lastUidValidity)
                                                       : QString();
         if (!syncToken.isEmpty() && !current.isEmpty() && current != syncToken) {
-            qWarning() << "mailo: UIDVALIDITY of" << folder << "changed" << syncToken << "->"
+            qWarning() << "mailove: UIDVALIDITY of" << folder << "changed" << syncToken << "->"
                        << current << "- the cached messages are void";
             Q_EMIT folderInvalidated(folder);
         }
@@ -910,7 +910,7 @@ void ImapBackend::shrinkBodyPool()
             break;
         }
     }
-    qWarning() << "mailo: reduced body-fetch pool to" << m_bodyPool.size()
+    qWarning() << "mailove: reduced body-fetch pool to" << m_bodyPool.size()
                << "after connection-cap refusal";
 }
 
@@ -939,7 +939,7 @@ void ImapBackend::ensureBodyPool()
         configureLogin(login);
         connect(login, &KJob::result, this, [this, conn, drop](KJob *job) {
             if (job->error() || !conn->session) {
-                qWarning() << "mailo: body-pool login failed:" << job->errorString();
+                qWarning() << "mailove: body-pool login failed:" << job->errorString();
                 // The server likely caps concurrent connections — settle for
                 // what we have until the next (re)connect.
                 m_bodyPoolBroken = true;
@@ -1145,7 +1145,7 @@ void ImapBackend::search(const QString &folder, const QString &query, bool heade
             if (job->error()) {
                 // Some servers reject SEARCH variants outright; the caller
                 // falls back to matching against its own index.
-                qWarning() << "mailo: IMAP SEARCH failed:" << job->errorString();
+                qWarning() << "mailove: IMAP SEARCH failed:" << job->errorString();
                 if (done)
                     done(Error::Protocol, job->errorString());
                 return;

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 // Offscreen end-to-end check of the message-viewer pipeline:
-// registers the mailo: scheme, serves HTML through ViewerSchemeHandler,
+// registers the mailove: scheme, serves HTML through ViewerSchemeHandler,
 // loads it in a WebEngineView with production settings, and verifies the
 // document title arrives. Exit 0 = viewer pipeline works.
 #include <QGuiApplication>
@@ -24,7 +24,7 @@ int main(int argc, char *argv[])
     const quint64 context = handler->allocateContext();
     const QString url = handler->setMessageHtml(
         context,
-        QByteArrayLiteral("<meta charset=\"utf-8\"><html><head><title>MAILO_OK</title></head>"
+        QByteArrayLiteral("<meta charset=\"utf-8\"><html><head><title>MAILOVE_OK</title></head>"
                           "<body><p>hello été</p></body></html>"));
 
     QQmlApplicationEngine engine;
@@ -50,8 +50,8 @@ int main(int argc, char *argv[])
     QObject::connect(&poll, &QTimer::timeout, [&] {
         elapsed += 200;
         const QString title = web->property("title").toString();
-        if (title == QLatin1String("MAILO_OK")) {
-            qInfo("PASS: mailo: scheme served and rendered (title=%s)", qPrintable(title));
+        if (title == QLatin1String("MAILOVE_OK")) {
+            qInfo("PASS: mailove: scheme served and rendered (title=%s)", qPrintable(title));
             QCoreApplication::exit(0);
         } else if (elapsed >= 10000) {
             qCritical("FAIL: timeout, title=\"%s\" url=%s loading=%d",

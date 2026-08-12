@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=Mailo
+Name=Mailove
 GenericName=Mail Client
 Comment=A fast, security-minded IMAP mail client for the KDE desktop
-Exec=mailo %U
-Icon=org.mailo.Mailo
+Exec=mailove %U
+Icon=org.mailove.Mailove
 Terminal=false
 Categories=Network;Email;Qt;KDE;
 Keywords=mail;email;imap;smtp;

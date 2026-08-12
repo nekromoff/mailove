@@ -392,7 +392,7 @@ public:
     /// than a message are untouched.
     void dropSentRecipients(const QString &folder, const QList<qint64> &uids);
     /// Drops \a folder's refs *without* forgetting anybody. For the paths
-    /// where the mail is not gone, only mailo's copy of it: an invalidated
+    /// where the mail is not gone, only mailove's copy of it: an invalidated
     /// folder cache is about to be re-synced, and a UIDVALIDITY reset renumbers
     /// the messages, so refs naming the old uids have to go — but the people
     /// those messages were addressed to have not changed.

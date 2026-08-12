@@ -154,7 +154,7 @@ void OAuthHelper::authorize(Provider provider, const QString &clientId,
             if (m_state.isEmpty() || state != m_state) {
                 respond("400 Bad Request",
                         QByteArrayLiteral("<h2>Sign-in rejected.</h2>This redirect did not "
-                                          "come from the sign-in Mailo started."));
+                                          "come from the sign-in Mailove started."));
                 return;
             }
             endRedirectListener(); // one-shot
@@ -166,7 +166,7 @@ void OAuthHelper::authorize(Provider provider, const QString &clientId,
                 return;
             }
             respond("200 OK", QByteArrayLiteral("<h2>Signed in.</h2>You can return to "
-                                                "Mailo and close this tab."));
+                                                "Mailove and close this tab."));
             requestToken(provider, clientId, clientSecret,
                          {{QStringLiteral("grant_type"), QStringLiteral("authorization_code")},
                           {QStringLiteral("code"), code},

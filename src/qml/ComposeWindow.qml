@@ -4,7 +4,7 @@
 import QtCore
 import QtQuick
 import QtQuick.Window
-import Mailo.Core
+import Mailove.Core
 
 /// The composer as a top-level window, for people who would rather write next
 /// to the mailbox than in front of it (Look and feel → Compose in). The

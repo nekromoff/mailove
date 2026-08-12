@@ -7,7 +7,7 @@ import QtQuick.Dialogs
 import QtQuick.Layouts
 import QtQuick.Window
 import org.kde.kirigami as Kirigami
-import Mailo.Core
+import Mailove.Core
 
 /// The OpenPGP key manager: the keys GnuPG holds, and the four things a mail
 /// client needs to do with them — import one, find one, hand one out, throw one
@@ -433,7 +433,7 @@ Window {
         id: generateKeyDialog
     }
 
-    /// Owner trust, on a right-click. This is the one trust input Mailo
+    /// Owner trust, on a right-click. This is the one trust input Mailove
     /// offers, and it is a statement about a *person*, not about bytes: gpg
     /// folds it into the validity it computes for this key and for every key
     /// its owner has signed. Everything here is reversible — "Nothing said"

@@ -1,4 +1,4 @@
-# Mailo
+# Mailove
 
 The fast KDE-only email client.
 
@@ -45,7 +45,7 @@ Security-minded KDE-only IMAP and JMAP mail client, blazing fast.
 
 ## Installation
 
-Packaged as DEB package and AppImage. Go to https://github.com/nekromoff/mailo/releases (open assets) to download.
+Packaged as DEB package and AppImage. Go to https://github.com/nekromoff/mailove/releases (open assets) to download.
 
 ## Technology
 
@@ -56,11 +56,11 @@ Packaged as DEB package and AppImage. Go to https://github.com/nekromoff/mailo/r
 | IMAP | KPim6 KIMAP (async KJobs, no Akonadi) |
 | MIME parsing/building | KPim6 KMime |
 | SMTP | KPim6 KSMTP |
-| HTML viewer | QtWebEngine (Quick), custom `mailo:` URL scheme + request interceptor |
+| HTML viewer | QtWebEngine (Quick), custom `mailove:` URL scheme + request interceptor |
 | Storage | SQLite via Qt SQL (WAL), FTS5 for full-text indexing |
 | Attachment store | content-addressed files, zstd-compressed and deduplicated |
 | DKIM / ARC | verified in-process against OpenSSL (libcrypto), worker thread |
-| OpenPGP | GpgME / QGpgME → GnuPG (optional, `MAILO_OPENPGP`) |
+| OpenPGP | GpgME / QGpgME → GnuPG (optional, `MAILOVE_OPENPGP`) |
 | Secrets | Qt6Keychain → KWallet / libsecret |
 | Rich-text editing | QTextDocument/QTextCursor exposed to QML (`DocumentHandler`) |
 | Build | CMake + Ninja |
@@ -77,12 +77,12 @@ sudo apt install cmake ninja-build extra-cmake-modules qt6-webengine-dev \
 
 cmake -B build -G Ninja
 cmake --build build
-./build/mailo
+./build/mailove
 ```
 
 OpenPGP is on by default and degrades gracefully: without GpgME the build drops
 it, and without gnupg at runtime the Encryption settings say so and no gpg
-process is ever spawned. `cmake -B build -DMAILO_OPENPGP=OFF` leaves it out
+process is ever spawned. `cmake -B build -DMAILOVE_OPENPGP=OFF` leaves it out
 outright.
 
 `build/tests/viewertest` is a headless end-to-end test of the sandboxed viewer pipeline (scheme registration, handler, render).
@@ -91,15 +91,15 @@ Packages are built from the same tree and land in the project root, named with
 the version from `project()`:
 
 ```bash
-cmake --build build --target package-deb   # mailo_<version>_<arch>.deb
+cmake --build build --target package-deb   # mailove_<version>_<arch>.deb
 cmake --build build --target packages      # the .deb and the AppImage
 ```
 
 ## Data locations
 
-- Message cache: `~/.local/share/mailo/mailo/mailo.db`
-- Settings: `~/.config/mailo/mailo.conf` (no secrets)
-- Passwords and OAuth refresh tokens: KWallet, service `mailo`
+- Message cache: `~/.local/share/mailove/mailove/mailove.db`
+- Settings: `~/.config/mailove/mailove.conf` (no secrets)
+- Passwords and OAuth refresh tokens: KWallet, service `mailove`
 
 ## Known issues
 

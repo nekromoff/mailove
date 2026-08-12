@@ -66,12 +66,12 @@ int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
     // Both together are what redirect AppDataLocation away from the real cache.
-    QCoreApplication::setApplicationName(QStringLiteral("mailo-storetest"));
-    QCoreApplication::setOrganizationName(QStringLiteral("mailo-storetest"));
+    QCoreApplication::setApplicationName(QStringLiteral("mailove-storetest"));
+    QCoreApplication::setOrganizationName(QStringLiteral("mailove-storetest"));
     QStandardPaths::setTestModeEnabled(true);
 
     const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    if (dir.isEmpty() || !dir.contains(QLatin1String("mailo-storetest"))) {
+    if (dir.isEmpty() || !dir.contains(QLatin1String("mailove-storetest"))) {
         qWarning() << "refusing to run: test data location is not isolated:" << dir;
         return 2;
     }

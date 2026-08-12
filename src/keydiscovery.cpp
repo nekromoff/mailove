@@ -8,7 +8,7 @@
 #include <QNetworkRequest>
 #include <QUrl>
 
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
 #include <gpgme++/data.h>
 #include <gpgme++/error.h>
 #include <qgpgme/protocol.h>
@@ -20,7 +20,7 @@
 
 namespace
 {
-/// The only keyserver mailo will talk to. Address-verified, does not serve
+/// The only keyserver mailove will talk to. Address-verified, does not serve
 /// flooded keys; see doc/openpgp.md §7 for why the SKS pool is not an option.
 const char kVksHost[] = "keys.openpgp.org";
 
@@ -37,7 +37,7 @@ KeyDiscovery::KeyDiscovery(QObject *parent)
 
 void KeyDiscovery::lookupWkd(const QString &address)
 {
-#ifdef MAILO_HAVE_OPENPGP
+#ifdef MAILOVE_HAVE_OPENPGP
     QGpgME::WKDLookupJob *job = QGpgME::openpgp()->wkdLookupJob();
     if (!job) {
         Q_EMIT finished(address, {}, QStringLiteral("WKD"),
@@ -80,7 +80,7 @@ void KeyDiscovery::lookupWkd(const QString &address)
     }
 #else
     Q_EMIT finished(address, {}, QStringLiteral("WKD"),
-                    tr("Mailo was built without OpenPGP support."));
+                    tr("Mailove was built without OpenPGP support."));
 #endif
 }
 

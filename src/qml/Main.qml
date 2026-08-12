@@ -6,11 +6,11 @@ import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
-import Mailo.Core
+import Mailove.Core
 
 Kirigami.ApplicationWindow {
     id: root
-    title: "Mailo"
+    title: "Mailove"
     width: windowSettings.width
     height: windowSettings.height
 
@@ -47,11 +47,11 @@ Kirigami.ApplicationWindow {
         Qt.quit()
     }
 
-    // Same category as the C++ trace, so QT_LOGGING_RULES='mailo.trace.debug=true'
+    // Same category as the C++ trace, so QT_LOGGING_RULES='mailove.trace.debug=true'
     // (or the Settings toggle) turns both on together.
     LoggingCategory {
         id: traceLog
-        name: "mailo.trace"
+        name: "mailove.trace"
         defaultLogLevel: LoggingCategory.Fatal
     }
 
@@ -857,11 +857,11 @@ Kirigami.ApplicationWindow {
         titleDelegate: RowLayout {
             Layout.fillWidth: true
             Kirigami.Heading {
-                text: "Mailo"
+                text: "Mailove"
                 level: 2
             }
             // Version straight from QCoreApplication (main.cpp sets it from
-            // MAILO_VERSION), so it can never drift from the built binary.
+            // MAILOVE_VERSION), so it can never drift from the built binary.
             QQC2.Label {
                 text: "v" + Qt.application.version
                 opacity: 0.7
@@ -911,7 +911,7 @@ Kirigami.ApplicationWindow {
                     // Named after the button's own tooltip rather than
                     // described by shape — the icon is theme-supplied and is
                     // not a gear.
-                    : "Welcome to Mailo! Add an account to get started — Settings, top right."
+                    : "Welcome to Mailove! Add an account to get started — Settings, top right."
                 font.bold: !Mail.hasAccount && !Mail.accountIsLocal
                 elide: Text.ElideRight
                 opacity: 0.8
@@ -2311,7 +2311,7 @@ Kirigami.ApplicationWindow {
                                     }
                                     function requestDelete() {
                                         const rows = selectedIndexes()
-                                        console.debug(traceLog, "mailo: requestDelete rows",
+                                        console.debug(traceLog, "mailove: requestDelete rows",
                                                       JSON.stringify(rows),
                                                       "permanent", Mail.deleteIsPermanent())
                                         if (rows.length === 0)
@@ -2364,7 +2364,7 @@ Kirigami.ApplicationWindow {
                                                 // explicitly at the click instead.
                                                 messageList.currentIndex = -1
                                                 console.debug(traceLog,
-                                                              "mailo: msg reset: empty, keeping uid",
+                                                              "mailove: msg reset: empty, keeping uid",
                                                               messageList.openedUid)
                                                 return
                                             }
@@ -2389,7 +2389,7 @@ Kirigami.ApplicationWindow {
                                                     Mail.messageModel.uidAt(messageList.currentIndex)
                                             }
                                             console.debug(traceLog,
-                                                          "mailo: msg reset: count", messageList.count,
+                                                          "mailove: msg reset: count", messageList.count,
                                                           "wanted uid", messageList.openedUid,
                                                           "-> row", row,
                                                           "current", messageList.currentIndex)
@@ -2451,7 +2451,7 @@ Kirigami.ApplicationWindow {
                                                         messageList.currentIndex, ListView.Center)
                                             })
                                             console.debug(traceLog,
-                                                          "mailo: msg re-sorted: count",
+                                                          "mailove: msg re-sorted: count",
                                                           messageList.count,
                                                           "uid", messageList.openedUid,
                                                           "-> row", messageList.currentIndex)
@@ -2828,7 +2828,7 @@ Kirigami.ApplicationWindow {
                                                     return
                                                 }
                                                 console.debug(traceLog,
-                                                              "mailo: click row", msgDelegate.index,
+                                                              "mailove: click row", msgDelegate.index,
                                                               "modifiers", mouse.modifiers,
                                                               "anchor", messageList.selectionAnchor)
                                                 if (mouse.modifiers & Qt.ControlModifier) {
@@ -2840,7 +2840,7 @@ Kirigami.ApplicationWindow {
                                                         ? messageList.selectionAnchor
                                                         : (messageList.currentIndex >= 0
                                                            ? messageList.currentIndex : msgDelegate.index)
-                                                    console.debug(traceLog, "mailo: shift range",
+                                                    console.debug(traceLog, "mailove: shift range",
                                                                   anchor, "->", msgDelegate.index)
                                                     messageList.selectRange(anchor, msgDelegate.index)
                                                     return

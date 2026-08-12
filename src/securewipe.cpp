@@ -14,7 +14,7 @@
 
 namespace
 {
-Q_LOGGING_CATEGORY(logWipe, "mailo.wipe")
+Q_LOGGING_CATEGORY(logWipe, "mailove.wipe")
 
 /// How many contexts are currently holding decrypted plaintext. Not atomic:
 /// every caller is on the GUI thread, which is where messages are opened and

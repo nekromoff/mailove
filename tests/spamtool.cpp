@@ -14,10 +14,10 @@
 //   ./spamtool --msgid '<abc@host>'         score a message straight from the cache
 //   ./spamtool --db PATH                    ...from a cache other than the default
 //
-// --msgid saves exporting an .eml by hand: it looks the message up in mailo's
+// --msgid saves exporting an .eml by hand: it looks the message up in mailove's
 // own cache by Message-ID (an indexed lookup, idx_messages_msgid) and scores
 // the stored bytes. The cache is opened strictly read-only and no migration is
-// run, so pointing this at the database a running mailo is using cannot alter
+// run, so pointing this at the database a running mailove is using cannot alter
 // it. The same Message-ID may be cached in several folders or accounts; every
 // copy is scored and located in the output.
 //
@@ -188,7 +188,7 @@ QStringList emlsUnder(const QString &dir)
     return out;
 }
 
-/// mailo's own cache, opened read-only. Deliberately not via MailStore: open()
+/// mailove's own cache, opened read-only. Deliberately not via MailStore: open()
 /// there runs the schema migrations, and a diagnostic must not be able to write
 /// to the database the running client is using.
 QSqlDatabase openCacheReadOnly(const QString &explicitPath)
@@ -196,7 +196,7 @@ QSqlDatabase openCacheReadOnly(const QString &explicitPath)
     QString path = explicitPath;
     if (path.isEmpty()) {
         path = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
-            + QStringLiteral("/mailo.db");
+            + QStringLiteral("/mailove.db");
     }
     if (!QFile::exists(path)) {
         std::fprintf(stderr, "no cache at %s\n", qPrintable(path));
@@ -205,7 +205,7 @@ QSqlDatabase openCacheReadOnly(const QString &explicitPath)
     QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
                                                 QStringLiteral("spamtool"));
     db.setDatabaseName(path);
-    // QSQLITE_OPEN_READONLY is the guarantee, not a convention: mailo may well
+    // QSQLITE_OPEN_READONLY is the guarantee, not a convention: mailove may well
     // be running against this file, and its WAL is shared.
     db.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
     if (!db.open()) {
@@ -255,7 +255,7 @@ int scoreByMessageId(QSqlDatabase &db, const QString &rawMsgid, const QSet<QStri
 
         if (!b.exec() || !b.next() || b.value(0).toByteArray().isEmpty()) {
             std::fprintf(stderr, "%s: header cached but no body yet — open it once "
-                                 "in mailo, or export it\n", qPrintable(where));
+                                 "in mailove, or export it\n", qPrintable(where));
             continue;
         }
         // A cached body whose large attachments were lifted into the file store
@@ -284,10 +284,10 @@ int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
     // The same identity src/main.cpp gives the client, so QStandardPaths lands
-    // on mailo's own data directory. Both the cached Public Suffix List and the
+    // on mailove's own data directory. Both the cached Public Suffix List and the
     // message cache live there, so this has to come before either is looked up.
-    QCoreApplication::setOrganizationName(QStringLiteral("mailo"));
-    QCoreApplication::setApplicationName(QStringLiteral("mailo"));
+    QCoreApplication::setOrganizationName(QStringLiteral("mailove"));
+    QCoreApplication::setApplicationName(QStringLiteral("mailove"));
     // Loads the cached Public Suffix List and refreshes it if stale. Without it
     // organizationalDomainOf() falls back to the full domain, which only makes
     // the alignment rules fire less often — the tool still runs, it just

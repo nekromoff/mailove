@@ -51,7 +51,7 @@ static void check(bool ok, const QString &what)
 
 /// Something the server in front of us cannot do, as distinct from something
 /// this client got wrong. Counted separately so a container built without a
-/// feature does not read as a defect in mailo — and so it does not read as a
+/// feature does not read as a defect in mailove — and so it does not read as a
 /// pass either.
 static int skipped = 0;
 static void skip(const QString &what, const QString &why)
@@ -201,7 +201,7 @@ static int runLiveWrite(const QString &host, const QString &token, const QString
     int result = 1;
 
     const QString stamp = QString::number(QDateTime::currentSecsSinceEpoch());
-    const QString created = QStringLiteral("mailo-test-") + stamp;
+    const QString created = QStringLiteral("mailove-test-") + stamp;
     const QString renamed = created + QStringLiteral("-renamed");
     QString inbox;
     QString filedId;
@@ -210,9 +210,9 @@ static int runLiveWrite(const QString &host, const QString &token, const QString
     const QByteArray filedRaw =
         "From: tester <tester@example.invalid>\r\n"
         "To: tester <tester@example.invalid>\r\n"
-        "Subject: mailo write-path test\r\n"
+        "Subject: mailove write-path test\r\n"
         "Date: Wed, 05 Aug 2026 10:00:00 +0000\r\n"
-        "Message-ID: <mailo-write-" + stamp.toUtf8()
+        "Message-ID: <mailove-write-" + stamp.toUtf8()
         + "@example.invalid>\r\n"
           "MIME-Version: 1.0\r\n"
           "Content-Type: text/plain; charset=utf-8\r\n"
@@ -332,9 +332,9 @@ static int runLiveWrite(const QString &host, const QString &token, const QString
         // submission is built on.
         auto sentRaw = std::make_shared<QByteArray>(
             "From: " + sendFrom.toUtf8() + "\r\nTo: " + sendTo.toUtf8()
-            + "\r\nSubject: mailo JMAP submission test\r\n"
+            + "\r\nSubject: mailove JMAP submission test\r\n"
               "Date: Wed, 05 Aug 2026 10:00:00 +0000\r\n"
-              "Message-ID: <mailo-send-"
+              "Message-ID: <mailove-send-"
             + stamp.toUtf8()
             + "@example.invalid>\r\n"
               "MIME-Version: 1.0\r\n"
@@ -576,7 +576,7 @@ static int runLiveSync(const QString &host, const QString &token)
     // decisive test needs a *second* client to make the change: anything this
     // one did itself it would also have recorded locally, and a stale full
     // listing would pass.
-    const QString deltaFolder = QStringLiteral("mailo-delta-") + stamp;
+    const QString deltaFolder = QStringLiteral("mailove-delta-") + stamp;
     steps.append({QStringLiteral("list the mailbox tree once"), [&](Done done) {
                       listAndWait(backend, [&, done](const QStringList &paths) {
                           folderPaths = paths;

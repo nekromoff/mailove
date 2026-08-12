@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailo VERSION 2.2 LANGUAGES CXX)
+project(mailove VERSION 2.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,17 +24,17 @@ pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
 # no TLS — and it is already in the process via Qt Network.
 pkg_check_modules(LIBCRYPTO REQUIRED IMPORTED_TARGET libcrypto)
 # OpenPGP key handling (see doc/openpgp.md). Optional on purpose: the AppImage
-# has no gnupg to talk to, and everything else in mailo works without it. When
+# has no gnupg to talk to, and everything else in mailove works without it. When
 # it is missing the encryption UI is hidden and PgpEngine reports why — see
-# MAILO_HAVE_OPENPGP below and PgpEngine::available().
-option(MAILO_OPENPGP "Build OpenPGP support (needs Gpgmepp and QGpgmeQt6)" ON)
-if(MAILO_OPENPGP)
+# MAILOVE_HAVE_OPENPGP below and PgpEngine::available().
+option(MAILOVE_OPENPGP "Build OpenPGP support (needs Gpgmepp and QGpgmeQt6)" ON)
+if(MAILOVE_OPENPGP)
     find_package(Gpgmepp QUIET)
     find_package(QGpgmeQt6 QUIET)
     if(Gpgmepp_FOUND AND QGpgmeQt6_FOUND)
-        set(MAILO_HAVE_OPENPGP ON)
+        set(MAILOVE_HAVE_OPENPGP ON)
     else()
-        set(MAILO_HAVE_OPENPGP OFF)
+        set(MAILOVE_HAVE_OPENPGP OFF)
         # All three: the Gpgmepp and QGpgmeQt6 configs both resolve a Gpgme
         # dependency, which comes from the C library's own dev package — with
         # only the two C++ ones installed, both find_packages fail here.
@@ -42,13 +42,13 @@ if(MAILO_OPENPGP)
                        "(install libgpgme-dev libgpgmepp-dev libqgpgmeqt6-dev)")
     endif()
 else()
-    set(MAILO_HAVE_OPENPGP OFF)
-    message(STATUS "OpenPGP support disabled by MAILO_OPENPGP=OFF")
+    set(MAILOVE_HAVE_OPENPGP OFF)
+    message(STATUS "OpenPGP support disabled by MAILOVE_OPENPGP=OFF")
 endif()
 
 qt_standard_project_setup(REQUIRES 6.5)
 
-qt_add_executable(mailo
+qt_add_executable(mailove
     src/main.cpp
     src/mailclient.cpp
     src/mailclient.h
@@ -108,9 +108,9 @@ qt_add_executable(mailo
 )
 
 # Must be set before qt_add_qml_module(), which bakes the autogen path into the
-# metatypes dependency. Keeps mailo_autogen/ out of the build root.
-set_target_properties(mailo PROPERTIES
-    AUTOGEN_BUILD_DIR "${CMAKE_BINARY_DIR}/autogen/mailo_autogen")
+# metatypes dependency. Keeps mailove_autogen/ out of the build root.
+set_target_properties(mailove PROPERTIES
+    AUTOGEN_BUILD_DIR "${CMAKE_BINARY_DIR}/autogen/mailove_autogen")
 
 set_source_files_properties(src/qml/Main.qml PROPERTIES QT_RESOURCE_ALIAS Main.qml)
 set_source_files_properties(src/qml/AccountSheet.qml PROPERTIES QT_RESOURCE_ALIAS AccountSheet.qml)
@@ -125,8 +125,8 @@ set_source_files_properties(src/qml/HoverToolTip.qml PROPERTIES QT_RESOURCE_ALIA
 set_source_files_properties(src/qml/SelectableValue.qml PROPERTIES QT_RESOURCE_ALIAS SelectableValue.qml)
 set_source_files_properties(src/qml/ExpandableValue.qml PROPERTIES QT_RESOURCE_ALIAS ExpandableValue.qml)
 
-qt_add_qml_module(mailo
-    URI Mailo
+qt_add_qml_module(mailove
+    URI Mailove
     VERSION 1.0
     QML_FILES
         src/qml/Main.qml
@@ -146,12 +146,12 @@ qt_add_qml_module(mailo
 # Compile ABOUT.md into the binary (shown in Settings → About). Editing
 # ABOUT.md and rebuilding always bakes the new text in — it is never read
 # from disk at runtime.
-qt_add_resources(mailo "about"
+qt_add_resources(mailove "about"
     PREFIX "/"
     FILES ABOUT.md
 )
 
-target_link_libraries(mailo PRIVATE
+target_link_libraries(mailove PRIVATE
     Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Sql
     # Widgets: for KDE's native, widget-based file pickers only (see main.cpp).
     Qt6::Widgets
@@ -164,23 +164,23 @@ target_link_libraries(mailo PRIVATE
     PkgConfig::LIBCRYPTO
 )
 
-if(MAILO_HAVE_OPENPGP)
-    target_link_libraries(mailo PRIVATE Gpgmepp QGpgmeQt6)
-    target_compile_definitions(mailo PRIVATE MAILO_HAVE_OPENPGP)
+if(MAILOVE_HAVE_OPENPGP)
+    target_link_libraries(mailove PRIVATE Gpgmepp QGpgmeQt6)
+    target_compile_definitions(mailove PRIVATE MAILOVE_HAVE_OPENPGP)
 endif()
 
-target_compile_definitions(mailo PRIVATE MAILO_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(mailove PRIVATE MAILOVE_VERSION="${PROJECT_VERSION}")
 
-install(TARGETS mailo RUNTIME DESTINATION bin)
+install(TARGETS mailove RUNTIME DESTINATION bin)
 
 # Desktop integration files — installed into the standard XDG locations so
 # linuxdeploy (and normal system installs) pick them up for packaging.
 include(GNUInstallDirs)
-install(FILES packaging/org.mailo.Mailo.desktop
+install(FILES packaging/org.mailove.Mailove.desktop
         DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
-install(FILES packaging/org.mailo.Mailo.svg
+install(FILES packaging/org.mailove.Mailove.svg
         DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps)
-install(FILES packaging/org.mailo.Mailo.metainfo.xml
+install(FILES packaging/org.mailove.Mailove.metainfo.xml
         DESTINATION ${CMAKE_INSTALL_DATADIR}/metainfo)
 
 # Debian has no "License" control field — the licence and copyright holder
@@ -196,56 +196,56 @@ add_custom_command(
     COMMENT "Compressing Debian changelog"
     VERBATIM)
 add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mailo.1.gz
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mailove.1.gz
     COMMAND ${CMAKE_COMMAND} -E copy
-            ${CMAKE_CURRENT_SOURCE_DIR}/packaging/mailo.1
-            ${CMAKE_CURRENT_BINARY_DIR}/mailo.1
-    COMMAND gzip -9nf ${CMAKE_CURRENT_BINARY_DIR}/mailo.1
-    DEPENDS packaging/mailo.1
+            ${CMAKE_CURRENT_SOURCE_DIR}/packaging/mailove.1
+            ${CMAKE_CURRENT_BINARY_DIR}/mailove.1
+    COMMAND gzip -9nf ${CMAKE_CURRENT_BINARY_DIR}/mailove.1
+    DEPENDS packaging/mailove.1
     COMMENT "Compressing man page"
     VERBATIM)
-add_custom_target(mailo-docs ALL
+add_custom_target(mailove-docs ALL
     DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/changelog.gz
-            ${CMAKE_CURRENT_BINARY_DIR}/mailo.1.gz)
+            ${CMAKE_CURRENT_BINARY_DIR}/mailove.1.gz)
 
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/mailo.1.gz
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/mailove.1.gz
         DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
 
 install(FILES packaging/copyright
               ${CMAKE_CURRENT_BINARY_DIR}/changelog.gz
-        DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/mailo)
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/mailove)
 
 # Debian packaging: `cmake --build build --target package-deb`, which leaves
-# mailo_<version>_<arch>.deb in the project root (see the target below).
+# mailove_<version>_<arch>.deb in the project root (see the target below).
 # Shared-library Depends are computed by dpkg-shlibdeps; the extra Depends
 # below are runtime-only QML/data packages the linker can't see (QML modules
 # are loaded by name, the org.kde.desktop style is forced in main.cpp, and
 # icons come from the Breeze theme).
 set(CPACK_GENERATOR DEB)
-set(CPACK_PACKAGE_NAME mailo)
+set(CPACK_PACKAGE_NAME mailove)
 set(CPACK_PACKAGE_VENDOR "Daniel Duris")
 set(CPACK_PACKAGE_CONTACT "Daniel Duris <dusoft@staznosti.sk>")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "The fast KDE email client")
-set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/nekromoff/mailo")
-set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "Mailo is an IMAP and JMAP mail client focused on speed and safe message viewing.
+set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/nekromoff/mailove")
+set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "Mailove is an IMAP and JMAP mail client focused on speed and safe message viewing.
 It caches headers, bodies and the folder tree in SQLite for instant,
 offline-capable browsing and full-text search, and renders HTML mail in a
 sandboxed QtWebEngine view that blocks all remote content until you opt in. Built for KDE.
 
-Licensed under the LGPL-3.0-or-later; see /usr/share/doc/mailo/copyright.")
+Licensed under the LGPL-3.0-or-later; see /usr/share/doc/mailove/copyright.")
 set(CPACK_STRIP_FILES ON)
 set(CPACK_PACKAGING_INSTALL_PREFIX /usr)
 set(CPACK_DEBIAN_PACKAGE_SECTION mail)
 # Spelled out rather than DEB-DEFAULT, which produces this exact name but never
 # tells us what it was — and package-deb below has to know which file to move.
 execute_process(COMMAND dpkg --print-architecture
-                OUTPUT_VARIABLE MAILO_DEB_ARCH
+                OUTPUT_VARIABLE MAILOVE_DEB_ARCH
                 OUTPUT_STRIP_TRAILING_WHITESPACE
                 ERROR_QUIET)
-if(NOT MAILO_DEB_ARCH)
-    set(MAILO_DEB_ARCH amd64)
+if(NOT MAILOVE_DEB_ARCH)
+    set(MAILOVE_DEB_ARCH amd64)
 endif()
-set(CPACK_DEBIAN_FILE_NAME "mailo_${PROJECT_VERSION}_${MAILO_DEB_ARCH}.deb")
+set(CPACK_DEBIAN_FILE_NAME "mailove_${PROJECT_VERSION}_${MAILOVE_DEB_ARCH}.deb")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "\
 qml6-module-org-kde-kirigami, \
@@ -256,7 +256,7 @@ qml6-module-qtquick-controls, \
 qml6-module-qtquick-layouts, \
 qml6-module-qtquick-dialogs, \
 qml6-module-qtwebengine")
-# Recommends, not Depends: without gnupg mailo runs exactly as before, with the
+# Recommends, not Depends: without gnupg mailove runs exactly as before, with the
 # encryption settings hidden and PgpEngine saying why. Anyone who wants
 # OpenPGP wants gpg-agent's passphrase handling with it, which is why the agent
 # is named rather than left to gnupg's own dependencies.
@@ -265,12 +265,12 @@ include(CPack)
 
 # The version, for anything outside CMake that needs it — packaging/build-appimage.sh
 # names the AppImage from this rather than parsing project() out of this file.
-file(WRITE "${CMAKE_BINARY_DIR}/mailo-version.txt" "${PROJECT_VERSION}\n")
+file(WRITE "${CMAKE_BINARY_DIR}/mailove-version.txt" "${PROJECT_VERSION}\n")
 
 # Every release artifact lands in the project root, named with its version, so
 # builds are never hunted for inside a build tree:
 #
-#   cmake --build build --target package-deb   → mailo_<version>_<arch>.deb
+#   cmake --build build --target package-deb   → mailove_<version>_<arch>.deb
 #   cmake --build build --target packages      → both, via build-appimage.sh
 #
 # Named "packages", not "package": include(CPack) above already defines that
@@ -280,18 +280,18 @@ file(WRITE "${CMAKE_BINARY_DIR}/mailo-version.txt" "${PROJECT_VERSION}\n")
 # behind — a staging tree it repopulates from scratch every run, worth nothing
 # once the .deb exists. Removing it before and after keeps a stale layout from
 # a previous version out of the package and the build tree tidy afterwards.
-set(MAILO_CPACK_SCRATCH "${CMAKE_BINARY_DIR}/_CPack_Packages")
+set(MAILOVE_CPACK_SCRATCH "${CMAKE_BINARY_DIR}/_CPack_Packages")
 add_custom_target(package-deb
-    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILO_CPACK_SCRATCH}"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILOVE_CPACK_SCRATCH}"
     COMMAND ${CMAKE_CPACK_COMMAND} --config "${CMAKE_BINARY_DIR}/CPackConfig.cmake"
     COMMAND ${CMAKE_COMMAND} -E rename
             "${CMAKE_BINARY_DIR}/${CPACK_DEBIAN_FILE_NAME}"
             "${CMAKE_SOURCE_DIR}/${CPACK_DEBIAN_FILE_NAME}"
-    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILO_CPACK_SCRATCH}"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILOVE_CPACK_SCRATCH}"
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Packaging ${CPACK_DEBIAN_FILE_NAME} into the project root"
     VERBATIM)
-add_dependencies(package-deb mailo mailo-docs)
+add_dependencies(package-deb mailove mailove-docs)
 
 # The AppImage has its own build tree (build-appimage/, a Release configure of
 # its own) because it bundles Qt and must not inherit this one's flags. The
@@ -409,7 +409,7 @@ target_compile_definitions(jmapbackendtest PRIVATE
     JMAP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
 target_link_libraries(jmapbackendtest PRIVATE Qt6::Core Qt6::Network KPim6::Mime)
 
-set(_mailo_tests attachmenttest viewertest dkimtest dkimchecktool rawfidelitytest
+set(_mailove_tests attachmenttest viewertest dkimtest dkimchecktool rawfidelitytest
                  fidelitytool pgpmimetest securewipetest spamtool storetest
                  jmapsessiontest jmaprequesttest jmapbackendtest)
 
@@ -456,7 +456,7 @@ target_link_libraries(pgpmimetest PRIVATE Qt6::Core KPim6::Mime)
 # listing, identity matching, import/export, and the two lookup paths.
 # Set GNUPGHOME to a throwaway directory first.
 #   GNUPGHOME=/tmp/kr ./pgpkeytool --for me@example.com
-if(MAILO_HAVE_OPENPGP)
+if(MAILOVE_HAVE_OPENPGP)
     qt_add_executable(pgpkeytool tests/pgpkeytool.cpp
         src/pgpengine.cpp src/pgpengine.h
         src/pgpmime.cpp src/pgpmime.h
@@ -464,13 +464,13 @@ if(MAILO_HAVE_OPENPGP)
     target_include_directories(pgpkeytool PRIVATE src)
     target_link_libraries(pgpkeytool PRIVATE
         Qt6::Core Qt6::Network KPim6::Mime Gpgmepp QGpgmeQt6)
-    target_compile_definitions(pgpkeytool PRIVATE MAILO_HAVE_OPENPGP)
-    list(APPEND _mailo_tests pgpkeytool)
+    target_compile_definitions(pgpkeytool PRIVATE MAILOVE_HAVE_OPENPGP)
+    list(APPEND _mailove_tests pgpkeytool)
 endif()
 
 # Keep the test and diagnostic targets out of the build root: both the
 # binaries and the AUTOMOC/AUTOUIC scratch dirs land under build/tests/.
-foreach(_test ${_mailo_tests})
+foreach(_test ${_mailove_tests})
     set_target_properties(${_test} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
         AUTOGEN_BUILD_DIR "${CMAKE_BINARY_DIR}/tests/${_test}_autogen")

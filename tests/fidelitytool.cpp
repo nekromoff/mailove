@@ -6,7 +6,7 @@
 //   WIRE     the literal returned by `UID FETCH <uid> BODY.PEEK[]`, read
 //            straight off the socket by this tool — no KIMAP, no KMime. This
 //            is the ground truth the sender signed.
-//   CACHED   bodies.raw for that UID, exactly as mailo stored it, lifted to
+//   CACHED   bodies.raw for that UID, exactly as mailove stored it, lifted to
 //            CRLF the way MailClient::rawMessageForDkim() does before
 //            verification.
 //   KMIME    setContent(CRLFtoLF(WIRE)) -> parse() -> encodedContent() ->
@@ -89,7 +89,7 @@ const char *statusName(DkimResult::Status s)
 Account readAccount(int index)
 {
     Account a;
-    QSettings s(QStringLiteral("mailo"), QStringLiteral("mailo"));
+    QSettings s(QStringLiteral("mailove"), QStringLiteral("mailove"));
     const int count = s.beginReadArray(QStringLiteral("accounts"));
     if (index < 0 || index >= count) {
         s.endArray();
@@ -110,7 +110,7 @@ Account readAccount(int index)
 /// Same wallet service and key layout MailClient uses.
 QString walletPassword(const Account &a)
 {
-    QKeychain::ReadPasswordJob job(QStringLiteral("mailo"));
+    QKeychain::ReadPasswordJob job(QStringLiteral("mailove"));
     job.setAutoDelete(false);
     job.setKey(QStringLiteral("imap-password:") + a.user + QLatin1Char('@') + a.host);
     QEventLoop loop;
@@ -127,7 +127,7 @@ QString walletPassword(const Account &a)
 QString cacheDbPath()
 {
     return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
-        + QStringLiteral("/mailo.db");
+        + QStringLiteral("/mailove.db");
 }
 
 /// Scoped folder key, matching MailStore::scoped().
@@ -442,8 +442,8 @@ QString firstDifference(const QByteArray &a, const QByteArray &b)
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
-    QCoreApplication::setOrganizationName(QStringLiteral("mailo"));
-    QCoreApplication::setApplicationName(QStringLiteral("mailo"));
+    QCoreApplication::setOrganizationName(QStringLiteral("mailove"));
+    QCoreApplication::setApplicationName(QStringLiteral("mailove"));
 
     int accountIndex = 0;
     QString mailBox = QStringLiteral("INBOX");

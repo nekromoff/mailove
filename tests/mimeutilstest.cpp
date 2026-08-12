@@ -101,12 +101,12 @@ int main(int argc, char **argv)
     QCoreApplication app(argc, argv);
     // Both together are what redirect AppDataLocation — where AttachmentStore
     // writes its payload files — away from the real cache.
-    QCoreApplication::setApplicationName(QStringLiteral("mailo-mimeutilstest"));
-    QCoreApplication::setOrganizationName(QStringLiteral("mailo-mimeutilstest"));
+    QCoreApplication::setApplicationName(QStringLiteral("mailove-mimeutilstest"));
+    QCoreApplication::setOrganizationName(QStringLiteral("mailove-mimeutilstest"));
     QStandardPaths::setTestModeEnabled(true);
 
     const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    if (dir.isEmpty() || !dir.contains(QLatin1String("mailo-mimeutilstest"))) {
+    if (dir.isEmpty() || !dir.contains(QLatin1String("mailove-mimeutilstest"))) {
         qWarning() << "refusing to run: test data location is not isolated:" << dir;
         return 2;
     }

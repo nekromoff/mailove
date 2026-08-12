@@ -174,7 +174,7 @@ bool SyncEngine::handleBackgroundOpenFailure(const QString &message)
     // A mailbox deleted or made unreadable since the listing: skip it rather
     // than letting the pass stall on it. Leaving m_backfillFolder set would
     // re-issue the same open on the next tick, forever.
-    qWarning() << "mailo: skipping" << m_backfillFolder << "-" << message;
+    qWarning() << "mailove: skipping" << m_backfillFolder << "-" << message;
     m_backfillOpenPending = false;
     m_backfillFolder.clear();
     m_backfillFolderCount = -1;
@@ -341,7 +341,7 @@ void SyncEngine::backoffBackfill()
         Q_EMIT statusMessage(tr("%1 — sync paused (server busy)")
                       .arg(m_selectedFolder.isEmpty() ? tr("Mail")
                                                        : m_selectedFolder));
-        qWarning() << "mailo: backfill paused after" << kBackoffMaxAttempts
+        qWarning() << "mailove: backfill paused after" << kBackoffMaxAttempts
                    << "throttle/backoff attempts";
         return;
     }

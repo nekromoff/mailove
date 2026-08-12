@@ -49,7 +49,7 @@ public:
         CalendarAttachment = 2,  ///< body: every attachment is an .ics invite
         /// Body: no attachment parts at all. Distinct from NoAttachment so a
         /// multipart/mixed head that wraps nothing but the message text — what
-        /// Mailo itself used to send — stops showing a paperclip.
+        /// Mailove itself used to send — stops showing a paperclip.
         ConfirmedNoAttachment = 3,
     };
 

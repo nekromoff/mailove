@@ -19,7 +19,7 @@
  * and the honest summary is that this shortens the window rather than closing
  * it. Closing it properly needs plaintext to live in a buffer type of its own —
  * uniquely owned, mlock'd, wiped on destruction — which is what gpgme does
- * internally and what mailo would have to do to make the same claim.
+ * internally and what mailove would have to do to make the same claim.
  */
 namespace SecureWipe
 {

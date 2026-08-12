@@ -39,7 +39,7 @@ UPSTREAM = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1:18080"
 USER = sys.argv[3] if len(sys.argv) > 3 else "cassandane"
 # entrypoint.sh writes the key as `echo $JWT_SECRET | base64`, so the HMAC key
 # carries the newline echo added. Signing with the bare secret fails.
-SECRET = (sys.argv[4] if len(sys.argv) > 4 else "mailo-test-secret").encode() + b"\n"
+SECRET = (sys.argv[4] if len(sys.argv) > 4 else "mailove-test-secret").encode() + b"\n"
 
 # Streamed rather than buffered: an EventSource reply never ends, so anything
 # that waits for a complete body would hang push instead of proxying it.

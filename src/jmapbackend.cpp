@@ -662,7 +662,7 @@ void JmapBackend::fetchHeadersSince(const QString &folder, const QString &sinceR
         for (const JmapRequest::Response &response : responses) {
             if (response.isError()
                 && response.errorType() == QLatin1String("cannotCalculateChanges")) {
-                qWarning() << "mailo: JMAP server cannot compute changes for" << folder
+                qWarning() << "mailove: JMAP server cannot compute changes for" << folder
                            << "- the cached messages are void";
                 m_emailState.remove(folder);
                 Q_EMIT folderInvalidated(folder);
@@ -2140,7 +2140,7 @@ void JmapBackend::openPushStream()
             schedulePushRetry();
             return;
         }
-        qWarning() << "mailo: JMAP server does not offer an EventSource (HTTP" << status
+        qWarning() << "mailove: JMAP server does not offer an EventSource (HTTP" << status
                    << ") - falling back to polling";
         m_pushWanted = false;
     });

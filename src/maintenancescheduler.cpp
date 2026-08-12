@@ -288,7 +288,7 @@ void MaintenanceScheduler::startAttachmentMigration()
             // an inconvenience, one that loses its attachment is a bug.
             QString reason;
             if (!MimeUtils::verifyRoundTrip(stub, *parts, &reason)) {
-                qWarning() << "mailo: attachment migration skipped a message —" << reason;
+                qWarning() << "mailove: attachment migration skipped a message —" << reason;
                 parts->clear();
                 return raw;
             }
