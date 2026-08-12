@@ -1,3 +1,35 @@
+mailove (2.3) unstable; urgency=medium
+
+  * Renamed from Mailo to Mailove. The binary, the desktop entry, the icon
+    and the internal URL scheme all follow the new name.
+  * Because the application name changed, settings and cached mail now live
+    under ~/.config/mailove/ and ~/.local/share/mailove/. Nothing is migrated
+    from the old mailo directories: accounts must be added again and each
+    one re-syncs from the server on first use. The old directories are left
+    untouched and can be removed by hand.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Wed, 12 Aug 2026 12:00:00 +0200
+
+mailove (2.2) unstable; urgency=medium
+
+  * Better spam identification.
+  * UI and UX fixes against the 20 ms rule: message pages are prefetched
+    ahead of the scroll, and holding Page Down no longer degrades over a
+    long list.
+  * Read-only folders now fail cleanly instead of surfacing a rejected
+    STORE.
+  * Background workers run at low priority, so they no longer compete with
+    the GUI thread.
+  * Logging changed: switched off now means a silent console.
+  * Added a GUI-thread stall detector and paging timings for diagnostics,
+    both reported only when logging is enabled.
+  * Groundwork for Gravatar sender icons is present but inert: not built,
+    not reachable from the UI, and likely to be removed — an avatar lookup
+    tells a third party who is mailing you, which is not a switch worth
+    offering even off by default.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Mon, 10 Aug 2026 21:24:40 +0200
+
 mailove (2.1) unstable; urgency=medium
 
   * Accounts other than the open one now sync their mail in the background,

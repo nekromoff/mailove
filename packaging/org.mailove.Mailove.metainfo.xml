@@ -33,6 +33,33 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="2.3" date="2026-08-12" type="stable">
+      <description>
+        <ul>
+          <li>Renamed from Mailo to Mailove — the binary, the desktop entry
+              and the icon all follow the new name.</li>
+          <li>Settings and cached mail moved to ~/.config/mailove/ and
+              ~/.local/share/mailove/. Accounts from an earlier install are
+              not carried over and must be added again.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.2" date="2026-08-10" type="stable">
+      <description>
+        <ul>
+          <li>Better spam identification.</li>
+          <li>Message pages are prefetched ahead of the scroll, and holding
+              Page Down no longer degrades over a long list.</li>
+          <li>Read-only folders now fail cleanly rather than reporting a
+              rejected server command.</li>
+          <li>Background work runs at low priority, so it no longer competes
+              with the interface.</li>
+          <li>Logging switched off now means a silent console; with it on,
+              a stall detector and paging timings are reported for
+              diagnostics.</li>
+        </ul>
+      </description>
+    </release>
     <release version="2.1" date="2026-08-07" type="stable">
       <description>
         <ul>
