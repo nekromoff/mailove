@@ -2,6 +2,9 @@
 
 The fast KDE-only email client.
 
+<img width="300" height="300" alt="org mailove Mailove" src="https://github.com/user-attachments/assets/67841075-7f20-4e41-a6ca-7814b1988757" />
+
+
 (c) 2026 Daniel Duris, dusoft@staznosti.sk
 
 ## What it does
