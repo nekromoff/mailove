@@ -38,13 +38,15 @@ Security-minded KDE-only IMAP and JMAP mail client, blazing fast.
 - **Imported mail** — a Thunderbird directory imports as an offline account. Add servers later to promote it to a live one, archive intact.
 
 ## Screenshots
-<img width="1920" height="1038" alt="01-main" src="https://github.com/user-attachments/assets/9d316cd3-1aac-4912-b299-10be19a4bcb2" />
-<img width="1920" height="1038" alt="03-settings-general" src="https://github.com/user-attachments/assets/0e3ca0fe-2c70-4315-bc28-970329edd4f0" />
-<img width="1920" height="1038" alt="04-settings-look" src="https://github.com/user-attachments/assets/48307c05-f72c-490e-936f-714272bcd628" />
-<img width="1920" height="1038" alt="05-settings-shortcuts" src="https://github.com/user-attachments/assets/7ffb32bf-7e74-485f-8472-1955072284e6" />
-<img width="1920" height="1038" alt="06-settings-about" src="https://github.com/user-attachments/assets/a7429f33-54b4-462d-8fe8-b7837cfadb64" />
-<img width="1002" height="688" alt="09-compose" src="https://github.com/user-attachments/assets/6e256ce0-680d-436d-8422-3c5160bacaf4" />
-<img width="1002" height="688" alt="10-compose-cc" src="https://github.com/user-attachments/assets/f1d80745-abe3-4374-8523-7272ee9b3fef" />
+<img width="1132" height="818" alt="compose" src="https://github.com/user-attachments/assets/128b1bf7-6eab-4ecd-9b98-afd7d1ec78ab" />
+<img width="1920" height="1038" alt="02-settings-accounts" src="https://github.com/user-attachments/assets/108c1e8c-dc90-406f-8719-4fb24efef692" />
+<img width="1920" height="1038" alt="03-settings-general" src="https://github.com/user-attachments/assets/594e49de-5bf6-43cb-8868-2c11bc185974" />
+<img width="1920" height="1038" alt="04-settings-look" src="https://github.com/user-attachments/assets/cfa9486b-bdb6-41e1-8db1-28fcaffc104e" />
+<img width="1920" height="1038" alt="05-settings-shortcuts" src="https://github.com/user-attachments/assets/a01aa48d-3a70-40ea-ac71-47e5afd9e115" />
+<img width="1920" height="1038" alt="06-settings-about" src="https://github.com/user-attachments/assets/14543538-9c8d-4f1b-8b94-5bb9c9296783" />
+<img width="571" height="112" alt="Screenshot_20260813_115049" src="https://github.com/user-attachments/assets/ac41c815-df3d-4e70-a791-5d152238cc6a" />
+<img width="802" height="112" alt="Screenshot_20260813_115137" src="https://github.com/user-attachments/assets/1c07d657-731d-476c-aa20-6de2f05eb0b9" />
+<img width="802" height="136" alt="Screenshot_20260813_115219" src="https://github.com/user-attachments/assets/7f8dbf7e-ae4a-4b5a-9348-8459de23ef19" />
 
 ## Installation
 
