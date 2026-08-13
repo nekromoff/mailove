@@ -33,6 +33,24 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="2.4" date="2026-08-13" type="stable">
+      <description>
+        <ul>
+          <li>New Layout setting: the message preview can sit below the
+              message list or beside it, each remembering its own divider
+              position.</li>
+          <li>The beside layout shows two lines per message and moves sorting
+              to a button next to the search field.</li>
+          <li>Search now works offline and in imported archives instead of
+              refusing with "Not connected".</li>
+          <li>Search fixes: a query that found nothing no longer hides the
+              next one's results, and clearing a search offline restores the
+              folder.</li>
+          <li>Settings help texts rewritten throughout, and a simplified
+              application icon.</li>
+        </ul>
+      </description>
+    </release>
     <release version="2.3" date="2026-08-12" type="stable">
       <description>
         <ul>

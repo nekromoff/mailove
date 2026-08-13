@@ -15,11 +15,11 @@ Security-minded KDE-only IMAP and JMAP mail client, blazing fast.
 - **IMAP or JMAP** — multiple accounts supported. IMAP against any server (SSL/TLS, STARTTLS, plain), password or OAuth 2 for Gmail and Microsoft 365; JMAP (RFC 8620/8621) discovers its own endpoints from the address and authenticates with an API token or a password.
 - **Push, or polling where there is none** — IMAP IDLE and JMAP EventSource both land as "something changed there"; what changed is then fetched the ordinary way. A timed refresh covers servers offering neither.
 - **Every account stays current, not just the open one** — the same refresh syncs the accounts you are not looking at: inbox first, then their other folders.
-- **Local cache with full-text search** — headers, read bodies and folders in SQLite: folders open instantly, offline included. IMAP SEARCH → FTS5 (accent-folding) → regex; `/pattern/` is a case-insensitive regex.
+- **Local cache with full-text search** — headers, read bodies and folders in SQLite: folders open instantly, offline included. FTS5 (accent-folding) + a case-insensitive regex.
 
 ### UI
 - **Fast by design** — a 20 ms limit on the GUI thread, one frame: anything slower runs on a worker. Nothing ever snaps or stalls mid-scroll.
-- **UX to taste** — Look and feel sets row density, background colour and whether the composer is a tab or a window; Message sorting by any column; Shortcuts rebinds every action; Color labels for messages; Change the date format, refresh interval, spam retention, cache limits and debug logging
+- **UX to taste** — Look and feel sets the layout (message preview below or beside the list), row density, background colour and tab or window to compose email; Message sorting by any column; Shortcuts rebinds every action; Color labels for messages; Change the date format, refresh interval, spam retention, cache limits and debug logging
 - **Compose & send** — SMTP with rich text, attachments, signature and resumable drafts.
 - **Attachments** — click to open, right-click to save. Stored zstd-compressed and deduplicated outside the database.
 - **OpenPGP** — read and send signed and encrypted mail through GnuPG. Key manager, WKD discovery. Decrypted plaintext is never indexed, never cached, and is wiped from memory when the message closes.

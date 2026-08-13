@@ -4379,19 +4379,27 @@ void MailClient::searchMessages(const QString &query, int field)
         return;
     }
 
-    // A local archive has no server to ask, but the whole archive is in the
-    // cache — the local index pass IS the search.
-    if (m_acct.local && !m_selectedFolder.isEmpty()) {
+    if (m_selectedFolder.isEmpty()) {
+        Q_EMIT errorOccurred(tr("Select a folder to search."));
+        return;
+    }
+
+    // A previous query that found nothing left a regex filter on the model (see
+    // the tail of localKeywordFilter) — and a filter hides every row the NEXT
+    // query appends, so one fruitless search made the search box look broken
+    // until the field was cleared. The filter belongs to the query that set it.
+    m_messageModel.applyFilter(QRegularExpression());
+
+    // A local archive has no server to ask, and an offline account has none it
+    // can reach — either way the cache is what there is to search, and the
+    // local index pass IS the search. Refusing here with "Not connected" was
+    // the whole complaint: the mail is sitting in the index, unsearchable.
+    if (m_acct.local || !connected()) {
         m_searchSeen.clear();
         m_searching = true;
         m_searchFound = 0;
         Q_EMIT searchingChanged();
         localKeywordFilter(trimmed, tr("Search results"), /*append=*/false, field == 0);
-        return;
-    }
-
-    if (!connected() || m_selectedFolder.isEmpty()) {
-        Q_EMIT errorOccurred(tr("Not connected."));
         return;
     }
 
@@ -4552,8 +4560,15 @@ void MailClient::clearSearch()
         Q_EMIT searchingChanged();
     }
     m_messageModel.applyFilter(QRegularExpression());
-    if (!m_selectedFolder.isEmpty() && connected())
-        openFolder(m_selectedFolder);
+    if (m_selectedFolder.isEmpty())
+        return;
+    // Offline (and every local archive): no server refresh is coming to replace
+    // the result rows, and openFolder() treats a folder that still has rows as
+    // a reopen and leaves them standing — so drop them and let it refill from
+    // the cache. Otherwise clearing the search left the hits on screen.
+    if (!connected())
+        m_messageModel.clear();
+    openFolder(m_selectedFolder);
 }
 
 void MailClient::fetchHeadersByUids(const QList<qint64> &uids, const QString &localMergeKeyword,

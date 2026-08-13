@@ -220,6 +220,13 @@ void MessageListModel::clear()
 
 void MessageListModel::applyFilter(const QRegularExpression &pattern)
 {
+    // rebuildVisible() is a full model reset, which throws away every delegate
+    // the view holds — far too violent to run for a filter that did not
+    // change. The search path clears the filter before every query (including
+    // the debounced one behind each keystroke), so without this guard that was
+    // a reset per keystroke on a list the view is actively scrolling.
+    if (m_filter == pattern)
+        return;
     m_filter = pattern;
     rebuildVisible();
 }

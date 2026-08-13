@@ -65,6 +65,20 @@ Kirigami.ApplicationWindow {
         property string collapsedAccounts: "[]"
         property int rowDensity: 1     // 0 compact, 1 medium, 2 wide
         property string bgColor: ""    // "" = theme default
+        // Where the reading pane sits: 0 below the message list (the list runs
+        // the full width, columns and all), 1 beside it (list and viewer are
+        // full-height columns, and the list narrows to a two-line row).
+        property int messageLayout: 0
+        // Divider positions, one per layout: the list's height in "below" and
+        // its width in "beside". Kept apart on purpose — switching layouts and
+        // back has to put the divider where the user last left it *in that
+        // layout*, not carry one mode's number into the other, where it means
+        // a different thing entirely. 0 = never dragged, use the default.
+        property real splitBelowHeight: 0
+        property real splitBesideWidth: 0
+        // The folder pane's width, shared by both layouts (it is the same pane
+        // in the same place either way).
+        property real folderPaneWidth: 220
         // Compose is the one view offered both ways; everything else is a tab.
         property bool composeInWindow: false
         // Definable shortcuts (Look settings); QKeySequence strings.
@@ -107,6 +121,21 @@ Kirigami.ApplicationWindow {
     // Mail-list row height from the density setting
     readonly property real listRowHeight:
         Kirigami.Units.gridUnit * [1.15, 1.4, 1.9][uiSettings.rowDensity]
+    // The same, for the two-line row of the "beside" layout — which takes the
+    // row size setting one step up: a two-line row at Compact is tighter than a
+    // one-line row at Compact ever was, so the setting has to be read as "one
+    // looser than you asked" to feel like the same choice. Wide has no step
+    // above it, so it stretches instead.
+    readonly property real listRowHeightTwoLine: {
+        const steps = [2.05, 2.4, 3.1]
+        const d = uiSettings.rowDensity
+        return Kirigami.Units.gridUnit * (d >= 2 ? steps[2] * 1.2 : steps[d + 1])
+    }
+
+    // Reading pane beside the list rather than below it. Read in enough places
+    // — the split's orientation, the column header, the row delegate, the sort
+    // menu — to be worth naming once here.
+    readonly property bool previewBeside: uiSettings.messageLayout === 1
     readonly property color panelColor: uiSettings.bgColor !== ""
         ? uiSettings.bgColor : Kirigami.Theme.backgroundColor
 
@@ -1079,9 +1108,23 @@ Kirigami.ApplicationWindow {
                         // the connection over and opens it.
                         ColumnLayout {
                             id: folderPane
-                            QQC2.SplitView.preferredWidth: 220
                             QQC2.SplitView.minimumWidth: 140
                             spacing: 0
+
+                            // Restored rather than bound: dragging the divider
+                            // makes SplitView *write* preferredWidth, which
+                            // would blow away a binding on the first drag.
+                            Component.onCompleted:
+                                QQC2.SplitView.preferredWidth = uiSettings.folderPaneWidth
+                            onWidthChanged: folderWidthSave.restart()
+                            Timer {
+                                id: folderWidthSave
+                                interval: 400 // after the drag settles, not per frame
+                                onTriggered: {
+                                    if (folderPane.width > 0)
+                                        uiSettings.folderPaneWidth = folderPane.width
+                                }
+                            }
 
                             property Item folderListView: null
 
@@ -1857,26 +1900,77 @@ Kirigami.ApplicationWindow {
                             id: rightSplit
                             QQC2.SplitView.fillWidth: true
                             QQC2.SplitView.minimumWidth: 300
-                            orientation: Qt.Vertical
+                            // The whole layout setting comes down to this line:
+                            // the same three panes, split the other way. Kept as
+                            // one SplitView rather than two swapped layouts so
+                            // the list and the viewer are never re-created —
+                            // switching would otherwise drop scroll position,
+                            // selection and whatever the viewer has open.
+                            orientation: root.previewBeside ? Qt.Horizontal : Qt.Vertical
+                            onOrientationChanged: messagePane.applySplit()
 
-                            // Wider, hover-highlighted grab area for the list/viewer divider
+                            // Wider, hover-highlighted grab area for the list/viewer
+                            // divider. Both dimensions are set: the handle is laid out
+                            // across whichever axis the split is currently using.
                             handle: Rectangle {
                                 implicitHeight: 6
+                                implicitWidth: 6
                                 color: QQC2.SplitHandle.hovered || QQC2.SplitHandle.pressed
                                        ? Kirigami.Theme.highlightColor : "transparent"
                                 opacity: QQC2.SplitHandle.pressed ? 0.6 : 0.3
                                 Kirigami.Separator {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    width: parent.width
+                                    anchors.centerIn: parent
+                                    width: root.previewBeside ? 1 : parent.width
+                                    height: root.previewBeside ? parent.height : 1
                                 }
                             }
 
                         // Message list pane
                         ColumnLayout {
                             id: messagePane
-                            QQC2.SplitView.preferredHeight: rightSplit.height / 2
                             QQC2.SplitView.minimumHeight: 160
+                            QQC2.SplitView.minimumWidth: Kirigami.Units.gridUnit * 15
                             spacing: 0
+
+                            // --- Divider memory, one position per layout ------------
+                            //
+                            // SplitView reads preferredHeight when vertical and
+                            // preferredWidth when horizontal, and *writes* the one it
+                            // reads as the divider is dragged — so neither can be a
+                            // binding. Both are restored on load and re-applied on
+                            // every orientation change, which is what makes switching
+                            // to "beside" and back land the divider exactly where it
+                            // was left in "below".
+                            function applySplit() {
+                                if (root.previewBeside)
+                                    QQC2.SplitView.preferredWidth =
+                                        uiSettings.splitBesideWidth > 0
+                                        ? uiSettings.splitBesideWidth
+                                        : Math.round(rightSplit.width * 0.36)
+                                else
+                                    QQC2.SplitView.preferredHeight =
+                                        uiSettings.splitBelowHeight > 0
+                                        ? uiSettings.splitBelowHeight
+                                        : Math.round(rightSplit.height / 2)
+                            }
+                            // Only the axis the split is actually using is recorded.
+                            // In "beside" the pane is full-height and in "below" it is
+                            // full-width, and saving that free dimension would write
+                            // the window's size over the other layout's divider.
+                            onWidthChanged: if (root.previewBeside) splitSave.restart()
+                            onHeightChanged: if (!root.previewBeside) splitSave.restart()
+                            Timer {
+                                id: splitSave
+                                interval: 400
+                                onTriggered: {
+                                    if (root.previewBeside) {
+                                        if (messagePane.width > 0)
+                                            uiSettings.splitBesideWidth = messagePane.width
+                                    } else if (messagePane.height > 0) {
+                                        uiSettings.splitBelowHeight = messagePane.height
+                                    }
+                                }
+                            }
 
                             // Column layout shared by the header row and every message row.
                             // Order is user-adjustable by dragging headers; weight 0 marks
@@ -1896,6 +1990,7 @@ Kirigami.ApplicationWindow {
                                 uiSettings.columnOrder = JSON.stringify(ids)
                             }
                             Component.onCompleted: {
+                                applySplit()
                                 // Restore the saved column order (ignore unknown/missing ids)
                                 const saved = JSON.parse(uiSettings.columnOrder)
                                 let target = 0
@@ -1982,13 +2077,55 @@ Kirigami.ApplicationWindow {
                                     // ("Everything" — body, cc, all headers) is the slower,
                                     // noisier search, so it is the one you opt into.
                                     model: ["From + Subject", "Everything"]
-                                    implicitWidth: Kirigami.Units.gridUnit * 8
+                                    // Half the width in the narrow list, where the
+                                    // full label would crowd out the search field.
+                                    implicitWidth: Kirigami.Units.gridUnit
+                                                   * (root.previewBeside ? 5 : 8)
                                     // Changing the scope IS a new query when there is text
                                     // to search — no reason to make the user press Enter
                                     // to get what they just asked for.
                                     onActivated: {
                                         if (searchField.text.length > 0)
                                             searchField.startSearch()
+                                    }
+                                }
+
+                                // Sorting, for the layout that has no column header
+                                // to click. Same state and same toggle() as the
+                                // header, so the two never disagree — and a column
+                                // picked here is still the sort when the user
+                                // switches back to the wide list.
+                                QQC2.ToolButton {
+                                    visible: root.previewBeside
+                                    icon.name: columnHeader.sortDescending
+                                               ? "view-sort-descending" : "view-sort-ascending"
+                                    QQC2.ToolTip.text: "Sort messages"
+                                    QQC2.ToolTip.visible: hovered
+                                    onClicked: sortMenu.popup()
+
+                                    QQC2.Menu {
+                                        id: sortMenu
+                                        Repeater {
+                                            model: [{ label: "Date", col: 0 },
+                                                    { label: "Sender", col: 1 },
+                                                    { label: "Subject", col: 2 },
+                                                    { label: "Attachment", col: 3 }]
+                                            delegate: QQC2.MenuItem {
+                                                required property var modelData
+                                                checkable: true
+                                                checked: columnHeader.sortColumn === modelData.col
+                                                // The arrow rides on the active entry, so
+                                                // one glance says both what the list is
+                                                // sorted by and which way round.
+                                                text: modelData.label
+                                                      + (columnHeader.sortColumn === modelData.col
+                                                         ? (columnHeader.sortDescending ? "  ↓" : "  ↑")
+                                                         : "")
+                                                // Re-picking the active column reverses it,
+                                                // exactly as clicking its header does.
+                                                onTriggered: columnHeader.toggle(modelData.col)
+                                            }
+                                        }
                                     }
                                 }
 
@@ -2036,6 +2173,14 @@ Kirigami.ApplicationWindow {
                                 id: columnHeader
                                 Layout.fillWidth: true
                                 implicitHeight: Kirigami.Units.gridUnit * 1.6
+                                // No room for four draggable columns in a pane a
+                                // few hundred pixels wide, so the narrow list drops
+                                // the header and sorts from the menu in the search
+                                // row instead. The item stays alive while hidden —
+                                // it owns the sort state and toggle(), which that
+                                // menu calls. (A Layout skips invisible children,
+                                // so this costs no height.)
+                                visible: !root.previewBeside
 
                                 // model order: 0 date, 1 from, 2 subject, 3 attachment
                                 property int sortColumn: uiSettings.sortColumn
@@ -2747,6 +2892,30 @@ Kirigami.ApplicationWindow {
                                         readonly property string markColor:
                                             colorLabel > 0 ? root.scaleColorOf(colorLabel) : ""
 
+                                        // A marked, selected row shows the mark as its
+                                        // TEXT color (the tint background is suppressed
+                                        // under selection). When not selected the mark
+                                        // lives in the background tint, so text uses the
+                                        // normal theme color. Named once here because
+                                        // both the column row and the two-line row need
+                                        // it, and two copies of this would drift.
+                                        readonly property color rowTextColor:
+                                            (highlighted && markColor !== "") ? markColor
+                                            : highlighted ? Kirigami.Theme.highlightedTextColor
+                                                          : Kirigami.Theme.textColor
+
+                                        // "Not what it appears to be" — a failed sender
+                                        // check or the local spam heuristics. One glyph
+                                        // for both, because to a reader they say the same
+                                        // thing; the tooltip is where they differ.
+                                        readonly property bool authFailed:
+                                            suspicious && Mail.authVerification
+                                        readonly property bool showsWarning: authFailed || spam
+                                        readonly property string warningText:
+                                            authFailed
+                                            ? "Sender authentication failed:\n" + authInfo
+                                            : "Looks like spam:\n" + spamDetail
+
                                         width: messageList.width
                                         // Row height comes from the density setting alone;
                                         // fixed slim padding keeps the density steps even.
@@ -2870,7 +3039,22 @@ Kirigami.ApplicationWindow {
                                             }
                                         }
 
-                                        contentItem: Row {
+                                        // One row shape or the other, never both:
+                                        // a Loader builds only the tree the
+                                        // current layout needs. Toggling
+                                        // `visible` on two trees would double
+                                        // what every pooled row carries, and
+                                        // this list is deliberately cheap per
+                                        // row (see reuseItems above).
+                                        contentItem: Loader {
+                                            sourceComponent: root.previewBeside
+                                                             ? twoLineRow : columnRow
+                                        }
+
+                                        // --- Wide list: one cell per column ------------
+                                        Component {
+                                        id: columnRow
+                                        Row {
                                             Repeater {
                                                 model: messagePane.columns
                                                 delegate: Item {
@@ -2910,24 +3094,18 @@ Kirigami.ApplicationWindow {
                                                     }
                                                     QQC2.Label { // sender-authentication / spam marker
                                                         id: authMark
-                                                        // One glyph for both, because to a reader
-                                                        // they say the same thing. The tooltip is
-                                                        // where they differ: authentication quotes
-                                                        // the server, spam lists the rules that
-                                                        // fired, so "Why?" always has an answer.
-                                                        readonly property bool authFailed:
-                                                            msgDelegate.suspicious && Mail.authVerification
+                                                        // The tooltip is where the two differ:
+                                                        // authentication quotes the server, spam
+                                                        // lists the rules that fired, so "Why?"
+                                                        // always has an answer.
                                                         visible: rowCell.colId === "subject"
-                                                                 && (authFailed || msgDelegate.spam)
+                                                                 && msgDelegate.showsWarning
                                                         anchors.left: parent.left
                                                         anchors.verticalCenter: parent.verticalCenter
                                                         text: "!"
                                                         color: Kirigami.Theme.negativeTextColor
                                                         font.bold: true
-                                                        QQC2.ToolTip.text:
-                                                            authMark.authFailed
-                                                            ? "Sender authentication failed:\n" + msgDelegate.authInfo
-                                                            : "Looks like spam:\n" + msgDelegate.spamDetail
+                                                        QQC2.ToolTip.text: msgDelegate.warningText
                                                         QQC2.ToolTip.visible: authHover.hovered
                                                         HoverHandler { id: authHover }
                                                     }
@@ -2952,20 +3130,113 @@ Kirigami.ApplicationWindow {
                                                         // push it further below AA.
                                                         opacity: (rowCell.colId === "subject"
                                                                   || msgDelegate.highlighted) ? 1 : 0.8
-                                                        // A marked, selected row shows the
-                                                        // mark as its TEXT color (the tint
-                                                        // background is suppressed under
-                                                        // selection). When not selected the
-                                                        // mark lives in the background tint,
-                                                        // so text uses the normal theme color.
-                                                        color: (msgDelegate.highlighted && msgDelegate.markColor !== "")
-                                                               ? msgDelegate.markColor
-                                                               : msgDelegate.highlighted
-                                                                 ? Kirigami.Theme.highlightedTextColor
-                                                                 : Kirigami.Theme.textColor
+                                                        color: msgDelegate.rowTextColor
                                                     }
                                                 }
                                             }
+                                        }
+                                        }
+
+                                        // --- Narrow list: sender + date, then subject ---
+                                        //
+                                        // The columns do not survive a pane a few hundred
+                                        // pixels wide, so the narrow list stacks what they
+                                        // carried: who it is from and when on the first
+                                        // line, what it is about on the second. The markers
+                                        // move to the subject line, where the eye already
+                                        // is. Same model properties, same colors — only the
+                                        // arrangement differs.
+                                        Component {
+                                        id: twoLineRow
+                                        Item {
+                                            implicitHeight: root.listRowHeightTwoLine
+
+                                            // Two-line rows run together without one: the
+                                            // wide list separates messages by their column
+                                            // grid, and nothing here does that job. Skipped
+                                            // on the highlighted row, where a line drawn
+                                            // across the selection band reads as a glitch.
+                                            Kirigami.Separator {
+                                                anchors.left: parent.left
+                                                anchors.right: parent.right
+                                                anchors.bottom: parent.bottom
+                                                height: 1
+                                                visible: !msgDelegate.highlighted
+                                                opacity: 0.5
+                                            }
+
+                                            ColumnLayout {
+                                                anchors.fill: parent
+                                                anchors.leftMargin: Kirigami.Units.smallSpacing
+                                                anchors.rightMargin: Kirigami.Units.smallSpacing
+                                                // Keeps the text off the divider, top and
+                                                // bottom, so rows read as blocks rather than
+                                                // as four evenly spaced lines.
+                                                anchors.topMargin: Kirigami.Units.smallSpacing / 2
+                                                anchors.bottomMargin: Kirigami.Units.smallSpacing / 2
+                                                spacing: 0
+
+                                                RowLayout { // sender · date
+                                                    Layout.fillWidth: true
+                                                    spacing: Kirigami.Units.smallSpacing
+
+                                                    QQC2.Label {
+                                                        Layout.fillWidth: true
+                                                        text: msgDelegate.from
+                                                        elide: Text.ElideRight
+                                                        font.bold: !msgDelegate.seen
+                                                        color: msgDelegate.rowTextColor
+                                                    }
+                                                    QQC2.Label {
+                                                        text: msgDelegate.date
+                                                        // Never elided away by a long sender:
+                                                        // the date is the one field whose
+                                                        // usefulness is all-or-nothing.
+                                                        Layout.alignment: Qt.AlignRight
+                                                        font.pointSize: Kirigami.Theme.smallFont.pointSize
+                                                        opacity: msgDelegate.highlighted ? 1 : 0.8
+                                                        color: msgDelegate.rowTextColor
+                                                    }
+                                                }
+                                                RowLayout { // subject, with the markers
+                                                    Layout.fillWidth: true
+                                                    spacing: Kirigami.Units.smallSpacing / 2
+
+                                                    QQC2.Label {
+                                                        visible: msgDelegate.showsWarning
+                                                        text: "!"
+                                                        color: Kirigami.Theme.negativeTextColor
+                                                        font.bold: true
+                                                        QQC2.ToolTip.text: msgDelegate.warningText
+                                                        QQC2.ToolTip.visible: warnHover.hovered
+                                                        HoverHandler { id: warnHover }
+                                                    }
+                                                    QQC2.Label {
+                                                        Layout.fillWidth: true
+                                                        text: msgDelegate.subject
+                                                        elide: Text.ElideRight
+                                                        font.bold: !msgDelegate.seen
+                                                        color: msgDelegate.rowTextColor
+                                                    }
+                                                    Kirigami.Icon { // encrypted / signed
+                                                        visible: msgDelegate.crypto > 0
+                                                        source: msgDelegate.crypto === 2
+                                                                ? "mail-signed" : "mail-encrypted"
+                                                        implicitWidth: Kirigami.Units.iconSizes.small
+                                                        implicitHeight: implicitWidth
+                                                        opacity: 0.7
+                                                    }
+                                                    Kirigami.Icon { // paperclip / calendar-invite
+                                                        visible: msgDelegate.hasAttachment
+                                                        source: msgDelegate.calendarAttachment
+                                                                ? "view-calendar" : "mail-attachment"
+                                                        implicitWidth: Kirigami.Units.iconSizes.small
+                                                        implicitHeight: implicitWidth
+                                                        opacity: 0.7
+                                                    }
+                                                }
+                                            }
+                                        }
                                         }
                                     }
 
@@ -2975,7 +3246,18 @@ Kirigami.ApplicationWindow {
                                         // Not while a search runs: an empty list then means
                                         // "no results yet", which the spinner below says.
                                         visible: messageList.count === 0 && !Mail.searching
-                                        text: Mail.connected ? "No messages" : "Not connected"
+                                        // A search that found nothing is not a
+                                        // connection problem, and neither is a local
+                                        // archive — which is never connected by
+                                        // design. Saying "Not connected" for either
+                                        // blamed the network for an empty result.
+                                        text: {
+                                            if (searchField.text.length > 0)
+                                                return "No matching messages"
+                                            if (Mail.accountIsLocal || Mail.connected)
+                                                return "No messages"
+                                            return "Offline — nothing cached for this folder"
+                                        }
                                         icon.name: "mail-folder-inbox"
                                     }
 
@@ -3011,7 +3293,7 @@ Kirigami.ApplicationWindow {
                             }
                         }
 
-                        // Viewer pane — bottom half of the right side
+                        // Viewer pane — below the list, or beside it
                         MessageViewer {
                             id: viewer
                             context: Mail.readingContext
@@ -3020,8 +3302,13 @@ Kirigami.ApplicationWindow {
                             // tab has its own viewer, and both answering Find
                             // or View source makes the shortcut ambiguous.
                             shortcutsActive: tabStack.currentIndex === 0
+                            // The viewer is the pane that takes the leftovers in
+                            // either layout; SplitView reads whichever of these
+                            // matches its orientation and ignores the other.
                             QQC2.SplitView.fillHeight: true
+                            QQC2.SplitView.fillWidth: true
                             QQC2.SplitView.minimumHeight: 160
+                            QQC2.SplitView.minimumWidth: Kirigami.Units.gridUnit * 18
                             onReplyRequested: replyAll => composeSheet().openReply(Mail.replyData(replyAll))
                             onForwardRequested: composeSheet().openForward(Mail.forwardData())
                         }

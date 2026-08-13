@@ -1009,10 +1009,10 @@ Item {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
                 text: "Server settings are set up automatically. When you save, "
-                      + "your browser opens to sign in — Mailove picks up the "
-                      + "sign-in automatically and remembers it in the system keyring."
+                      + "your browser opens to log in and authorize Mailove."
                 wrapMode: Text.Wrap
-                opacity: 0.7
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
             }
 
             QQC2.Label {
@@ -1020,22 +1020,20 @@ Item {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
                 wrapMode: Text.Wrap
-                opacity: 0.7
-                text: "Imported mail, kept on disk. There is no server to "
-                      + "configure and nothing is sent or synced. To turn this "
-                      + "into a live account, change the type to IMAP "
-                      + "and fill in its servers."
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                text: "Imported (archive) account. Change type to turn it into "
+                      + "a live account."
             }
             QQC2.Label {
                 visible: sheet.jmapAccount
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
                 wrapMode: Text.Wrap
-                opacity: 0.7
-                text: "Experimental: a JMAP account can list folders and read "
-                      + "mail, but marking read, moving, deleting and sending "
-                      + "are not implemented yet and will report an error. "
-                      + "Use it to try a JMAP server, not as your only account."
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                text: "Experimental: JMAP support is newer and less tested "
+                      + "than IMAP."
             }
             QQC2.TextField {
                 id: hostField
@@ -1094,7 +1092,8 @@ Item {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
                 wrapMode: Text.Wrap
-                opacity: 0.7
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
                 text: "The token is sent as an Authorization: Bearer header. "
                       + "Most JMAP servers issue one from their own settings "
                       + "page — check with your provider. Mailove cannot obtain "
@@ -1162,8 +1161,8 @@ Item {
                 visible: !sheet.localAccount
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
-                text: "HTML mail carries a plain-text version alongside, so every "
-                      + "recipient can read it. Untick to send plain text only."
+                text: "HTML mail carries a plain-text version alongside. "
+                      + "Disable to send plain text only."
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
@@ -1259,21 +1258,25 @@ Item {
                 text: "Encrypt"
                 onToggled: sheet.savePrefs()
             }
-            QQC2.Label {
+            ColumnLayout {
                 visible: Pgp.available && !sheet.localAccount
                 Kirigami.FormData.label: ""
-                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
-                text: "These set how the compose window opens; both stay "
-                      + "switchable per message.\n\n"
-                      + "Encrypting needs a public key for each recipient. When "
-                      + "one is missing, Mailove leaves encryption off for that "
-                      + "message and says so — it never quietly sends in the "
-                      + "clear.\n\n"
-                      + "The subject line is never encrypted — it travels in the "
-                      + "clear whatever these say."
-                wrapMode: Text.Wrap
-                opacity: 0.8
-                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                spacing: 0
+                QQC2.Label {
+                    Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                    wrapMode: Text.Wrap
+                    opacity: 0.8
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    text: "Encrypting needs a public key for each recipient. "
+                          + "Signing works without those."
+                }
+                QQC2.Label {
+                    Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                    wrapMode: Text.Wrap
+                    opacity: 0.8
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    text: "The subject line is never encrypted."
+                }
             }
             QQC2.CheckBox {
                 id: pgpAutoWkdBox
@@ -1391,8 +1394,8 @@ Item {
                 }
                 QQC2.Label {
                     Layout.fillWidth: true
-                    text: "Added automatically to every new message, reply and "
-                          + "forward from this account — above the quoted mail."
+                    text: "Added automatically to every message above the "
+                          + "quoted message."
                     wrapMode: Text.Wrap
                     opacity: 0.8
                     font.pointSize: Kirigami.Theme.smallFont.pointSize
@@ -1431,8 +1434,7 @@ Item {
             QQC2.Label {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
-                text: "Used for message dates in the list and the reading pane. "
-                      + "Messages from today show only their time."
+                text: "Used for message dates in the list and the reading pane."
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
@@ -1456,8 +1458,7 @@ Item {
             QQC2.Label {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
-                text: "Checks the open folder for new mail on this schedule when "
-                      + "real-time push (IMAP IDLE) is not active. 0 turns it off."
+                text: "Checks for new email on this schedule. 0 to disable."
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
@@ -1484,18 +1485,25 @@ Item {
                 checked: Mail.spamSkipTrash
                 onToggled: sheet.setMail("spamSkipTrash", checked)
             }
-            QQC2.Label {
+            ColumnLayout {
                 Kirigami.FormData.label: ""
-                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
-                text: "Spam sent longer ago than this is "
-                      + "removed automatically, once per connection — going by the "
-                      + "date the message carries, the one shown in the list. 0 keeps it "
-                      + "forever. With Skip trash on, deleting spam — by hand or "
-                      + "on this schedule — destroys it outright instead of "
-                      + "filing it in the trash to be cleared out twice."
-                wrapMode: Text.Wrap
-                opacity: 0.8
-                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                spacing: 0
+                QQC2.Label {
+                    Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                    wrapMode: Text.Wrap
+                    opacity: 0.8
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    text: "Spam received longer ago than this is removed "
+                          + "automatically. 0 keeps it forever."
+                }
+                QQC2.Label {
+                    Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                    wrapMode: Text.Wrap
+                    opacity: 0.8
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    text: "Skip trash deletes all spam immediately without moving "
+                          + "it to Trash first."
+                }
             }
 
             Kirigami.Separator {
@@ -1512,12 +1520,7 @@ Item {
             QQC2.Label {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
-                text: "Checks whether a message really came from the domain it "
-                      + "claims, and shows the result when you open it. DKIM and "
-                      + "ARC signatures are verified here, against keys looked up "
-                      + "in DNS; SPF and DMARC are read from what your mail server "
-                      + "reported. Turning this off stops all of it: no keys are "
-                      + "looked up, and no result is shown or stored."
+                text: "Checks whether a message really came from the sender it claims."
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
@@ -1541,11 +1544,7 @@ Item {
             QQC2.Label {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
-                text: "Messages larger than this are still opened normally, they "
-                      + "are just never stored for offline use — a few big "
-                      + "attachments can otherwise outweigh thousands of normal "
-                      + "messages. 0 caches everything. Raising the limit makes "
-                      + "previously skipped messages eligible again."
+                text: "Larger messages are not stored locally. 0 caches everything."
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
@@ -1584,10 +1583,9 @@ Item {
             QQC2.Label {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
-                text: "Deleting cached mail frees space inside the cache file but "
-                      + "does not shrink it. This rebuilds the file to give that "
-                      + "space back to the disk. It takes several minutes on a "
-                      + "large cache and pauses syncing while it runs."
+                text: "Reclaim space that is taken by deleted messages. It takes "
+                      + "several minutes on a large cache and pauses syncing "
+                      + "while it runs."
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
@@ -1616,9 +1614,8 @@ Item {
             QQC2.Label {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
-                text: "Prints folder, account and sync activity to the terminal "
-                      + "mailove was started from. Useful when reporting a bug; "
-                      + "takes effect immediately, no restart needed."
+                text: "Prints folder, account and sync activity to the terminal. "
+                      + "Useful when reporting a bug."
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
@@ -1638,6 +1635,27 @@ Item {
             width: lookScroll.availableWidth
 
             QQC2.ComboBox {
+                Kirigami.FormData.label: "Layout:"
+                model: ["Preview below", "Preview beside"]
+                currentIndex: sheet.ui ? sheet.ui.messageLayout : 0
+                onActivated: sheet.setUi("messageLayout", currentIndex)
+            }
+            ColumnLayout {
+                Kirigami.FormData.label: ""
+                spacing: 0
+                QQC2.Label {
+                    opacity: 0.8
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    text: "Below: email preview below the message list."
+                }
+                QQC2.Label {
+                    opacity: 0.8
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    text: "Beside: email preview right of the message list."
+                }
+            }
+
+            QQC2.ComboBox {
                 Kirigami.FormData.label: "Row size:"
                 model: ["Compact", "Medium", "Wide"]
                 currentIndex: sheet.ui ? sheet.ui.rowDensity : 1
@@ -1653,13 +1671,6 @@ Item {
                 model: ["Tab", "Separate window"]
                 currentIndex: sheet.ui && sheet.ui.composeInWindow ? 1 : 0
                 onActivated: sheet.setUi("composeInWindow", currentIndex === 1)
-            }
-            QQC2.Label {
-                Kirigami.FormData.label: ""
-                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
-                wrapMode: Text.Wrap
-                opacity: 0.7
-                text: "Takes effect the next time you open the composer."
             }
 
             RowLayout {
@@ -1708,7 +1719,7 @@ Item {
             }
             QQC2.Label {
                 Kirigami.FormData.label: ""
-                text: "Applies to the interface panels. Changes take effect immediately."
+                text: "Applies to the interface panels."
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
             }
@@ -1943,9 +1954,7 @@ Item {
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
                 text: "Click a shortcut, then press the new key or combination "
                       + "(Esc cancels). Shortcuts act in the mail and folder "
-                      + "lists and apply immediately. The label keys — No label "
-                      + "and 1 to 5 — live under Look and feel → Mark emails, "
-                      + "next to the color each one marks with."
+                      + "lists. The label keys are under Look and feel."
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize

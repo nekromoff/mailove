@@ -1,3 +1,27 @@
+mailove (2.4) unstable; urgency=medium
+
+  * New Layout setting: the message preview can sit below the message list as
+    before, or beside it. Each layout remembers its own divider position, and
+    the folder pane width is now remembered too.
+  * In the beside layout the list shows each message on two lines, sender and
+    date above subject, separated by a hairline rule; sorting moves to a
+    button next to the search field and stays in step with the column
+    headers of the other layout.
+  * Search works offline and in imported archives instead of refusing with
+    "Not connected" — the local index is the search when no server can be
+    reached.
+  * A search that found nothing no longer leaves a filter behind that hid the
+    results of the next one, and clearing a search offline restores the
+    folder instead of leaving the hits on screen.
+  * Typing in the search field no longer resets the message list on every
+    keystroke.
+  * Settings help texts rewritten throughout: shorter, and all at one size.
+    The JMAP note no longer claims that marking read, moving, deleting and
+    sending are unimplemented — they are.
+  * Simplified application icon.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Thu, 13 Aug 2026 12:00:00 +0200
+
 mailove (2.3) unstable; urgency=medium
 
   * Renamed from Mailo to Mailove. The binary, the desktop entry, the icon
