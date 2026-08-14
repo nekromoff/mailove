@@ -9,10 +9,25 @@
 //   ./spamtool --known alice@example.com    treat these senders as allowlisted
 //   ./spamtool --auth-fail msg.eml          score as if SPF/DKIM/DMARC failed
 //   ./spamtool --auth-pass msg.eml          ...or passed
+//   ./spamtool --arc-pass msg.eml           ...or failed only because of a relay (ARC)
+//   ./spamtool --junk msg.eml               score as if it sat in the Junk folder
 //   ./spamtool --crypto 2 msg.eml           score as OpenPGP signed (1 enc, 2 sig, 3 both)
 //   ./spamtool --quiet ...                  totals only, no per-message lines
+//   ./spamtool --cache                      score your own cached inbox, no export
+//   ./spamtool --cache --folder Junk        ...some other folder instead
+//   ./spamtool --cache --limit 500          ...how many, newest first (default 200)
 //   ./spamtool --msgid '<abc@host>'         score a message straight from the cache
 //   ./spamtool --db PATH                    ...from a cache other than the default
+//
+// --cache is the normal way to try the filter against real mail: it reads the
+// messages mailove has already cached and, unlike every other mode, fills the
+// scoring context from the cache too. It sweeps the INBOX only, because that is
+// the only folder the client scores (MailClient::scoresSpamIn) — measuring Sent
+// or Junk would be measuring a filter that never runs there — who you have written to, and how long
+// each sending domain has been writing to you. Those are the two strongest ham
+// rules in the scorer, so a corpus scored without them comes out pessimistic.
+// Only messages whose body is cached are scored, and the count of those that
+// were skipped for want of one is printed with the totals.
 //
 // --msgid saves exporting an .eml by hand: it looks the message up in mailove's
 // own cache by Message-ID (an indexed lookup, idx_messages_msgid) and scores
@@ -23,11 +38,13 @@
 //
 // Bodies are used when the file has them, so the same message can score
 // differently here and in the message list, which only ever sees headers.
+#include "../src/mimeutils.h"
 #include "../src/publicsuffixlist.h"
 #include "../src/spamheuristics.h"
 
 #include <KMime/Message>
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
@@ -49,49 +66,6 @@ const char *verdictName(SpamHeuristics::Verdict v)
     case SpamHeuristics::Verdict::Spam: return "SPAM";
     }
     return "?";
-}
-
-/// Pulls the text/plain and text/html bodies out of a parsed message. Uses
-/// KMime rather than a hand-rolled split so the tool sees what the client
-/// would see once body scoring is wired into the viewer.
-void collectBodies(KMime::Content *node, QString *text, QString *html)
-{
-    if (!node)
-        return;
-    const auto children = node->contents();
-    if (!children.isEmpty()) {
-        for (KMime::Content *child : children)
-            collectBodies(child, text, html);
-        return;
-    }
-    const QByteArray mime =
-        node->contentType() ? node->contentType()->mimeType().toLower() : QByteArray();
-    if (mime == "text/html" && html->isEmpty())
-        *html = node->decodedText();
-    else if (mime == "text/plain" && text->isEmpty())
-        *text = node->decodedText();
-}
-
-/// Filenames of the parts that present themselves as attachments. Name only:
-/// the scorer judges what a part claims to be, which is the same thing the
-/// reader is being invited to click.
-void collectAttachments(KMime::Content *node, QStringList *names)
-{
-    if (!node)
-        return;
-    const auto children = node->contents();
-    if (!children.isEmpty()) {
-        for (KMime::Content *child : children)
-            collectAttachments(child, names);
-        return;
-    }
-    QString name;
-    if (auto *cd = node->contentDisposition(); cd && !cd->filename().isEmpty())
-        name = cd->filename();
-    else if (auto *ct = node->contentType(); ct && !ct->name().isEmpty())
-        name = ct->name();
-    if (!name.isEmpty())
-        names->append(name);
 }
 
 struct Totals {
@@ -139,13 +113,19 @@ bool scoreRaw(const QByteArray &raw, const QString &label, const QSet<QString> &
 
     SpamHeuristics::Message m;
     m.head = msg.head();
-    collectBodies(&msg, &m.text, &m.html);
-    collectAttachments(&msg, &m.attachmentNames);
+    MimeUtils::collectBodies(&msg, &m.text, &m.html);
+    MimeUtils::collectAttachments(&msg, &m.attachmentNames);
+    m.encryptedArchive = MimeUtils::hasEncryptedArchive(&msg);
 
     SpamHeuristics::Context ctx = base;
     const QString from = msg.from() ? msg.from()->asUnicodeString() : QString();
     const QString addr = SpamHeuristics::addressOf(from);
-    ctx.knownCorrespondent = known.contains(addr);
+    // Only when the caller supplied an allowlist. --cache answers this from the
+    // recipients table and passes the answer in the context; overwriting it
+    // from an empty --known set here reported every message as unexempt and
+    // made Rule 0 — the strongest ham rule there is — look like it never fires.
+    if (!known.isEmpty())
+        ctx.knownCorrespondent = known.contains(addr);
 
     const SpamHeuristics::Score s = SpamHeuristics::score(m, ctx);
     totals->count(s);
@@ -214,6 +194,137 @@ QSqlDatabase openCacheReadOnly(const QString &explicitPath)
         return {};
     }
     return db;
+}
+
+/// The real scoring context for one message, read out of the cache the client
+/// uses — not simulated the way --auth-pass and --seen-from-org are.
+///
+/// This is what makes --cache worth having over a folder of exported files: the
+/// familiarity and allowlist signals are the strongest ham rules in the scorer,
+/// and a corpus on disk has no history behind it to trigger them. Scored
+/// without that, perfectly ordinary mail reads as "first contact from a domain
+/// I have never heard of" and the numbers come out pessimistic.
+///
+/// The authentication verdict is the one part still left to the caller. It
+/// depends on which authserv-id this account's server stamps, which lives in
+/// the account settings rather than the cache, and reading a message's own
+/// Authentication-Results here would be trusting a header the sender wrote.
+SpamHeuristics::Context cacheContext(QSqlDatabase &db, const SpamHeuristics::Context &base,
+                                     const QString &fromValue)
+{
+    SpamHeuristics::Context ctx = base;
+    const QString addr = SpamHeuristics::addressOf(fromValue);
+    if (addr.isEmpty())
+        return ctx;
+
+    QSqlQuery r(db);
+    r.prepare(QStringLiteral("SELECT 1 FROM recipients WHERE addr_norm = ? LIMIT 1"));
+    r.addBindValue(SpamHeuristics::normalizeAddress(addr));
+    if (r.exec() && r.next())
+        ctx.knownCorrespondent = true;
+
+    const QString org = SpamHeuristics::organizationalDomainOf(addr);
+    if (!org.isEmpty()) {
+        QSqlQuery h(db);
+        h.prepare(QStringLiteral("SELECT seen, first_seen FROM sender_domains WHERE org = ?"));
+        h.addBindValue(org);
+        if (h.exec() && h.next()) {
+            ctx.seenFromOrg = h.value(0).toInt();
+            const qint64 first = h.value(1).toLongLong();
+            const qint64 now = QDateTime::currentSecsSinceEpoch();
+            // Same measure MailStore::senderDomainHistory() uses: age to now,
+            // not to the last message, so a burst last Tuesday is not "old".
+            ctx.daysKnownOrg =
+                first > 0 && now > first ? static_cast<int>((now - first) / 86400) : 0;
+        }
+    }
+    return ctx;
+}
+
+/// Scores what is already cached, without anything being exported first.
+///
+/// Only messages whose body is cached are scored: the header-only ones are the
+/// majority in a large mailbox and would score systematically lower (every
+/// body and attachment rule stays silent), which would quietly make the
+/// false-positive rate look better than it is. They are counted and reported
+/// as skipped rather than folded into the totals.
+///
+/// \a folderLike, when set, restricts the sweep to folder keys containing it —
+/// "INBOX", or an account name. \a limit caps how many are scored, newest
+/// first, because a full mailbox is a lot of output to read.
+int scoreCache(QSqlDatabase &db, const QString &folderLike, int limit,
+               const SpamHeuristics::Context &base, bool quiet, Totals *totals)
+{
+    QString sql = QStringLiteral(
+        "SELECT m.folder, m.uid, m.sender, b.raw FROM messages m"
+        " JOIN bodies b ON b.folder = m.folder AND b.uid = m.uid");
+    // The inbox and nothing else, matching MailClient::scoresSpamIn(). Sweeping
+    // everything scored the user's own Sent mail, their Drafts, and a Junk
+    // folder the server had already judged — none of which the client scores,
+    // so the numbers described a filter that does not exist. The folder key is
+    // "account\x1fmailbox", hence the suffix match.
+    if (folderLike.isEmpty())
+        sql += QStringLiteral(" WHERE m.folder LIKE '%INBOX'");
+    else
+        sql += QStringLiteral(" WHERE m.folder LIKE ?");
+    sql += QStringLiteral(" ORDER BY m.date DESC");
+    if (limit > 0)
+        sql += QStringLiteral(" LIMIT %1").arg(limit);
+
+    QSqlQuery q(db);
+    q.prepare(sql);
+    if (!folderLike.isEmpty())
+        q.addBindValue(QStringLiteral("%%%1%%").arg(folderLike));
+    if (!q.exec()) {
+        std::fprintf(stderr, "cache sweep failed: %s\n", qPrintable(q.lastError().text()));
+        return 0;
+    }
+
+    int scored = 0;
+    while (q.next()) {
+        const QByteArray raw = q.value(3).toByteArray();
+        if (raw.isEmpty())
+            continue;
+        QString where = q.value(0).toString();
+        where.replace(QChar(0x1f), QLatin1String(" / "));
+        where += QStringLiteral(":%1").arg(q.value(1).toLongLong());
+        SpamHeuristics::Context ctx = cacheContext(db, base, q.value(2).toString());
+        // Same rule the client applies: everything in a junk folder is spam by
+        // definition. Named by the same generous test MailClient::isJunkFolder
+        // uses, reduced to the few names that matter for a diagnostic.
+        const QString path = q.value(0).toString().section(QChar(0x1f), -1).toLower();
+        for (const auto &name : {"junk", "spam", "bulk", "quarantine"}) {
+            if (path.contains(QLatin1String(name))) {
+                ctx.inJunkFolder = true;
+                break;
+            }
+        }
+        // knownCorrespondent comes from the context now, so the --known list
+        // has nothing left to add; pass it empty rather than have two sources
+        // of the same answer disagree.
+        scoreRaw(raw, where, {}, ctx, quiet, totals);
+        ++scored;
+    }
+    return scored;
+}
+
+/// How many cached headers have no body, so the sweep's coverage can be stated
+/// rather than left to be guessed at from the totals.
+int countBodyless(QSqlDatabase &db, const QString &folderLike)
+{
+    QString sql = QStringLiteral(
+        "SELECT COUNT(*) FROM messages m LEFT JOIN bodies b"
+        " ON b.folder = m.folder AND b.uid = m.uid"
+        " WHERE (b.raw IS NULL OR b.raw = x'')");
+    if (folderLike.isEmpty())
+        sql += QStringLiteral(" AND m.folder LIKE '%INBOX'");
+    else
+        sql += QStringLiteral(" AND m.folder LIKE ?");
+    QSqlQuery q(db);
+    q.prepare(sql);
+    if (!folderLike.isEmpty())
+        q.addBindValue(QStringLiteral("%%%1%%").arg(folderLike));
+    return (q.exec() && q.next()) ? q.value(0).toInt() : 0;
 }
 
 /// Every cached copy of \a msgid, scored. Returns how many were found.
@@ -302,6 +413,9 @@ int main(int argc, char **argv)
     bool quiet = false;
     QStringList msgids;
     QString dbPath;
+    bool sweepCache = false;
+    QString folderLike;
+    int limit = 200;
 
     for (int i = 1; i < argc; ++i) {
         const QString arg = QString::fromLocal8Bit(argv[i]);
@@ -322,6 +436,10 @@ int main(int argc, char **argv)
             base.authFailed = true;
         else if (arg == QLatin1String("--auth-pass"))
             base.authPassed = true;
+        else if (arg == QLatin1String("--arc-pass"))
+            base.arcPassed = true;
+        else if (arg == QLatin1String("--junk"))
+            base.inJunkFolder = true;
         else if (arg == QLatin1String("--crypto"))
             base.crypto = next().toInt();
         // Simulated sender-domain history, the way --auth-pass simulates a
@@ -332,6 +450,12 @@ int main(int argc, char **argv)
             base.daysKnownOrg = next().toInt();
         else if (arg == QLatin1String("--msgid"))
             msgids.append(next());
+        else if (arg == QLatin1String("--cache"))
+            sweepCache = true;
+        else if (arg == QLatin1String("--folder"))
+            folderLike = next();
+        else if (arg == QLatin1String("--limit"))
+            limit = next().toInt();
         else if (arg == QLatin1String("--db"))
             dbPath = next();
         else if (arg == QLatin1String("--quiet"))
@@ -344,10 +468,12 @@ int main(int argc, char **argv)
         }
     }
 
-    if (files.isEmpty() && hamDirs.isEmpty() && spamDirs.isEmpty() && msgids.isEmpty()) {
+    if (files.isEmpty() && hamDirs.isEmpty() && spamDirs.isEmpty() && msgids.isEmpty()
+        && !sweepCache) {
         std::fprintf(stderr,
                      "usage: spamtool [--quiet] [--always-score] [--known ADDR]...\n"
                      "                [--auth-fail|--auth-pass] [--crypto 0|1|2|3]\n"
+                     "                [--cache] [--folder NAME] [--limit N]\n"
                      "                [--msgid MESSAGE-ID]... [--db PATH]\n"
                      "                [--dir DIR] [--ham DIR] [--spam DIR] [FILE...]\n");
         return 2;
@@ -361,12 +487,22 @@ int main(int argc, char **argv)
     for (const QString &f : std::as_const(files))
         scoreFile(f, known, base, quiet, &plain);
 
-    if (!msgids.isEmpty()) {
+    if (!msgids.isEmpty() || sweepCache) {
         QSqlDatabase db = openCacheReadOnly(dbPath);
         if (!db.isOpen())
             return 2;
         for (const QString &id : std::as_const(msgids)) {
             scoreByMessageId(db, id, known, base, quiet, &plain);
+        }
+        if (sweepCache) {
+            const int scored = scoreCache(db, folderLike, limit, base, quiet, &plain);
+            const int skipped = countBodyless(db, folderLike);
+            // Said out loud rather than left to be inferred: a sweep that
+            // silently ignored two thirds of the mailbox would read as a
+            // clean bill of health for the whole of it.
+            std::printf("cache: scored %d message(s) with a cached body%s; %d cached "
+                        "header(s) have no body yet and were skipped\n",
+                        scored, limit > 0 ? " (newest first, --limit)" : "", skipped);
         }
     }
 

@@ -201,6 +201,108 @@ int main(int argc, char **argv)
     check(MimeUtils::findPartByType(msg.get(), "text/nonexistent") == nullptr,
           "findPartByType returns null for a type that is not there");
 
+    // --- the collectors the spam scorer reads ----------------------------
+    {
+        QString text, html;
+        MimeUtils::collectBodies(msg.get(), &text, &html);
+        check(text.contains(QLatin1String("body text")), "collectBodies finds the text part");
+        QStringList names;
+        MimeUtils::collectAttachments(msg.get(), &names);
+        check(names.contains(QStringLiteral("big.bin"))
+                  && names.contains(QStringLiteral("small.bin")),
+              "collectAttachments names both attachments");
+    }
+
+    // --- the encrypted-archive probe --------------------------------------
+    // A password-protected attachment scores +50 on its own, so a probe that
+    // answered true for an ordinary zip would mark real mail. Both directions
+    // are checked for that reason. The two archives are written by hand rather
+    // than by an unpacker: what is being tested is the reading of one flag
+    // bit, and a fixture built by the same assumption as the code under test
+    // would prove nothing.
+    {
+        const auto zipWith = [](quint16 flags) {
+            QByteArray z;
+            z += QByteArray("PK\x03\x04", 4);
+            z += QByteArray("\x14\x00", 2);                                  // version
+            z += QByteArray(1, char(flags & 0xFF)) + QByteArray(1, char(flags >> 8));
+            z += QByteArray("\x00\x00", 2);                                  // method: store
+            z += QByteArray(4, '\0');                                        // time, date
+            z += QByteArray(4, '\0');                                        // crc
+            z += QByteArray("\x04\x00\x00\x00", 4);                          // compressed size
+            z += QByteArray("\x04\x00\x00\x00", 4);                          // uncompressed
+            z += QByteArray("\x05\x00", 2);                                  // name length
+            z += QByteArray("\x00\x00", 2);                                  // extra length
+            z += QByteArray("a.txt", 5);
+            z += QByteArray("data", 4);
+            return z;
+        };
+        const auto messageWithZip = [](const QByteArray &zip) {
+            QByteArray raw;
+            raw += "From: A <a@x.example>\r\nSubject: docs\r\nMIME-Version: 1.0\r\n";
+            raw += "Content-Type: multipart/mixed; boundary=\"SEP\"\r\n\r\n";
+            raw += "--SEP\r\nContent-Type: text/plain\r\n\r\ntext\r\n";
+            raw += "--SEP\r\nContent-Type: application/zip; name=\"docs.zip\"\r\n";
+            raw += "Content-Transfer-Encoding: base64\r\n";
+            raw += "Content-Disposition: attachment; filename=\"docs.zip\"\r\n\r\n";
+            raw += zip.toBase64() + "\r\n--SEP--\r\n";
+            auto m = std::make_shared<KMime::Message>();
+            m->setContent(KMime::CRLFtoLF(raw));
+            m->parse();
+            return m;
+        };
+        check(MimeUtils::hasEncryptedArchive(messageWithZip(zipWith(0x0001)).get()),
+              "hasEncryptedArchive sees the encryption flag");
+        check(!MimeUtils::hasEncryptedArchive(messageWithZip(zipWith(0x0000)).get()),
+              "hasEncryptedArchive leaves an ordinary zip alone");
+        check(!MimeUtils::hasEncryptedArchive(msg.get()),
+              "hasEncryptedArchive says nothing about a message with no archive");
+    }
+
+    // --- pasted images on their way out of the composer -------------------
+    // The composer references a pasted image as a local file, which is the
+    // only thing it can render; the message has to reference it as cid:, which
+    // is the only thing a recipient can render. Getting this rewrite wrong
+    // sends a message pointing at a path on the sender's machine.
+    {
+        QString html = QStringLiteral(
+            "<p>before</p><img src=\"file:///tmp/x/pasted-1.png\" width=\"640\" />"
+            "<p><img src='file:///tmp/x/pasted-1.png' /> again</p>"
+            "<img src=\"https://example.com/tracker.gif\">"
+            "<img src=\"cid:already@there\">");
+        const auto images = MimeUtils::takeInlineImages(html, QStringLiteral("x.example"));
+        check(images.size() == 1, "one part per file, however often it is referenced");
+        check(!html.contains(QLatin1String("file:")), "no local path survives into the message");
+        check(html.contains(QLatin1String("width=\"640\"")),
+              "the display size the editor wrote is kept");
+        check(html.contains(QLatin1String("https://example.com/tracker.gif")),
+              "a remote image is left exactly as it was");
+        check(html.contains(QLatin1String("cid:already@there")),
+              "an existing cid: reference is left alone");
+        if (images.size() == 1) {
+            check(images.first().path == QLatin1String("/tmp/x/pasted-1.png"),
+                  "the file to read the bytes from is named");
+            check(images.first().contentId.endsWith("@x.example"),
+                  "the Content-ID is in the sender's domain");
+            check(!images.first().contentId.contains('<'),
+                  "…and carries no angle brackets, which KMime adds itself");
+            // Both references have to point at the one part, or the second
+            // image renders as a broken box.
+            check(html.count(QStringLiteral("cid:") + QString::fromUtf8(images.first().contentId))
+                      == 2,
+                  "both references point at the same part");
+        }
+    }
+    // A body with nothing pasted into it must come back untouched — every
+    // message goes through this call, not just the ones with images.
+    {
+        QString html = QStringLiteral("<p>plain <b>body</b></p>");
+        const QString before = html;
+        check(MimeUtils::takeInlineImages(html, QStringLiteral("x.example")).isEmpty()
+                  && html == before,
+              "a body with no pasted image is left as it is");
+    }
+
     out << (failures == 0 ? "all mime utils tests passed\n"
                           : QStringLiteral("%1 check(s) failed\n").arg(failures));
     out.flush();

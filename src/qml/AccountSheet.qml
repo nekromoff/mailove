@@ -707,7 +707,7 @@ Item {
 
     FolderDialog {
         id: thunderbirdImportDialog
-        title: "Choose a Thunderbird mail folder"
+        title: "Choose a folder of mbox files"
         onAccepted: {
             Mail.importThunderbird(selectedFolder)
             sheet.close()
@@ -874,9 +874,18 @@ Item {
                 icon.name: "document-import"
                 text: "Import mail…"
                 onClicked: thunderbirdImportDialog.open()
-                QQC2.ToolTip.text: "Import a Thunderbird mail folder (mbox) as a "
-                                   + "browsable archive account. Point it at a profile's "
-                                   + "\"Mail\" or \"ImapMail\" subfolder."
+                // Any mbox tree, not just Thunderbird's: a file counts as mail
+                // when it opens with an mbox From_ line, and the ".sbd" suffix
+                // Thunderbird gives its subfolder directories is understood
+                // where it appears. The profile subfolders are still named:
+                // that is the one case where which folder to pick is not
+                // obvious from looking at it.
+                QQC2.ToolTip.text: "Import a folder of mbox files (Thunderbird, "
+                                   + "Evolution, Claws, KMail, a Gmail Takeout export) "
+                                   + "as a browsable archive account. Subfolders become "
+                                   + "folders. For a Thunderbird profile, point it at "
+                                   + "\"Mail\" or \"ImapMail\"; a single mbox file needs "
+                                   + "a folder of its own."
                 QQC2.ToolTip.visible: hovered
             }
             QQC2.Button {

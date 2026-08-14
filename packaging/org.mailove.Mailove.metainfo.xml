@@ -33,6 +33,28 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="2.5" date="2026-08-14" type="stable">
+      <description>
+        <ul>
+          <li>Spam detection rewritten around the message itself rather than
+              the X-Spam headers: brand impersonation, homograph and
+              zero-width tricks, phishing links, password forms, dangerous
+              attachments and the business-email-compromise shape.</li>
+          <li>Attachment and link rules now run — the client only ever scored
+              headers before, so nothing needing a body could fire.</li>
+          <li>ARC is read, so mailing lists are no longer marked.</li>
+          <li>Rules that fired on ordinary mail removed, measured against a
+              real mailbox.</li>
+          <li>The red ! means spam only; hovering lists every rule that fired
+              with its weight and the total.</li>
+          <li>Everything in the junk folder is marked. Scoring runs in the
+              inbox and junk folder only, and never in imported archives.</li>
+          <li>Taking a message out of the junk folder allowlists the sender;
+              Not spam also returns it to the inbox.</li>
+          <li>Sent and Drafts show, sort and search To instead of From.</li>
+        </ul>
+      </description>
+    </release>
     <release version="2.4" date="2026-08-13" type="stable">
       <description>
         <ul>

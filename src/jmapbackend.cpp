@@ -1015,7 +1015,7 @@ void JmapBackend::folderUnreadCounts(
 }
 
 void JmapBackend::search(const QString &folder, const QString &query, bool headersOnly,
-                         const OpCallback &done)
+                         bool byRecipient, const OpCallback &done)
 {
     const QString id = mailboxId(folder);
     if (id.isEmpty()) {
@@ -1039,8 +1039,11 @@ void JmapBackend::search(const QString &folder, const QString &query, bool heade
                 QJsonObject{{QStringLiteral("inMailbox"), id}},
                 QJsonObject{{QStringLiteral("operator"), QStringLiteral("OR")},
                             {QStringLiteral("conditions"),
-                             QJsonArray{QJsonObject{{QStringLiteral("from"), query}},
-                                        QJsonObject{{QStringLiteral("subject"), query}}}}}});
+                             QJsonArray{
+                                 QJsonObject{{byRecipient ? QStringLiteral("to")
+                                                          : QStringLiteral("from"),
+                                              query}},
+                                 QJsonObject{{QStringLiteral("subject"), query}}}}}});
         filter.remove(QStringLiteral("inMailbox"));
     } else {
         filter.insert(QStringLiteral("text"), query);

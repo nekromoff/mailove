@@ -5,6 +5,7 @@
 
 #include <QAtomicInt>
 #include <QByteArray>
+#include <QHash>
 #include <QList>
 #include <QSet>
 #include <QSqlDatabase>
@@ -44,6 +45,25 @@ public:
 
     QStringList cachedFolders(const QString &account);
     void storeFolders(const QString &account, const QStringList &folders);
+
+    /// Teaches the store which mailboxes are junk folders, so that every path
+    /// that reads cached headers marks what it finds there.
+    ///
+    /// Set once at startup by MailClient, which is the only thing that knows —
+    /// the answer comes from the server's \Junk attribute, the JMAP role and a
+    /// list of folder names, none of which is the cache's business. It lives
+    /// here anyway because the cache is where the rows come from: SyncEngine
+    /// re-reads them on every merge, page and reconcile, and a rule applied in
+    /// one caller was silently undone by the next refresh.
+    ///
+    /// Given the whole folder key ("account\x1fmailbox"), not just the mailbox:
+    /// the cache holds every account's rows, and an imported archive's "Junk"
+    /// folder is a record of what some other mail system once decided rather
+    /// than a verdict this client should restate.
+    ///
+    /// Static because sortedHeadersOn() is, and read from the sort worker as
+    /// well as the GUI thread. Set before either exists and never again.
+    static void setJunkFolderTest(std::function<bool(const QString &)> isJunk);
 
     QList<MessageListModel::Header> cachedHeaders(const QString &folder, int limit = 1000);
     /// Next page of cached headers strictly older than the (date, uid) anchor
@@ -114,6 +134,39 @@ public:
     /// 3 cleared by the user.
     void setSpamVerdict(const QString &folder, qint64 uid, int score, int state,
                         const QString &detail);
+    /// One cached message's raw bytes, for the recipient backfill.
+    struct RawRow {
+        qint64 uid = 0;
+        QByteArray raw;
+    };
+    /// Rows of \a folder that have no recipients recorded but do have their
+    /// bytes cached, newest first, at most \a limit of them.
+    ///
+    /// The To line was never a column until recently, so every message cached
+    /// before it existed has none — which in the Sent folder is every row on
+    /// screen. The bytes are still here though: a cached body keeps the whole
+    /// head even when its attachments have been lifted out, so the header can
+    /// be read back locally and nothing has to be re-fetched.
+    /// Static, taking their own connection: this runs as a one-time migration
+    /// over tens of thousands of rows, parsing a header out of each, and must
+    /// never touch the GUI thread. \a scopedFolder is what scopedKey() returns.
+    static QList<RawRow> rawsMissingRecipientsOn(QSqlDatabase &db, const QString &scopedFolder,
+                                                 int limit);
+    /// Writes a batch of recipient lines in one transaction.
+    static void setRecipientsBatchOn(QSqlDatabase &db, const QString &scopedFolder,
+                                     const QHash<qint64, QString> &byUid);
+    /// How many rows of \a scopedFolder still need one — the migration's total,
+    /// for the progress bar.
+    static int missingRecipientCountOn(QSqlDatabase &db, const QString &scopedFolder);
+    /// Every folder key the message cache holds, for *all* accounts. The
+    /// migration cannot ask the folder model: that holds the open account's
+    /// folders only, so driving the migration from it silently skipped every
+    /// other account's Sent folder.
+    static QStringList allCachedFolderKeysOn(QSqlDatabase &db);
+
+    /// The stored verdict state, or 0 when the message is not cached. Read
+    /// before a body-stage re-score, which must leave state 3 alone.
+    int spamStateOf(const QString &folder, qint64 uid);
     /// Marks a cached header as read, so the state survives a restart even
     /// before the next header sync confirms it from the server.
     void setSeen(const QString &folder, qint64 uid);
@@ -319,7 +372,8 @@ public:
     /// (FTS5 prefix query plus a substring scan over subject/sender).
     /// Blocking, and on a large folder the substring pass is not fast — callers
     /// on the GUI thread should use searchOn() on a worker instead.
-    QList<MessageListModel::Header> search(const QString &folder, const QString &keyword);
+    QList<MessageListModel::Header> search(const QString &folder, const QString &keyword,
+                                          bool byRecipient = false);
 
     /// Receives search hits in batches as they are found; returning false
     /// abandons the search (a newer query, a folder switch, shutdown).
@@ -329,7 +383,8 @@ public:
     /// \a scopedFolder is what scopedKey() returns for the folder.
     /// \a headersOnly limits the full-text pass to sender and subject.
     static void searchOn(QSqlDatabase &db, const QString &scopedFolder, const QString &keyword,
-                         bool ftsAvailable, const SearchSink &deliver, bool headersOnly = false);
+                         bool ftsAvailable, const SearchSink &deliver, bool headersOnly = false,
+                         bool byRecipient = false);
 
     /// Whether the FTS index exists — searchOn() takes this as a parameter
     /// because it cannot ask the instance from a worker thread.
@@ -416,6 +471,11 @@ public:
     /// Batched isKnownCorrespondent() for a whole FETCH worth of senders.
     /// Returns the subset of \a addresses that are known, normalized.
     QSet<QString> knownCorrespondents(const QSet<QString> &addresses);
+
+    /// The subset of \a msgids that the cache already holds a message for,
+    /// angle brackets stripped. Answers "is this a reply to something in my
+    /// mailbox?" for a whole FETCH batch at once, over idx_messages_msgid.
+    QSet<QString> knownMessageIds(const QSet<QString> &msgids);
 
     /// How much of a history one sending organization has here.
     struct DomainHistory {

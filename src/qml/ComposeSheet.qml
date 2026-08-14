@@ -492,6 +492,7 @@ Item {
         // the full server error in a dismissible dialog.
         function onSendFailed(error) {
             sheet.sending = false
+            sendErrorDialog.heading = "Message not sent"
             sendErrorDialog.errorText = error
             sendErrorDialog.open()
         }
@@ -641,12 +642,16 @@ Item {
     QQC2.Dialog {
         id: sendErrorDialog
         property string errorText: ""
+        /// What went wrong, as the dialog's title. Sending is what it is
+        /// usually reporting; a paste that could not be inserted is the other
+        /// case, and it is not a message that failed to send.
+        property string heading: "Message not sent"
         parent: QQC2.Overlay.overlay
         anchors.centerIn: parent
         modal: true
         width: Math.min(sheet.width - Kirigami.Units.gridUnit * 4,
                         Kirigami.Units.gridUnit * 30)
-        title: "Message not sent"
+        title: heading
         standardButtons: QQC2.Dialog.Close
 
         contentItem: QQC2.Label {
@@ -662,6 +667,12 @@ Item {
         cursorPosition: bodyEdit.cursorPosition
         selectionStart: bodyEdit.selectionStart
         selectionEnd: bodyEdit.selectionEnd
+        // A paste that does nothing looks like a broken keyboard; say why.
+        onImagePasteFailed: message => {
+            sendErrorDialog.heading = "Image not pasted"
+            sendErrorDialog.errorText = message
+            sendErrorDialog.open()
+        }
     }
 
     FileDialog {
@@ -1034,6 +1045,14 @@ Item {
                             // never falls through to the formatted one.
                             docHandler.pastePlainText()
                             event.accepted = true
+                        } else if (event.key === Qt.Key_V) {
+                            // A picture on the clipboard goes into the message
+                            // where the cursor is — TextArea's own paste can
+                            // only take text, which is what left "attach it"
+                            // as the only way to send one. Anything else falls
+                            // through to that paste untouched.
+                            if (docHandler.pasteImage())
+                                event.accepted = true
                         }
                         // The list pair is a Shortcut below rather than a key
                         // code here: Shift+8 is not Key_8 on every layout, and

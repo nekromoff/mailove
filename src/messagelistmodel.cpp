@@ -42,6 +42,8 @@ QVariant MessageListModel::data(const QModelIndex &index, int role) const
         return h.subject.isEmpty() ? QStringLiteral("(no subject)") : h.subject;
     case FromRole:
         return h.from;
+    case ToRole:
+        return h.to;
     case DateRole: {
         const QDateTime local = h.date.toLocalTime();
         if (local.date() == QDate::currentDate())
@@ -80,6 +82,7 @@ QHash<int, QByteArray> MessageListModel::roleNames() const
     return {
         {SubjectRole, "subject"},
         {FromRole, "from"},
+        {ToRole, "to"},
         {DateRole, "date"},
         {UidRole, "uid"},
         {SeenRole, "seen"},
@@ -97,7 +100,12 @@ QHash<int, QByteArray> MessageListModel::roleNames() const
 void MessageListModel::primeKeys(Header &h)
 {
     h.dateSecs = h.date.isValid() ? h.date.toSecsSinceEpoch() : 0;
-    h.fromKey = h.from.toCaseFolded();
+    // The name the row actually shows: To where there is one (Sent, Drafts),
+    // From everywhere else. Sorting the column by a field it is not displaying
+    // would look like the sort was simply broken. `to` is only ever filled for
+    // the folders that display it, so this needs no knowledge of which folder
+    // is open — see MailClient::listsRecipients().
+    h.fromKey = (h.to.isEmpty() ? h.from : h.to).toCaseFolded();
     h.subjectKey = h.subject.toCaseFolded();
 }
 
@@ -478,6 +486,32 @@ void MessageListModel::clearSpam(qint64 uid)
         const QModelIndex idx = index(row, 0);
         Q_EMIT dataChanged(idx, idx, {SpamRole, SpamDetailRole});
     }
+}
+
+void MessageListModel::setSpamVerdict(qint64 uid, int score, int state, const QString &detail)
+{
+    const auto it = m_byUid.constFind(uid);
+    if (it == m_byUid.constEnd())
+        return;
+    Header &h = m_all[it.value()];
+    // State 3 is the user's own answer — "not spam", or the known-correspondent
+    // exemption. A body-stage re-score knows strictly less than that.
+    if (h.spamState == 3)
+        return;
+    h.spamScore = score;
+    h.spamState = state;
+    h.spamDetail = detail;
+    const int row = visibleRowOf(it.value());
+    if (row >= 0) {
+        const QModelIndex idx = index(row, 0);
+        Q_EMIT dataChanged(idx, idx, {SpamRole, SpamDetailRole});
+    }
+}
+
+int MessageListModel::spamStateOf(qint64 uid) const
+{
+    const auto it = m_byUid.constFind(uid);
+    return it == m_byUid.constEnd() ? 0 : m_all.at(it.value()).spamState;
 }
 
 int MessageListModel::colorLabelAt(int row) const

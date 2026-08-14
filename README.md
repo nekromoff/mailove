@@ -12,18 +12,18 @@ The fast KDE-only email client.
 Security-minded KDE-only IMAP and JMAP mail client, blazing fast.
 
 ### General
-- **IMAP or JMAP** — multiple accounts supported. IMAP against any server (SSL/TLS, STARTTLS, plain), password or OAuth 2 for Gmail and Microsoft 365; JMAP (RFC 8620/8621) discovers its own endpoints from the address and authenticates with an API token or a password.
+- **IMAP, JMAP, Gmail/365 OAuth** — multiple accounts supported. IMAP against any server (SSL/TLS, STARTTLS, plain), password or OAuth 2 for Gmail and Microsoft 365; JMAP (RFC 8620/8621) discovers its own endpoints from the address and authenticates with an API token or a password.
 - **Push, or polling where there is none** — IMAP IDLE and JMAP EventSource both land as "something changed there"; what changed is then fetched the ordinary way. A timed refresh covers servers offering neither.
 - **Every account stays current, not just the open one** — the same refresh syncs the accounts you are not looking at: inbox first, then their other folders.
 - **Local cache with full-text search** — headers, read bodies and folders in SQLite: folders open instantly, offline included. FTS5 (accent-folding) + a case-insensitive regex.
+- **Spam handling** — around 50 heuristic rules, not just the `X-Spam-*` headers: impersonation, homograph and zero-width tricks, phishing links, password forms in the body, dangerous attachments etc. A red **!** marks Spam - mouseover lists every rule that fired - everything explained. Older spam is cleared out automatically.
 
 ### UI
 - **Fast by design** — a 20 ms limit on the GUI thread, one frame: anything slower runs on a worker. Nothing ever snaps or stalls mid-scroll.
 - **UX to taste** — Look and feel sets the layout (message preview below or beside the list), row density, background colour and tab or window to compose email; Message sorting by any column; Shortcuts rebinds every action; Color labels for messages; Change the date format, refresh interval, spam retention, cache limits and debug logging
-- **Compose & send** — SMTP with rich text, attachments, signature and resumable drafts.
+- **Compose & send** — SMTP with rich text, pasted images, attachments, signature and resumable drafts.
 - **Attachments** — click to open, right-click to save. Stored zstd-compressed and deduplicated outside the database.
 - **OpenPGP** — read and send signed and encrypted mail through GnuPG. Key manager, WKD discovery. Decrypted plaintext is never indexed, never cached, and is wiped from memory when the message closes.
-- **Spam handling** — local heuristics score every message; J files one as spam, Shift+J takes the mark off and allowlists the sender for good. Spam older than a chosen number of days is cleared out automatically.
 - **Keyboard-first** — arrows, Page Up/Down, Home/End, Enter to open, Ctrl+W to close a tab, and the keyboard follows the folder you open.
 - **Tabs** — Compose, Settings and opened messages are tabs. Ctrl+W closes; Compose can be set to open in a window if preferred.
 - **Folders moving** — drag a folder onto another to reparent it, or onto the account name to move it to the top level. Rename from the context menu; where the protocol forbids it, the menu says so instead.
@@ -32,10 +32,10 @@ Security-minded KDE-only IMAP and JMAP mail client, blazing fast.
 ### Security & safety
 - **Secure credential storage** — passwords and OAuth tokens in KWallet via Qt6Keychain, never a config file.
 - **Sandboxed message viewing** — HTML renders with JavaScript, plugins and local-file access off, off-the-record, and every remote request blocked until the per-message opt-in. Links open in the system browser.
-- **Sender authentication verdicts** — DKIM verified, ARC chains validated, server SPF/DKIM/DMARC alongside. Suspicious mail gets a red **!**. A signature that covers only a stated length of the body (`l=`) reads as *partial*.
+- **Sender authentication verdicts** — DKIM verified, ARC chains validated, server SPF/DKIM/DMARC alongside, shown per message in the viewer and fed into the spam score. A signature that covers only a stated length of the body (`l=`) reads as *partial*. ARC is what keeps mailing lists — which break SPF and DKIM by design — from being marked.
 
-### Imports from Thunderbird
-- **Imported mail** — a Thunderbird directory imports as an offline account. Add servers later to promote it to a live one, archive intact.
+### Imports (MBOX)
+- **Imported mail** — point it at a folder of mbox files and it imports as an offline account (Thunderbird, Evolution, KMail etc.). Subfolders become folder hierarchy, and Thunderbird's .sbd naming is understood. Add servers later to promote it to a live account.
 
 ## Screenshots
 <img width="1132" height="818" alt="compose" src="https://github.com/user-attachments/assets/128b1bf7-6eab-4ecd-9b98-afd7d1ec78ab" />

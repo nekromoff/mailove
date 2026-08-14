@@ -49,6 +49,11 @@ enum class Verdict {
 /// reach it together — it takes either one decisive signal (a known contact
 /// whose authentication failed) or an accumulation of three or four.
 inline constexpr int SpamThreshold = 50;
+/// The weight of a fact rather than an inference: a message already filed as
+/// junk. Far above the threshold on purpose — no accumulation of ham credit,
+/// not an OpenPGP signature and a long correspondence together, may pull a
+/// message the user has thrown away back out of the marked state.
+inline constexpr int JunkFolderWeight = 999;
 /// Below this, nothing is shown at all.
 inline constexpr int UnsureThreshold = 25;
 
@@ -64,6 +69,20 @@ struct Context {
     bool authFailed = false;
     /// Same provenance, reporting a pass.
     bool authPassed = false;
+
+    /// The same trusted Authentication-Results reported arc=pass.
+    ///
+    /// ARC exists for exactly one situation: a mailing list or forwarder took
+    /// delivery of a message, rewrote or re-sent it, and broke SPF and DKIM in
+    /// the process. The chain carries the verdict from before that happened, so
+    /// arc=pass means "this failed here, but it passed where it started".
+    /// Scoring the failure anyway would mark every mailing list the user is on
+    /// — which is what \a authFailed does on its own, and why this exists.
+    ///
+    /// Not validated here: verifying a seal needs DNS, and this file does no
+    /// I/O. It is trusted on exactly the same basis as \a authPassed, being
+    /// read from the same header our own receiving server stamped.
+    bool arcPassed = false;
     /// The raw trusted Authentication-Results value, for the detail line.
     QString authInfo;
 
@@ -80,11 +99,43 @@ struct Context {
     int seenFromOrg = 0;
     int daysKnownOrg = 0;
 
+    /// Every address the user receives mail at, lowercased and +tag-stripped.
+    /// Used only to notice that a message is addressed to nobody the user is —
+    /// never to require it, because ordinary bcc'd mail looks exactly the same.
+    /// Empty disables the rule outright, which is the right behaviour when the
+    /// caller has no account list to hand.
+    QStringList ownAddresses;
+
+    /// The message's In-Reply-To or References names a Message-ID that is
+    /// already in the cache: this is a reply inside a conversation the user
+    /// already has. Filled from MailStore::knownMessageIds().
+    ///
+    /// A strong ham signal, and one that cannot be forged usefully — a spammer
+    /// would have to know a Message-ID from the user's own mailbox to claim it.
+    bool inReplyToKnown = false;
+
     /// PgpMime::StoredKind — 0 none, 1 encrypted, 2 signed, 3 both. Taken as a
     /// strong ham signal without checking the key: at list-build time no
     /// signature has been verified yet, and spam that bothers to be OpenPGP
     /// signed or encrypted to the recipient's key is not a thing that happens.
     int crypto = 0;
+
+    /// The message is sitting in a junk/spam folder.
+    ///
+    /// Decisive, and the only signal here that outranks Rule 0. Everything else
+    /// in this file is the filter guessing; this is a fact about where the
+    /// message already is — either the user put it there by hand, or a
+    /// server-side rule did, and in both cases the judgement has been made by
+    /// something better informed than a header scorer. Mail that arrived before
+    /// any of these rules existed is the case that matters most: it carries no
+    /// stored verdict at all, and without this it would sit unmarked in the
+    /// junk folder forever.
+    ///
+    /// Scoring continues past it rather than stopping, so the tooltip still
+    /// lists whatever else the message trips. "It is in your Junk folder" is a
+    /// true answer to "why is this marked?" but a thin one, and the rules that
+    /// would have caught it anyway are worth showing.
+    bool inJunkFolder = false;
 
     /// True to skip the known-correspondent short circuit and score the message
     /// anyway. Only for spamtool, which needs to see what a message would have

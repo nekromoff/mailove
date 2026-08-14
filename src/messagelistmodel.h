@@ -19,6 +19,8 @@ public:
     enum Roles {
         SubjectRole = Qt::UserRole + 1,
         FromRole,
+        /// The To line, for the folders where From is always the user.
+        ToRole,
         DateRole,
         UidRole,
         SeenRole,
@@ -63,6 +65,10 @@ public:
         qint64 uid = -1;
         QString subject;
         QString from;
+        /// To recipients, already joined for display. Only filled for mail in
+        /// the user's own outgoing folders — everywhere else the From line is
+        /// what the list shows and this would be dead weight in the cache.
+        QString to;
         QDateTime date;
         bool seen = false;
         bool suspicious = false; ///< SPF/DKIM/DMARC failure reported by our server
@@ -146,6 +152,12 @@ public:
     /// Drops a row's spam mark and settles the verdict (state 3) so a later
     /// re-score cannot bring it back.
     void clearSpam(qint64 uid);
+    /// Replaces a row's spam verdict with one scored from the full message.
+    /// Refuses to touch a row the user has settled (state 3): a re-score must
+    /// never undo "not spam".
+    void setSpamVerdict(qint64 uid, int score, int state, const QString &detail);
+    /// The stored verdict state of a row, or 0 when it is not listed.
+    int spamStateOf(qint64 uid) const;
     int colorLabelAt(int row) const;
     void setColorLabel(qint64 uid, int color);
     /// Drops the given uids from the model (visible and hidden lists).

@@ -757,6 +757,63 @@ Kirigami.ApplicationWindow {
         }
     }
 
+    // Generic one-time-migration modal. Driven entirely by three properties, so
+    // a future migration needs a worker on the C++ side and nothing here:
+    // MaintenanceScheduler::beginMigration/reportMigration/endMigration are
+    // what open, advance and close it.
+    //
+    // Modal and without a close button on purpose. A migration is the cache
+    // being made consistent with the code reading it; letting the user dismiss
+    // it would leave them looking at a list that is wrong in a way they have no
+    // way to understand, and clicking around meanwhile would fight the worker
+    // for the write lock.
+    QQC2.Dialog {
+        id: migrationDialog
+        parent: QQC2.Overlay.overlay
+        anchors.centerIn: parent
+        modal: true
+        closePolicy: QQC2.Popup.NoAutoClose
+        title: qsTr("Updating the message cache")
+        visible: Mail.migrationRunning
+
+        contentItem: ColumnLayout {
+            spacing: Kirigami.Units.largeSpacing
+
+            QQC2.Label {
+                Layout.fillWidth: true
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: Mail.migrationLabel
+                wrapMode: Text.WordWrap
+            }
+            QQC2.ProgressBar {
+                Layout.fillWidth: true
+                // -1 means the total is not known yet: show motion rather than
+                // a bar sitting at zero, which reads as "stuck".
+                indeterminate: Mail.migrationPercent < 0
+                from: 0
+                to: 100
+                value: Math.max(0, Mail.migrationPercent)
+            }
+            QQC2.Label {
+                Layout.fillWidth: true
+                horizontalAlignment: Text.AlignRight
+                visible: Mail.migrationPercent >= 0
+                text: Mail.migrationPercent + "%"
+                opacity: 0.7
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+            QQC2.Label {
+                Layout.fillWidth: true
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                text: qsTr("This runs once. Your mail is not being re-downloaded — "
+                           + "everything needed is already on this computer.")
+                wrapMode: Text.WordWrap
+                opacity: 0.7
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+        }
+    }
+
     QQC2.Dialog {
         id: renameFolderDialog
         property string mailBox: ""
@@ -2076,7 +2133,17 @@ Kirigami.ApplicationWindow {
                                     // From+Subject first and default: searching bodies too
                                     // ("Everything" — body, cc, all headers) is the slower,
                                     // noisier search, so it is the one you opt into.
-                                    model: ["From + Subject", "Everything"]
+                                    //
+                                    // In Sent and Drafts the header pass searches To
+                                    // instead of From — every message there is from the
+                                    // user, so a From search is the whole folder or
+                                    // nothing. The label has to say so: the option is
+                                    // what the user reads to know what is being searched,
+                                    // and one that named the wrong header would be a lie
+                                    // about behaviour that had already changed underneath.
+                                    model: Mail.viewingOutgoing
+                                           ? ["To + Subject", "Everything"]
+                                           : ["From + Subject", "Everything"]
                                     // Half the width in the narrow list, where the
                                     // full label would crowd out the search field.
                                     implicitWidth: Kirigami.Units.gridUnit
@@ -2106,8 +2173,11 @@ Kirigami.ApplicationWindow {
                                     QQC2.Menu {
                                         id: sortMenu
                                         Repeater {
+                                            // Column 1 is whichever name the list is
+                                                // showing, so the menu entry follows it.
                                             model: [{ label: "Date", col: 0 },
-                                                    { label: "Sender", col: 1 },
+                                                    { label: Mail.viewingOutgoing
+                                                             ? "Recipient" : "Sender", col: 1 },
                                                     { label: "Subject", col: 2 },
                                                     { label: "Attachment", col: 3 }]
                                             delegate: QQC2.MenuItem {
@@ -2289,7 +2359,12 @@ Kirigami.ApplicationWindow {
                                                                         headerLabelRow.width - sortArrow.width
                                                                         - headerLabelRow.spacing)
                                                         anchors.verticalCenter: parent.verticalCenter
-                                                        text: headerCell.title
+                                                        // "To" in the folders the row above
+                                                        // shows a recipient in, so the heading
+                                                        // never names a column it is not.
+                                                        text: (headerCell.colId === "from"
+                                                               && Mail.viewingOutgoing)
+                                                              ? qsTr("To") : headerCell.title
                                                         elide: Text.ElideRight
                                                         font.bold: columnHeader.sortColumn === headerCell.sortCol
                                                     }
@@ -2866,20 +2941,31 @@ Kirigami.ApplicationWindow {
                                         id: msgDelegate
                                         required property string subject
                                         required property string from
+                                        /// Only filled in Sent, Drafts and the like.
+                                        required property string to
                                         required property string date
+
+                                        // Who the row is *about*. In the user's own
+                                        // outgoing folders every message is from them,
+                                        // so the From column repeats one name down the
+                                        // whole list and tells the reader nothing; the
+                                        // recipient is the useful name there. Falls back
+                                        // to From for a message cached before the
+                                        // recipients column existed.
+                                        readonly property string correspondent:
+                                            (Mail.viewingOutgoing && to !== "") ? to : from
                                         required property bool seen
-                                        required property bool suspicious
                                         required property bool hasAttachment
                                         required property bool calendarAttachment
                                         /// PgpMime::StoredKind: 0 none, 1 encrypted, 2 signed,
                                         /// 3 both. 1 and 3 both draw the lock — what matters at
                                         /// list level is that it is encrypted.
                                         required property int crypto
-                                        required property string authInfo
-                                        /// Local spam heuristics said so (spamheuristics.h).
-                                        /// Shares the "!" marker with `suspicious`: both mean
-                                        /// "not what it appears to be", and one glyph to learn
-                                        /// beats two that need telling apart.
+                                        /// Local spam heuristics said so (spamheuristics.h),
+                                        /// and `spamDetail` is the arithmetic behind it: one
+                                        /// row per rule that fired, ending in the total the
+                                        /// verdict was made from. The authentication roles
+                                        /// are deliberately not read here — see showsWarning.
                                         required property bool spam
                                         required property string spamDetail
                                         required property int colorLabel
@@ -2904,17 +2990,23 @@ Kirigami.ApplicationWindow {
                                             : highlighted ? Kirigami.Theme.highlightedTextColor
                                                           : Kirigami.Theme.textColor
 
-                                        // "Not what it appears to be" — a failed sender
-                                        // check or the local spam heuristics. One glyph
-                                        // for both, because to a reader they say the same
-                                        // thing; the tooltip is where they differ.
-                                        readonly property bool authFailed:
-                                            suspicious && Mail.authVerification
-                                        readonly property bool showsWarning: authFailed || spam
+                                        // The marker means one thing: the local heuristics
+                                        // marked this message. A failed SPF/DKIM/DMARC check
+                                        // no longer draws it on its own — it is already one
+                                        // of the rules, worth +35 or +60 depending on who
+                                        // the sender claims to be, so whenever it actually
+                                        // mattered it appears as a row in the tooltip below.
+                                        // Drawing it twice, once as a glyph of its own,
+                                        // marked ordinary mail from senders whose provider
+                                        // simply does not sign.
+                                        //
+                                        // The per-message authentication detail did not go
+                                        // anywhere: it is on the message's own auth line in
+                                        // the viewer, which is where a reader who wants to
+                                        // check a specific claim looks.
+                                        readonly property bool showsWarning: spam
                                         readonly property string warningText:
-                                            authFailed
-                                            ? "Sender authentication failed:\n" + authInfo
-                                            : "Looks like spam:\n" + spamDetail
+                                            "Marked as spam because:\n" + spamDetail
 
                                         width: messageList.width
                                         // Row height comes from the density setting alone;
@@ -3092,12 +3184,12 @@ Kirigami.ApplicationWindow {
                                                             opacity: 0.7
                                                         }
                                                     }
-                                                    QQC2.Label { // sender-authentication / spam marker
+                                                    QQC2.Label { // spam marker
                                                         id: authMark
-                                                        // The tooltip is where the two differ:
-                                                        // authentication quotes the server, spam
-                                                        // lists the rules that fired, so "Why?"
-                                                        // always has an answer.
+                                                        // Hovering lists every rule that fired
+                                                        // with its weight, so "Why is this
+                                                        // spam?" always has a full answer and
+                                                        // not just a claim.
                                                         visible: rowCell.colId === "subject"
                                                                  && msgDelegate.showsWarning
                                                         anchors.left: parent.left
@@ -3119,7 +3211,7 @@ Kirigami.ApplicationWindow {
                                                             : Kirigami.Units.smallSpacing
                                                         anchors.rightMargin: Kirigami.Units.smallSpacing
                                                         text: rowCell.colId === "subject" ? msgDelegate.subject
-                                                            : rowCell.colId === "from" ? msgDelegate.from
+                                                            : rowCell.colId === "from" ? msgDelegate.correspondent
                                                             : rowCell.colId === "date" ? msgDelegate.date : ""
                                                         elide: Text.ElideRight
                                                         font.bold: rowCell.colId === "subject" && !msgDelegate.seen
@@ -3182,7 +3274,7 @@ Kirigami.ApplicationWindow {
 
                                                     QQC2.Label {
                                                         Layout.fillWidth: true
-                                                        text: msgDelegate.from
+                                                        text: msgDelegate.correspondent
                                                         elide: Text.ElideRight
                                                         font.bold: !msgDelegate.seen
                                                         color: msgDelegate.rowTextColor

@@ -110,6 +110,36 @@ public:
     void stopIndexRebuild();
     bool indexRebuilding() const { return m_indexRebuilding; }
     int indexRebuildPercent() const { return m_indexPercent; }
+
+    // --- one-time migrations ----------------------------------------------
+    //
+    // A cache migration is not maintenance that can wait for an idle moment:
+    // until it finishes the list shows the wrong thing, so the user is told
+    // what is happening and how far along it is. The three below drive one
+    // generic modal, so the next migration needs a worker and nothing else —
+    // no new properties, no new dialog.
+    bool migrationRunning() const { return m_migrationRunning; }
+    /// What to show the user, e.g. "Reading recipients from cached mail".
+    QString migrationLabel() const { return m_migrationLabel; }
+    /// 0-100, or -1 while the total is not known yet (indeterminate bar).
+    int migrationPercent() const { return m_migrationPercent; }
+
+    /// Fills in the To column of mail cached before that column existed, by
+    /// reading the header back out of the cached message. Offline: everything
+    /// it needs is already on disk. Returns without doing anything when there
+    /// is nothing to fill in, which is the normal case after the first run.
+    /// \a isOutgoing decides, from a folder key alone, whether that folder
+    /// shows recipients. A predicate rather than a list of folders because the
+    /// folders are enumerated from the cache on the worker: they belong to
+    /// every account, and the caller can only see the open one's.
+    void startRecipientBackfill(std::function<bool(const QString &)> isOutgoing);
+
+    /// Announces a migration's progress from a worker thread. Public so that a
+    /// future migration living elsewhere can drive the same modal; always call
+    /// them through QMetaObject::invokeMethod, they touch GUI-thread state.
+    void beginMigration(const QString &label);
+    void reportMigration(int percent);
+    void endMigration();
     /// Arms the drip-feed repair of the body search index.
     void startReindexTimer();
     void stopReindexTimer();
@@ -141,6 +171,8 @@ Q_SIGNALS:
     void errorOccurred(const QString &message);
     void reclaimingChanged();
     void indexRebuildChanged();
+    /// Any of migrationRunning/Label/Percent changed.
+    void migrationChanged();
     /// The search-index rebuild reached its end (successfully or not).
     void indexRebuildFinished();
     /// A vacuum is about to take the exclusive lock — stop every other writer.
@@ -214,6 +246,12 @@ private:
     QAtomicInt m_indexRebuildActive;
     bool m_indexRebuilding = false;
     int m_indexPercent = 0;
+
+    QThread *m_migrationThread = nullptr;
+    QAtomicInt m_migrationCancel;
+    bool m_migrationRunning = false;
+    QString m_migrationLabel;
+    int m_migrationPercent = -1;
 
     QThread *m_unreadThread = nullptr;  ///< unread-count recount for the sidebar
     bool m_unreadRecountQueued = false; ///< a request arrived while one was running

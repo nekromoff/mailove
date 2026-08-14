@@ -223,6 +223,10 @@ bool MailStore::open()
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN dkim_trusted INTEGER DEFAULT 0"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN arc TEXT DEFAULT ''"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN arc_sealer TEXT DEFAULT ''"));
+    // The To line, for the Sent and Drafts folders where every message is from
+    // the user and the From column says the same thing on every row. Only
+    // written for those folders — see MailClient::listsRecipients().
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN recipients TEXT DEFAULT ''"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN arc_detail TEXT DEFAULT ''"));
     // OpenPGP shape of the message (doc/openpgp.md §8): 0 none, 1 encrypted,
     // 2 signed, 3 both. Set from the raw head at header-store time and refined
@@ -506,6 +510,50 @@ void MailStore::storeFolders(const QString &account, const QStringList &folders)
     m_db.commit();
 }
 
+namespace
+{
+std::function<bool(const QString &)> g_isJunkFolder;
+}
+
+void MailStore::setJunkFolderTest(std::function<bool(const QString &)> isJunk)
+{
+    g_isJunkFolder = std::move(isJunk);
+}
+
+/// Applies the junk-folder verdict to rows just read from the cache.
+///
+/// Everything in a junk folder is spam by definition, and most of what is in
+/// one predates any scoring — filed by the server or by hand, with no stored
+/// verdict at all. Done on the way out of the database rather than written
+/// into it, so that moving a message out of junk stops it being marked
+/// immediately instead of waiting for a write to catch up.
+///
+/// A verdict the user has settled (state 3, "not spam") is left alone, as is a
+/// row that some rule already marked on its own evidence.
+void applyJunkVerdict(QList<MessageListModel::Header> &rows, const QString &scopedFolder)
+{
+    if (rows.isEmpty() || !g_isJunkFolder)
+        return;
+    // The whole key, account part included: the cache holds every account's
+    // rows, and whether a "Junk" folder means anything depends on whose it is
+    // — an imported archive's does not. The predicate does the splitting.
+    if (!g_isJunkFolder(scopedFolder))
+        return;
+    for (MessageListModel::Header &h : rows) {
+        if (h.spamState == 3 || h.spamScore >= SpamHeuristics::SpamThreshold)
+            continue;
+        SpamHeuristics::Score s;
+        s.verdict = SpamHeuristics::Verdict::Spam;
+        s.total = SpamHeuristics::JunkFolderWeight;
+        s.hits.append({QStringLiteral("junk-folder"), SpamHeuristics::JunkFolderWeight,
+                       QStringLiteral("This message is in your Junk folder — you or your "
+                                      "mail server put it there")});
+        h.spamScore = s.total;
+        h.spamState = 1;
+        h.spamDetail = s.explanation();
+    }
+}
+
 static QList<MessageListModel::Header> readHeaderRows(QSqlQuery &q)
 {
     QList<MessageListModel::Header> out;
@@ -527,6 +575,7 @@ static QList<MessageListModel::Header> readHeaderRows(QSqlQuery &q)
         h.spamState = q.value(11).toInt();
         h.spamDetail = q.value(12).toString();
         h.remoteId = q.value(13).toString();
+        h.to = q.value(14).toString();
         out.append(h);
     }
     return out;
@@ -540,12 +589,14 @@ QList<MessageListModel::Header> MailStore::cachedHeaders(const QString &folder, 
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
                              " color, crypto, spam_score, spam_state, spam_detail,"
-                             " IFNULL(remote_id, CAST(uid AS TEXT))"
+                             " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '')"
                              " FROM messages WHERE folder = ?"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
     q.addBindValue(limit);
-    return readHeaderRows(q);
+    QList<MessageListModel::Header> rows = readHeaderRows(q);
+    applyJunkVerdict(rows, scoped(folder));
+    return rows;
 }
 
 QList<MessageListModel::Header> MailStore::cachedHeadersBefore(const QString &folder,
@@ -557,7 +608,7 @@ QList<MessageListModel::Header> MailStore::cachedHeadersBefore(const QString &fo
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
                              " color, crypto, spam_score, spam_state, spam_detail,"
-                             " IFNULL(remote_id, CAST(uid AS TEXT))"
+                             " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '')"
                              " FROM messages WHERE folder = ?"
                              " AND (date < ? OR (date = ? AND uid < ?))"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
@@ -566,7 +617,9 @@ QList<MessageListModel::Header> MailStore::cachedHeadersBefore(const QString &fo
     q.addBindValue(dateSecs);
     q.addBindValue(uid);
     q.addBindValue(limit);
-    return readHeaderRows(q);
+    QList<MessageListModel::Header> rows = readHeaderRows(q);
+    applyJunkVerdict(rows, scoped(folder));
+    return rows;
 }
 
 /// The sort key expressions behind MessageListModel::lessThan(), by column.
@@ -579,7 +632,11 @@ static QString sortKeySql(int column)
 {
     switch (MessageListModel::SortColumn(column)) {
     case MessageListModel::SortColumn::From:
-        return QStringLiteral("IFNULL(lower(sender), '')");
+        // Whichever name the column is showing — see primeKeys(). The two must
+        // agree or a page boundary would sort by one field and the page's
+        // contents by the other.
+        return QStringLiteral("CASE WHEN IFNULL(recipients, '') = ''"
+                              " THEN IFNULL(lower(sender), '') ELSE lower(recipients) END");
     case MessageListModel::SortColumn::Subject:
         return QStringLiteral("IFNULL(lower(subject), '')");
     case MessageListModel::SortColumn::Attachment:
@@ -594,7 +651,7 @@ static QVariant sortKeyValue(int column, const MessageListModel::Header &h)
 {
     switch (MessageListModel::SortColumn(column)) {
     case MessageListModel::SortColumn::From:
-        return h.from.toLower();
+        return (h.to.isEmpty() ? h.from : h.to).toLower();
     case MessageListModel::SortColumn::Subject:
         return h.subject.toLower();
     case MessageListModel::SortColumn::Attachment:
@@ -650,7 +707,7 @@ QList<MessageListModel::Header> MailStore::sortedHeadersOn(QSqlDatabase &db,
     QSqlQuery q(db);
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
                              " color, crypto, spam_score, spam_state, spam_detail,"
-                             " IFNULL(remote_id, CAST(uid AS TEXT))"
+                             " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '')"
                              " FROM messages WHERE folder = ?")
               + where + order + QStringLiteral(" LIMIT ?"));
     q.addBindValue(scopedFolder);
@@ -666,7 +723,9 @@ QList<MessageListModel::Header> MailStore::sortedHeadersOn(QSqlDatabase &db,
         q.addBindValue(after->uid);
     }
     q.addBindValue(limit);
-    return readHeaderRows(q);
+    QList<MessageListModel::Header> rows = readHeaderRows(q);
+    applyJunkVerdict(rows, scopedFolder);
+    return rows;
 }
 
 QList<MessageListModel::Header> MailStore::headersByColor(const QString &folder, int color,
@@ -677,13 +736,15 @@ QList<MessageListModel::Header> MailStore::headersByColor(const QString &folder,
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
                              " color, crypto, spam_score, spam_state, spam_detail,"
-                             " IFNULL(remote_id, CAST(uid AS TEXT))"
+                             " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '')"
                              " FROM messages WHERE folder = ? AND color = ?"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
     q.addBindValue(color);
     q.addBindValue(limit);
-    return readHeaderRows(q);
+    QList<MessageListModel::Header> rows = readHeaderRows(q);
+    applyJunkVerdict(rows, scoped(folder));
+    return rows;
 }
 
 int MailStore::cachedHeaderCount(const QString &folder)
@@ -746,8 +807,8 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
     q.prepare(QStringLiteral(
         "INSERT INTO messages"
         " (folder, uid, subject, sender, date, seen, suspicious, auth, attach, msgid,"
-        " crypto, spam_score, spam_state, spam_detail, remote_id)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " crypto, spam_score, spam_state, spam_detail, remote_id, recipients)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(folder, uid) DO UPDATE SET"
         " subject = excluded.subject, sender = excluded.sender, date = excluded.date,"
         // Never overwrite a known Message-ID with an unknown one: a header
@@ -774,7 +835,14 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
         // Same COALESCE rule as msgid: a producer that does not know the
         // backend id (the Thunderbird importer, an older cached row being
         // refreshed) must not erase one that is already recorded.
-        " remote_id = COALESCE(excluded.remote_id, messages.remote_id)"));
+        " remote_id = COALESCE(excluded.remote_id, messages.remote_id),"
+        // Same rule again: a producer that does not fill it (any folder that is
+        // not Sent or Drafts) must not blank what is already recorded.
+        // IFNULL, not a bare comparison: a producer that leaves the field
+        // default-constructed binds SQL NULL, and NULL = '' is NULL, so the
+        // CASE fell through and erased the stored value.
+        " recipients = CASE WHEN IFNULL(excluded.recipients, '') = ''"
+        " THEN messages.recipients ELSE excluded.recipients END"));
     QSqlQuery ins(db);
     if (ftsAvailable) {
         // Keyed by messages.rowid — an O(1) lookup. Never filter fts by its
@@ -835,6 +903,7 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
         q.addBindValue(h.spamDetail);
         q.addBindValue(h.remoteId.isEmpty() ? QVariant(QMetaType(QMetaType::QString))
                                             : h.remoteId);
+        q.addBindValue(h.to);
         q.exec();
         if (ftsAvailable) {
             ins.addBindValue(h.subject);
@@ -863,6 +932,91 @@ void MailStore::setSpamVerdict(const QString &folder, qint64 uid, int score, int
     q.addBindValue(scoped(folder));
     q.addBindValue(uid);
     q.exec();
+}
+
+QList<MailStore::RawRow> MailStore::rawsMissingRecipientsOn(QSqlDatabase &db,
+                                                            const QString &scopedFolder,
+                                                            int limit)
+{
+    QList<RawRow> out;
+    if (!db.isOpen())
+        return out;
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral(
+        "SELECT m.uid, b.raw FROM messages m JOIN bodies b"
+        " ON b.folder = m.folder AND b.uid = m.uid"
+        " WHERE m.folder = ? AND IFNULL(m.recipients, '') = ''"
+        " AND b.raw IS NOT NULL AND length(b.raw) > 0"
+        " ORDER BY m.date DESC LIMIT ?"));
+    q.addBindValue(scopedFolder);
+    q.addBindValue(limit);
+    if (!q.exec())
+        return out;
+    while (q.next())
+        out.append({q.value(0).toLongLong(), q.value(1).toByteArray()});
+    return out;
+}
+
+QStringList MailStore::allCachedFolderKeysOn(QSqlDatabase &db)
+{
+    QStringList out;
+    if (!db.isOpen())
+        return out;
+    QSqlQuery q(db);
+    if (!q.exec(QStringLiteral("SELECT DISTINCT folder FROM messages")))
+        return out;
+    while (q.next())
+        out.append(q.value(0).toString());
+    return out;
+}
+
+int MailStore::missingRecipientCountOn(QSqlDatabase &db, const QString &scopedFolder)
+{
+    if (!db.isOpen())
+        return 0;
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral(
+        "SELECT COUNT(*) FROM messages m JOIN bodies b"
+        " ON b.folder = m.folder AND b.uid = m.uid"
+        " WHERE m.folder = ? AND IFNULL(m.recipients, '') = ''"
+        " AND b.raw IS NOT NULL AND length(b.raw) > 0"));
+    q.addBindValue(scopedFolder);
+    return (q.exec() && q.next()) ? q.value(0).toInt() : 0;
+}
+
+void MailStore::setRecipientsBatchOn(QSqlDatabase &db, const QString &scopedFolder,
+                                    const QHash<qint64, QString> &byUid)
+{
+    if (!db.isOpen() || byUid.isEmpty())
+        return;
+    db.transaction();
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral("UPDATE messages SET recipients = ?"
+                             " WHERE folder = ? AND uid = ?"));
+    const QString key = scopedFolder;
+    for (auto it = byUid.cbegin(); it != byUid.cend(); ++it) {
+        // A message genuinely addressed to nobody (a Bcc-only send) would be
+        // re-read on every pass otherwise, so it is marked done with a space
+        // rather than left empty. The list trims it back to nothing.
+        q.addBindValue(it.value().isEmpty() ? QStringLiteral(" ") : it.value());
+        q.addBindValue(key);
+        q.addBindValue(it.key());
+        q.exec();
+    }
+    db.commit();
+}
+
+int MailStore::spamStateOf(const QString &folder, qint64 uid)
+{
+    if (!m_db.isOpen())
+        return 0;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT spam_state FROM messages WHERE folder = ? AND uid = ?"));
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    if (!q.exec() || !q.next())
+        return 0;
+    return q.value(0).toInt();
 }
 
 void MailStore::setAttachKind(const QString &folder, qint64 uid, int kind)
@@ -957,7 +1111,7 @@ QList<MailStore::AgedMessage> MailStore::messagesOlderThan(const QString &folder
     // The remote id falls back to the uid in decimal, exactly as remoteIdFor()
     // does: that is what an IMAP backend expects, and what rows cached before
     // the remote_id column existed hold implicitly.
-    q.prepare(QStringLiteral("SELECT uid, IFNULL(remote_id, CAST(uid AS TEXT)) FROM messages"
+    q.prepare(QStringLiteral("SELECT uid, IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '') FROM messages"
                              " WHERE folder = ? AND (date < ? OR date <= 0)"));
     q.addBindValue(scoped(folder));
     q.addBindValue(cutoffSecs);
@@ -987,7 +1141,7 @@ QList<MailStore::AgedMessage> MailStore::unseenMessages(const QString &folder)
     QSqlQuery q(m_db);
     // Same remote-id fallback as remoteIdFor(): rows cached before the
     // remote_id column existed carry the uid in decimal implicitly.
-    q.prepare(QStringLiteral("SELECT uid, IFNULL(remote_id, CAST(uid AS TEXT)) FROM messages"
+    q.prepare(QStringLiteral("SELECT uid, IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '') FROM messages"
                              " WHERE folder = ? AND seen = 0"));
     q.addBindValue(scoped(folder));
     if (!q.exec())
@@ -1089,7 +1243,7 @@ QString MailStore::remoteIdFor(const QString &folder, qint64 uid)
     if (!m_db.isOpen())
         return {};
     QSqlQuery q(m_db);
-    q.prepare(QStringLiteral("SELECT IFNULL(remote_id, CAST(uid AS TEXT)) FROM messages"
+    q.prepare(QStringLiteral("SELECT IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '') FROM messages"
                              " WHERE folder = ? AND uid = ?"));
     q.addBindValue(scoped(folder));
     q.addBindValue(uid);
@@ -2290,6 +2444,43 @@ QSet<QString> MailStore::knownCorrespondents(const QSet<QString> &addresses)
     return out;
 }
 
+QSet<QString> MailStore::knownMessageIds(const QSet<QString> &msgids)
+{
+    QSet<QString> out;
+    if (!m_db.isOpen() || msgids.isEmpty())
+        return out;
+    QStringList needles;
+    needles.reserve(msgids.size());
+    for (const QString &raw : msgids) {
+        QString id = raw.trimmed();
+        if (id.startsWith(QLatin1Char('<')) && id.endsWith(QLatin1Char('>')))
+            id = id.mid(1, id.size() - 2);
+        if (!id.isEmpty())
+            needles.append(id);
+    }
+    if (needles.isEmpty())
+        return out;
+    // Chunked exactly as knownCorrespondents() is, and for the same reason: a
+    // References header can name a dozen ancestors, so one batch of headers can
+    // ask about far more ids than SQLite will bind at once.
+    constexpr int chunk = 500;
+    for (qsizetype start = 0; start < needles.size(); start += chunk) {
+        const QStringList slice = needles.mid(start, chunk);
+        const QString placeholders =
+            QStringList(slice.size(), QStringLiteral("?")).join(QLatin1Char(','));
+        QSqlQuery q(m_db);
+        q.prepare(QStringLiteral("SELECT DISTINCT msgid FROM messages WHERE msgid IN (%1)")
+                      .arg(placeholders));
+        for (const QString &n : slice)
+            q.addBindValue(n);
+        if (!q.exec())
+            continue;
+        while (q.next())
+            out.insert(q.value(0).toString());
+    }
+    return out;
+}
+
 QHash<QString, MailStore::DomainHistory>
 MailStore::senderDomainHistory(const QSet<QString> &orgs)
 {
@@ -2356,7 +2547,7 @@ QStringList MailStore::recipientCompletions(const QString &prefix, int limit)
 }
 
 QList<MessageListModel::Header> MailStore::search(const QString &folder,
-                                                  const QString &keyword)
+                                                  const QString &keyword, bool byRecipient)
 {
     QList<MessageListModel::Header> out;
     if (!m_db.isOpen())
@@ -2366,12 +2557,14 @@ QList<MessageListModel::Header> MailStore::search(const QString &folder,
              [&out](const QList<MessageListModel::Header> &batch) {
                  out += batch;
                  return true;
-             });
+             },
+             false, byRecipient);
     return out;
 }
 
 void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QString &keyword,
-                         bool ftsAvailable, const SearchSink &deliver, bool headersOnly)
+                         bool ftsAvailable, const SearchSink &deliver, bool headersOnly,
+                         bool byRecipient)
 {
     if (!db.isOpen() || keyword.trimmed().isEmpty())
         return;
@@ -2403,6 +2596,7 @@ void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QS
             h.spamScore = q.value(9).toInt();
             h.spamState = q.value(10).toInt();
             h.spamDetail = q.value(11).toString();
+            h.to = q.value(12).toString();
             batch.append(h);
             if (batch.size() < kBatch)
                 continue;
@@ -2424,7 +2618,8 @@ void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QS
         // milliseconds (EXPLAIN: LIST SUBQUERY vs SCAN f per row).
         q.prepare(QStringLiteral(
             "SELECT m.uid, m.subject, m.sender, m.date, m.seen, m.suspicious, m.auth, m.attach,"
-            " m.color, m.spam_score, m.spam_state, m.spam_detail FROM messages m"
+            " m.color, m.spam_score, m.spam_state, m.spam_detail, IFNULL(m.recipients, '')"
+            " FROM messages m"
             " WHERE m.rowid IN (SELECT rowid FROM fts WHERE fts MATCH ?)"
             " AND m.folder = ? ORDER BY m.date DESC LIMIT 200"));
         // Quote as a literal phrase so FTS5 operators in user input can't
@@ -2434,7 +2629,12 @@ void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QS
         phrase.replace(QLatin1Char('"'), QStringLiteral("\"\""));
         // {subject sender} is fts5's column filter — body stays out of the
         // match when only headers are wanted.
-        q.addBindValue(headersOnly ? QStringLiteral("{subject sender} : \"%1\"*").arg(phrase)
+        // The index has no recipients column — adding one means rebuilding it,
+        // and the substring pass below already answers a name in To. So a
+        // recipient search narrows FTS to the subject and lets LIKE do the rest.
+        const QString columns = byRecipient ? QStringLiteral("{subject}")
+                                            : QStringLiteral("{subject sender}");
+        q.addBindValue(headersOnly ? QStringLiteral("%1 : \"%2\"*").arg(columns, phrase)
                                    : QStringLiteral("\"%1\"*").arg(phrase));
         q.addBindValue(scopedFolder);
         if (q.exec())
@@ -2450,9 +2650,15 @@ void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QS
     QSqlQuery like(db);
     like.prepare(QStringLiteral(
         "SELECT uid, subject, sender, date, seen, suspicious, auth, attach, color,"
-        " spam_score, spam_state, spam_detail FROM messages"
-        " WHERE folder = ? AND (subject LIKE ? ESCAPE '\\' OR sender LIKE ? ESCAPE '\\')"
-        " ORDER BY date DESC LIMIT 200"));
+        " spam_score, spam_state, spam_detail, IFNULL(recipients, '') FROM messages"
+        " WHERE folder = ? AND (subject LIKE ? ESCAPE '\\' OR %1 LIKE ? ESCAPE '\\')"
+        " ORDER BY date DESC LIMIT 200")
+                     // Whichever column the list is showing. In Sent every row
+                     // has the same sender, so matching it finds the whole
+                     // folder or nothing — the recipient is the name a person
+                     // is actually looking for there.
+                     .arg(byRecipient ? QStringLiteral("recipients")
+                                      : QStringLiteral("sender")));
     QString escaped = keyword;
     escaped.replace(QLatin1Char('\\'), QStringLiteral("\\\\"));
     escaped.replace(QLatin1Char('%'), QStringLiteral("\\%"));

@@ -5,8 +5,11 @@
 
 #include <QObject>
 #include <QQuickTextDocument>
+#include <QTemporaryDir>
 #include <QTextCursor>
 #include <QTextListFormat>
+
+#include <memory>
 
 /**
  * Formatting backend for the compose editor. QML TextArea has no API for
@@ -75,7 +78,25 @@ public:
     /// holds no text, so the caller can leave the key press alone.
     Q_INVOKABLE bool pastePlainText();
 
+    /// Ctrl+V when the clipboard holds a picture: inserts it into the body at
+    /// the cursor rather than leaving "attach a file" as the only way to send
+    /// one. False when the clipboard holds no image, so the caller can let the
+    /// ordinary text paste happen.
+    ///
+    /// The bytes are written to a file of this handler's own (deleted with the
+    /// composer) and referenced from the document, because that is the only
+    /// kind of image reference a QTextDocument renders; composeMessage() turns
+    /// those references into cid: parts when the message is built.
+    Q_INVOKABLE bool pasteImage();
+
+    /// Whether pasteImage() would do anything — for the "Paste image" hint.
+    Q_INVOKABLE bool clipboardHasImage() const;
+
 Q_SIGNALS:
+    /// A pasted image was not inserted, with a line saying why. Nothing else
+    /// reports it: the paste simply appears not to have happened otherwise.
+    void imagePasteFailed(const QString &message);
+
     void documentChanged();
     void cursorPositionChanged();
     void selectionStartChanged();
@@ -89,8 +110,15 @@ private:
     void toggleList(int listStyle);
     void applyMarkerList(QTextCursor &cursor, const QTextListFormat &listFormat);
     bool changeListIndent(int delta);
+    /// Writes \a data into the scratch directory and inserts it at the cursor.
+    /// \a suffix is the file extension the format wants.
+    bool insertImage(const QByteArray &data, const QString &suffix);
 
     QQuickTextDocument *m_document = nullptr;
+    /// Holds the pasted images until the composer closes. Created on the first
+    /// paste — a composer that never sees one leaves nothing behind.
+    std::unique_ptr<QTemporaryDir> m_imageDir;
+    int m_imageCount = 0;
     int m_cursorPosition = -1;
     int m_selectionStart = 0;
     int m_selectionEnd = 0;

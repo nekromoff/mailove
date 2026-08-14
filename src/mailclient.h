@@ -31,6 +31,7 @@
 #include "messageverifier.h"
 #include "messagelistmodel.h"
 #include "pgpengine.h"
+#include "spamheuristics.h"
 
 class QThread;
 
@@ -91,6 +92,12 @@ class MailClient : public QObject
     Q_PROPERTY(int searchFound READ searchFound NOTIFY searchingChanged)
     /// How far that has got, 0-100, for the message shown on a close attempt.
     Q_PROPERTY(int indexRebuildPercent READ indexRebuildPercent NOTIFY indexRebuildChanged)
+    /// A one-time cache migration is running. Generic on purpose: these three
+    /// drive one modal, so the next migration needs a worker and nothing else.
+    Q_PROPERTY(bool migrationRunning READ migrationRunning NOTIFY migrationChanged)
+    Q_PROPERTY(QString migrationLabel READ migrationLabel NOTIFY migrationChanged)
+    /// 0-100, or -1 when the total is not known yet — an indeterminate bar.
+    Q_PROPERTY(int migrationPercent READ migrationPercent NOTIFY migrationChanged)
     /// ABOUT.md compiled into the binary (Settings → About). CONSTANT — baked
     /// in at build time, never changes at runtime.
     Q_PROPERTY(QString aboutText READ aboutText CONSTANT)
@@ -329,6 +336,12 @@ public:
     /// uid is the draft's own uid so the old copy can be removed on send.
     /// Empty map when nothing is shown.
     Q_INVOKABLE QVariantMap draftData();
+    /// True while the open folder holds the user's own outgoing mail: Sent,
+    /// Drafts, Templates, Outbox. Every message in one is from the user, so the
+    /// From column repeats the same name on every row and says nothing; the
+    /// list shows To instead, and search looks there too.
+    Q_PROPERTY(bool viewingOutgoing READ viewingOutgoing NOTIFY selectedFolderChanged)
+    bool viewingOutgoing() const { return listsRecipients(m_selectedFolder); }
     /// True while the open folder is this account's Drafts folder — clicking a
     /// message there reopens it in the composer instead of the reader.
     Q_PROPERTY(bool viewingDrafts READ viewingDrafts NOTIFY selectedFolderChanged)
@@ -495,6 +508,9 @@ public:
     bool searching() const { return m_searching; }
     int searchFound() const { return m_searchFound; }
     int indexRebuildPercent() const;
+    bool migrationRunning() const;
+    QString migrationLabel() const;
+    int migrationPercent() const;
     /// Asks to quit as soon as the rebuild finishes; the window is closed for
     /// the user rather than leaving them to try again.
     Q_INVOKABLE void quitWhenIndexRebuildDone() { m_quitAfterIndex = true; }
@@ -502,6 +518,7 @@ public:
 Q_SIGNALS:
     void reclaimingChanged();
     void indexRebuildChanged();
+    void migrationChanged();
     void searchingChanged();
     /// The rebuild finished and a close was pending — QML closes the window,
     /// so it still saves its geometry on the way out.
@@ -807,16 +824,70 @@ private:
     /// Fills in the spam fields of \a h from its raw \a head. \a knownSenders
     /// and \a orgHistory are the pre-resolved allowlist and sender-domain
     /// history for the whole batch (see appendScoredHeaders).
-    void scoreHeader(MessageListModel::Header &h, const QByteArray &head,
+    void scoreHeader(MessageListModel::Header &h, const QString &folder,
+                     const QByteArray &head,
                      const QSet<QString> &knownSenders,
-                     const QHash<QString, MailStore::DomainHistory> &orgHistory);
+                     const QHash<QString, MailStore::DomainHistory> &orgHistory,
+                     const QSet<QString> &knownMsgIds);
+    /// Scores a message again now that its body is in hand, and stores the
+    /// result as verdict state 2.
+    ///
+    /// The list-time score sees only headers, so every attachment, link and
+    /// body rule is silent there. This is the second look — the same scorer,
+    /// the same context, with the parts of the message that had not arrived
+    /// yet. Never called for a message the user has settled (state 3).
+    void rescoreWithBody(const QString &folder, qint64 uid, KMime::Message *msg);
+    /// The scoring context for one message, built from the store and the
+    /// account. Shared by the header pass and the body pass so the two cannot
+    /// disagree about who the sender is.
+    SpamHeuristics::Context spamContextFor(const QString &folder, const QString &fromValue,
+                                           const QByteArray &head,
+                                           const QSet<QString> &knownSenders,
+                                           const QHash<QString, MailStore::DomainHistory> &orgHistory,
+                                           const QSet<QString> &knownMsgIds) const;
+    /// Every address this account receives at, normalized. Read by the
+    /// "addressed to nobody you are" rule, which stays silent when it is empty.
+    QStringList ownAddresses() const;
+    /// The Message-IDs a header block claims as ancestors: In-Reply-To plus
+    /// every id in References.
+    static QSet<QString> referencedMessageIds(const QByteArray &head);
     /// Turns one header delivery into scored list rows and appends them to
     /// \a out. Single place where a backend's header batch becomes rows, so
     /// the allowlist lookup stays batched and no fetch path can quietly skip
     /// scoring.
     void appendScoredHeaders(QList<MessageListModel::Header> &out,
+                             const QString &folder,
                              const QList<MailBackend::HeaderInfo> &infos,
                              const QStringList &authDomains);
+    /// True for the folders spam scoring applies to.
+    ///
+    /// Two of them. The Inbox, because that is where spam arrives and where a
+    /// verdict changes what the user does about it. And the Junk folder,
+    /// because everything in it is spam by definition and must show the marker
+    /// — including the mail that arrived before any of these rules existed,
+    /// which carries no stored verdict and would otherwise sit there unmarked.
+    ///
+    /// Nowhere else. Sent and Drafts hold the user's own mail and marking that
+    /// "!" is absurd, Trash is on its way out, and mail filed into a folder by
+    /// a rule was sorted deliberately. Scoring those also charged every sync
+    /// for a verdict nothing would show.
+    bool scoresSpamIn(const QString &folder) const;
+    /// True for a folder whose mail the user sent: Sent, Drafts, Templates,
+    /// Outbox. Named the same generous way isJunkFolder() is, because the
+    /// server's own attributes only cover the two it knows about.
+    bool listsRecipients(const QString &folder) const;
+    /// The name half of listsRecipients(), with no account state behind it.
+    ///
+    /// Static because the recipient migration walks the folders of *every*
+    /// account in the cache, not just the open one — and for an account that
+    /// is not open there is no configured Sent folder to consult, only a name.
+    static bool folderNameIsOutgoing(const QString &folder);
+    /// True when \a accountKey names an imported archive rather than a server
+    /// account. Spam scoring is skipped for those entirely — see scoresSpamIn().
+    bool isLocalAccountKey(const QString &accountKey) const;
+    /// True when \a folder is the junk folder, for the decisive rule of the
+    /// same name. Takes a scoped or plain folder key, unlike isJunkFolder().
+    bool isJunkFolderKey(const QString &folder) const;
     /// The account's own sending address, bare — no display name. This is the
     /// SMTP envelope sender, and the address excluded from reply-all lists.
     QString ownAddress() const;

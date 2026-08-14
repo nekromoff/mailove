@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailove VERSION 2.4 LANGUAGES CXX)
+project(mailove VERSION 2.5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -353,10 +353,19 @@ target_link_libraries(fidelitytool PRIVATE
 # spam corpus. The weights in spamheuristics.cpp are only defensible against
 # numbers this produces.
 #   ./spamtool --ham good/ --spam junk/ --quiet
+#
+# Links MimeUtils (and so the cache sources it sits on) rather than carrying its
+# own copy of the body and attachment collectors: a tool that reads a message
+# differently from the client measures a filter the client does not run.
 qt_add_executable(spamtool tests/spamtool.cpp
     src/spamheuristics.cpp src/spamheuristics.h
+    src/mimeutils.cpp src/mimeutils.h
+    src/mailstore.cpp src/mailstore.h
+    src/messagelistmodel.cpp src/messagelistmodel.h
+    src/attachmentstore.cpp src/attachmentstore.h
     src/publicsuffixlist.cpp src/publicsuffixlist.h)
-target_link_libraries(spamtool PRIVATE Qt6::Core Qt6::Network Qt6::Sql KPim6::Mime)
+target_link_libraries(spamtool PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql KPim6::Mime PkgConfig::ZSTD)
 
 # Checks the backend-neutral message identity the JMAP work needs (remote_id,
 # per-folder sync_state) against a throwaway database of its own — never the
@@ -439,6 +448,16 @@ target_include_directories(mimeutilstest PRIVATE src)
 target_link_libraries(mimeutilstest PRIVATE
     Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql KPim6::Mime PkgConfig::ZSTD)
 set_target_properties(mimeutilstest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)
+
+# Pass/fail companion to spamtool: every rule fires on the shape it was written
+# for, and none of the ham corpus below the unsure threshold moves. The second
+# half is the one that must not be relaxed to fit a new rule.
+qt_add_executable(spamheuristicstest tests/spamheuristicstest.cpp
+    src/spamheuristics.cpp src/spamheuristics.h
+    src/publicsuffixlist.cpp src/publicsuffixlist.h)
+target_include_directories(spamheuristicstest PRIVATE src)
+target_link_libraries(spamheuristicstest PRIVATE Qt6::Core Qt6::Network)
+set_target_properties(spamheuristicstest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)
 
 qt_add_executable(securewipetest tests/securewipetest.cpp
     src/securewipe.cpp src/securewipe.h)

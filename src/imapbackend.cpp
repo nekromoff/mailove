@@ -1121,13 +1121,15 @@ void ImapBackend::folderUnreadCounts(
 // --- Search ----------------------------------------------------------------
 
 void ImapBackend::search(const QString &folder, const QString &query, bool headersOnly,
-                         const OpCallback &done)
+                         bool byRecipient, const OpCallback &done)
 {
     // headersOnly is the default at the call site: a body search drags in every
-    // newsletter that ever mentioned the word.
+    // newsletter that ever mentioned the word. Which header the name is looked
+    // for in depends on the folder — searching From in Sent asks "which of my
+    // messages are from me", which is all of them.
     const KIMAP::Term term = headersOnly
         ? KIMAP::Term(KIMAP::Term::Or,
-                      {KIMAP::Term(KIMAP::Term::From, query),
+                      {KIMAP::Term(byRecipient ? KIMAP::Term::To : KIMAP::Term::From, query),
                        KIMAP::Term(KIMAP::Term::Subject, query)})
         : KIMAP::Term(KIMAP::Term::Text, query);
 

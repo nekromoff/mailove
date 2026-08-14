@@ -1,5 +1,49 @@
+mailove (2.5) unstable; urgency=medium
+
+  * Spam detection rewritten around the message rather than the X-Spam headers:
+    brand impersonation in the sender name, sender-name and URL homograph and
+    zero-width tricks, credential-trick and brand-lookalike links, password
+    forms in the body, web pages and password-protected archives sent as
+    attachments, and the business-email-compromise shape of a corporate sender
+    with a freemail Reply-To.
+  * Attachment and link rules now actually run. They existed but the client
+    only ever scored headers, so nothing that needed a body could fire; a
+    message is scored again once its body is in hand.
+  * ARC is read, so mailing lists are no longer marked. A list breaks SPF and
+    DKIM by design and ARC carries the verdict from before it did.
+  * Three rules that fired on ordinary mail are gone or weakened, measured
+    against a real mailbox: Message-ID and Return-Path naming a different
+    domain than From (61% and 6% of ordinary mail — every mailing platform
+    does both, and SPF already authorises it) and Reply-To mismatches.
+  * A brand cannot impersonate itself: links to a sender's own asset and
+    shortener domains are no longer read as lookalikes.
+  * The red ! now means spam and only spam. Hovering lists every rule that
+    fired with its weight and the total the verdict was made from.
+  * Everything in the junk folder is marked, including mail filed there before
+    any of this existed.
+  * Scoring runs in the inbox and the junk folder only — never Sent, Drafts or
+    Trash, and never in imported archives, whose mail lacks the headers the
+    rules assume and would be marked for being old.
+  * Taking a message out of the junk folder allowlists the sender, whether by
+    the Not-spam action or by moving it; Not spam also puts it back in the
+    inbox instead of leaving it buried.
+  * Sent and Drafts show To instead of From, sort by it, and search it.
+  * A one-time cache migration fills that column in from mail already on disk,
+    with a progress dialog. Nothing is re-downloaded.
+  * The message list no longer waits for an unrelated event to notice that the
+    open folder changed.
+  * A clipboard image that cannot be pasted into a message says why instead of
+    doing nothing.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Fri, 15 Aug 2026 00:00:00 +0200
+
 mailove (2.4) unstable; urgency=medium
 
+  * Ctrl+V puts a picture from the clipboard into the message where the
+    cursor is, instead of only being able to attach one as a file. It travels
+    with the message as an inline part, survives saving and reopening a draft,
+    and is sent as an attachment on plain-text accounts, which have no body
+    that can reference it.
   * New Layout setting: the message preview can sit below the message list as
     before, or beside it. Each layout remembers its own divider position, and
     the folder pane width is now remembered too.

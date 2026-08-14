@@ -246,7 +246,11 @@ public:
     /// Server-side search within \a folder. \a headersOnly limits matching to
     /// sender and subject; otherwise the body and all headers count. Answered
     /// by searchResults().
+    /// \a byRecipient searches To instead of From in the header pass. Set for
+    /// the user's own outgoing folders, where every message is from them and a
+    /// From search matches everything or nothing.
     virtual void search(const QString &folder, const QString &query, bool headersOnly,
+                        bool byRecipient,
                         const OpCallback &done) = 0;
 
     // --- Writing -----------------------------------------------------------

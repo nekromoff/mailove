@@ -3,13 +3,20 @@
 
 #include "documenthandler.h"
 
+#include <QBuffer>
 #include <QClipboard>
+#include <QFile>
 #include <QGuiApplication>
+#include <QImage>
+#include <QMimeData>
+#include <QMimeDatabase>
 #include <QQuickTextDocument>
 #include <QTextBlock>
 #include <QTextDocument>
+#include <QTextImageFormat>
 #include <QTextList>
 #include <QTextListFormat>
+#include <QUrl>
 
 void DocumentHandler::setDocument(QQuickTextDocument *document)
 {
@@ -372,6 +379,182 @@ bool DocumentHandler::pastePlainText()
     // arrives looking like the paragraph it was dropped into; line feeds in it
     // become paragraph breaks.
     cursor.insertText(text);
+    cursor.endEditBlock();
+    return true;
+}
+
+namespace {
+
+/// Mail carries pictures badly enough without a screenshot pasted at retina
+/// size; past this the paste is refused rather than quietly building a message
+/// no server will accept.
+constexpr qint64 kMaxPastedImage = 20 * 1024 * 1024;
+
+/// How wide a pasted image is drawn — in the editor and, since the size
+/// travels with the HTML, in the recipient's client. The pixels are all still
+/// there; this is the display size, the way any editor scales an image dropped
+/// into a page. A modern screenshot is several thousand pixels wide and would
+/// otherwise arrive at that width.
+constexpr int kDisplayWidth = 640;
+
+/// Clipboard formats worth taking as they are, best first. A JPEG photo
+/// re-encoded as PNG is several times the size for no gain, and a GIF loses
+/// its animation — so the source's own bytes are sent whenever they are in a
+/// format every mail client can render.
+struct ClipboardImageFormat {
+    const char *mimeType;
+    const char *suffix;
+};
+constexpr ClipboardImageFormat kNativeFormats[] = {
+    {"image/png", "png"},
+    {"image/jpeg", "jpg"},
+    {"image/gif", "gif"},
+    {"image/webp", "webp"},
+};
+
+/// Local image files on the clipboard — copying a picture in a file manager
+/// puts the file's URL there and nothing else. All or nothing: a mixed
+/// selection, or anything that is not a local image, is left to the ordinary
+/// paste, which is what puts the path in as text.
+QStringList localImageFiles(const QMimeData *mime)
+{
+    if (!mime->hasUrls())
+        return {};
+    QMimeDatabase mimeDb;
+    QStringList out;
+    const QList<QUrl> urls = mime->urls();
+    for (const QUrl &url : urls) {
+        const QString path = url.toLocalFile();
+        if (path.isEmpty())
+            return {};
+        if (!mimeDb.mimeTypeForFile(path).name().startsWith(QLatin1String("image/")))
+            return {};
+        out.append(path);
+    }
+    return out;
+}
+
+QString suffixOf(const QString &path)
+{
+    const qsizetype dot = path.lastIndexOf(QLatin1Char('.'));
+    const QString suffix = dot > 0 ? path.sliced(dot + 1) : QString();
+    return suffix.isEmpty() ? QStringLiteral("png") : suffix;
+}
+
+} // namespace
+
+bool DocumentHandler::clipboardHasImage() const
+{
+    const QClipboard *clipboard = QGuiApplication::clipboard();
+    const QMimeData *mime = clipboard ? clipboard->mimeData() : nullptr;
+    if (!mime)
+        return false;
+    return mime->hasImage() || !localImageFiles(mime).isEmpty();
+}
+
+bool DocumentHandler::pasteImage()
+{
+    const QClipboard *clipboard = QGuiApplication::clipboard();
+    const QMimeData *mime = clipboard ? clipboard->mimeData() : nullptr;
+    if (!mime)
+        return false;
+
+    // Image data first, and ahead of any text or HTML offered beside it: a
+    // clipboard that holds a picture at all is one where the picture is what
+    // was copied. The HTML a browser offers with it references the image by
+    // URL, which would leave the message depending on someone else's server.
+    if (mime->hasImage()) {
+        for (const auto &format : kNativeFormats) {
+            if (!mime->hasFormat(QLatin1String(format.mimeType)))
+                continue;
+            const QByteArray data = mime->data(QLatin1String(format.mimeType));
+            if (!data.isEmpty())
+                return insertImage(data, QLatin1String(format.suffix));
+        }
+        // Offered as a decoded image and nothing else (X11 clipboards often
+        // are): PNG it, which is lossless and understood everywhere.
+        const QImage image = qvariant_cast<QImage>(mime->imageData());
+        if (image.isNull())
+            return false;
+        QByteArray png;
+        QBuffer buffer(&png);
+        buffer.open(QIODevice::WriteOnly);
+        if (!image.save(&buffer, "PNG")) {
+            Q_EMIT imagePasteFailed(tr("The image on the clipboard could not be read."));
+            return true;
+        }
+        return insertImage(png, QStringLiteral("png"));
+    }
+
+    const QStringList files = localImageFiles(mime);
+    if (files.isEmpty())
+        return false;
+    bool inserted = false;
+    for (const QString &path : files) {
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) {
+            Q_EMIT imagePasteFailed(tr("Could not read %1.").arg(path));
+            continue;
+        }
+        inserted = insertImage(file.readAll(), suffixOf(path)) || inserted;
+    }
+    return inserted;
+}
+
+bool DocumentHandler::insertImage(const QByteArray &data, const QString &suffix)
+{
+    if (!m_document)
+        return false;
+    if (data.size() > kMaxPastedImage) {
+        Q_EMIT imagePasteFailed(
+            tr("That image is %1 MB — too large to put in a message. Attach it instead.")
+                .arg(data.size() / (1024 * 1024)));
+        return true;
+    }
+    // Decoded here for two reasons: it is how the image's size is known, and a
+    // payload that does not decode is not an image at all, whatever the
+    // clipboard called it.
+    const QImage image = QImage::fromData(data);
+    if (image.isNull()) {
+        Q_EMIT imagePasteFailed(tr("The image on the clipboard could not be read."));
+        return true;
+    }
+
+    if (!m_imageDir)
+        m_imageDir = std::make_unique<QTemporaryDir>();
+    if (!m_imageDir->isValid()) {
+        Q_EMIT imagePasteFailed(tr("Could not create a temporary file for the image."));
+        return true;
+    }
+    const QString path = m_imageDir->filePath(
+        QStringLiteral("pasted-%1.%2").arg(++m_imageCount).arg(suffix));
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly) || file.write(data) != data.size()) {
+        Q_EMIT imagePasteFailed(tr("Could not write the image to %1.").arg(path));
+        return true;
+    }
+    file.close();
+
+    QTextCursor cursor = textCursor();
+    if (cursor.isNull())
+        return false;
+
+    const QUrl url = QUrl::fromLocalFile(path);
+    // The document would load the file by itself, asynchronously; handing it
+    // the decoded image outright means the paste appears at once, and appears
+    // even if the temporary directory is somewhere the loader will not follow.
+    m_document->textDocument()->addResource(QTextDocument::ImageResource, url, image);
+
+    QTextImageFormat format;
+    format.setName(url.toString());
+    if (image.width() > kDisplayWidth) {
+        format.setWidth(kDisplayWidth);
+        format.setHeight(qRound(double(image.height()) * kDisplayWidth / image.width()));
+    }
+    cursor.beginEditBlock();
+    if (cursor.hasSelection())
+        cursor.removeSelectedText();
+    cursor.insertImage(format);
     cursor.endEditBlock();
     return true;
 }

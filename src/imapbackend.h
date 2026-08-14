@@ -117,6 +117,7 @@ public:
         const std::function<void(Error, const QHash<QString, int> &,
                                  const QString &)> &done) override;
     void search(const QString &folder, const QString &query, bool headersOnly,
+                bool byRecipient,
                 const OpCallback &done) override;
     void storeMessage(const QString &folder, const QByteArray &raw,
                       const QStringList &flags,

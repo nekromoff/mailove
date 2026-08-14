@@ -12,6 +12,7 @@
  */
 
 #include "../src/mailstore.h"
+#include "../src/spamheuristics.h"
 
 #include <QCoreApplication>
 #include <QDebug>
@@ -295,6 +296,125 @@ int main(int argc, char **argv)
           QStringLiteral("a background folder's sync token round-trips"));
     check(store.syncState(folder) != QLatin1String("state-42"),
           QStringLiteral("and does not overwrite the open account's"));
+
+    // --- the To column ----------------------------------------------------
+    //
+    // In Sent and Drafts every message is from the user, so the list shows the
+    // recipient instead. The cache has to carry it, and the "From" sort has to
+    // follow whatever the column is showing — sorting by a field the column is
+    // not displaying reads as a broken sort.
+    {
+        const QString sent = QStringLiteral("Sent");
+        MessageListModel::Header zoe = makeHeader(401, QStringLiteral("re: budget"), QString());
+        zoe.to = QStringLiteral("Zoe <zoe@example.com>");
+        MessageListModel::Header adam = makeHeader(402, QStringLiteral("hello"), QString());
+        adam.to = QStringLiteral("Adam <adam@example.com>");
+        store.storeHeaders(sent, {zoe, adam});
+
+        check(find(store, sent, 401).to == QLatin1String("Zoe <zoe@example.com>"),
+              QStringLiteral("the recipient round-trips through the cache"));
+
+        // A later header refresh that does not know the recipients (any
+        // producer outside the sent folders) must not blank what is stored.
+        store.storeHeaders(sent, {makeHeader(401, QStringLiteral("re: budget"), QString())});
+        check(find(store, sent, 401).to == QLatin1String("Zoe <zoe@example.com>"),
+              QStringLiteral("…and a refresh that does not know it does not erase it"));
+
+        const auto byName = store.sortedHeaders(sent, int(MessageListModel::SortColumn::From),
+                                                false, 50, nullptr);
+        QList<qint64> order;
+        for (const auto &h : byName) {
+            if (h.uid == 401 || h.uid == 402)
+                order.append(h.uid);
+        }
+        check(order == QList<qint64>({402, 401}),
+              QStringLiteral("the From sort orders Sent by recipient (Adam before Zoe), got %1")
+                  .arg(order.size() == 2 ? QStringLiteral("%1,%2").arg(order[0]).arg(order[1])
+                                         : QStringLiteral("%1 rows").arg(order.size())));
+
+        // Ordinary folders are unaffected: no recipients, sort by sender.
+        check(find(store, folder, 101).to.isEmpty(),
+              QStringLiteral("a row outside the sent folders carries no recipient"));
+
+        const auto hits = store.search(sent, QStringLiteral("zoe"), /*byRecipient=*/true);
+        bool foundZoe = false;
+        for (const auto &h : hits) {
+            if (h.uid == 401)
+                foundZoe = true;
+        }
+        check(foundZoe, QStringLiteral("searching Sent matches the recipient"));
+    }
+
+    // --- the junk-folder verdict -----------------------------------------
+    //
+    // Everything in a junk folder is spam by definition, and the rule lives in
+    // the store rather than in a caller because the store is where the rows
+    // come from: SyncEngine re-reads them on every merge, page and reconcile.
+    // Applied in one caller instead, the marks appeared when the folder opened
+    // and vanished on the next refresh, which is the bug this pins.
+    // The predicate is handed the whole key, account part and all — that is
+    // what lets the real one refuse to mark an imported archive's junk folder.
+    MailStore::setJunkFolderTest([&junk](const QString &scopedFolder) {
+        return scopedFolder.contains(QChar(0x1f))
+            && scopedFolder.section(QChar(0x1f), -1) == junk;
+    });
+
+    MessageListModel::Header settled = makeHeader(301, QStringLiteral("rescued"), QString());
+    settled.spamState = 3; // the user said "not spam"
+    store.storeHeaders(junk, {makeHeader(300, QStringLiteral("unscored"), QString()), settled});
+    store.storeHeaders(folder, {makeHeader(302, QStringLiteral("ordinary"), QString())});
+
+    const MessageListModel::Header inJunk = find(store, junk, 300);
+    check(inJunk.spamScore >= SpamHeuristics::SpamThreshold && inJunk.spamState == 1,
+          QStringLiteral("a cached junk row with no stored verdict comes back marked"));
+    check(inJunk.spamDetail.contains(QLatin1String("Junk folder")),
+          QStringLiteral("…and says why: \"%1\"").arg(inJunk.spamDetail.section('\n', 0, 0)));
+
+    check(find(store, junk, 301).spamState == 3,
+          QStringLiteral("a verdict the user settled is left alone"));
+    check(find(store, folder, 302).spamScore == 0,
+          QStringLiteral("rows outside the junk folder are untouched"));
+
+    // Every read path, not just the one the folder view happens to use.
+    const auto page = store.cachedHeadersBefore(junk, QDateTime::currentSecsSinceEpoch(), 0);
+    bool pagedMarked = !page.isEmpty();
+    for (const auto &h : page) {
+        if (h.uid == 300 && h.spamScore < SpamHeuristics::SpamThreshold)
+            pagedMarked = false;
+    }
+    check(pagedMarked, QStringLiteral("the pagination path marks them too"));
+
+    const auto sorted = store.sortedHeaders(junk, 0, true, 50, nullptr);
+    bool sortedMarked = !sorted.isEmpty();
+    for (const auto &h : sorted) {
+        if (h.uid == 300 && h.spamScore < SpamHeuristics::SpamThreshold)
+            sortedMarked = false;
+    }
+    check(sortedMarked, QStringLiteral("and so does the sorted path"));
+
+    // An account the predicate calls local: its junk folder must stay unmarked.
+    // This is the shape MailClient uses to keep imported archives out of spam
+    // scoring — the rules would be wrong about archived mail (no Received, no
+    // Date, no Message-ID after an mbox round trip is 53 points on its own) and
+    // there would be nothing to do with the verdict anyway.
+    {
+        const QString archived = QStringLiteral("import:Mail");
+        MailStore::setJunkFolderTest([&junk, &archived](const QString &scopedFolder) {
+            if (scopedFolder.section(QChar(0x1f), 0, 0) == archived)
+                return false;
+            return scopedFolder.section(QChar(0x1f), -1) == junk;
+        });
+        const QString wasKey = store.accountKey();
+        store.setAccountKey(archived);
+        store.storeHeaders(junk, {makeHeader(500, QStringLiteral("old junk"), QString())});
+        check(find(store, junk, 500).spamScore == 0,
+              QStringLiteral("an imported archive's junk folder is left unmarked"));
+        store.setAccountKey(wasKey);
+        check(find(store, junk, 300).spamScore >= SpamHeuristics::SpamThreshold,
+              QStringLiteral("…while a server account's junk folder still is"));
+    }
+
+    MailStore::setJunkFolderTest({}); // leave no global set behind
 
     if (failures) {
         out() << failures << " check(s) failed" << Qt::endl;

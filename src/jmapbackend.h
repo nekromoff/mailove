@@ -94,6 +94,7 @@ public:
         const std::function<void(Error, const QHash<QString, int> &counts,
                                  const QString &message)> &done) override;
     void search(const QString &folder, const QString &query, bool headersOnly,
+                bool byRecipient,
                 const OpCallback &done) override;
 
     // --- Writing -----------------------------------------------------------
