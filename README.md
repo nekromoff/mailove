@@ -38,6 +38,7 @@ Security-minded KDE-only IMAP and JMAP mail client, blazing fast.
 - **Imported mail** — point it at a folder of mbox files and it imports as an offline account (Thunderbird, Evolution, KMail etc.). Subfolders become folder hierarchy, and Thunderbird's .sbd naming is understood. Add servers later to promote it to a live account.
 
 ## Screenshots
+<img width="1920" height="1034" alt="1" src="https://github.com/user-attachments/assets/37cb8a95-5e58-4fdf-bbe4-1db994fc3848" />
 <img width="1132" height="818" alt="compose" src="https://github.com/user-attachments/assets/128b1bf7-6eab-4ecd-9b98-afd7d1ec78ab" />
 <img width="1920" height="1038" alt="02-settings-accounts" src="https://github.com/user-attachments/assets/108c1e8c-dc90-406f-8719-4fb24efef692" />
 <img width="1920" height="1038" alt="03-settings-general" src="https://github.com/user-attachments/assets/594e49de-5bf6-43cb-8868-2c11bc185974" />
