@@ -312,6 +312,11 @@ void ImapBackend::startPush(const QString &folder)
                     qWarning() << "mailove: idle ended:" << job->errorString();
                 if (m_idleSession && m_connected) {
                     const QString folder = m_pushFolder;
+                    // Drop the session now rather than at the retry: jobless
+                    // but still connected, it has nothing to receive the
+                    // server's keepalives ("* OK Still here"), and KIMAP logs
+                    // every one as a message with no job to handle it.
+                    stopPush();
                     QTimer::singleShot(30 * 1000, this, [this, folder] { startPush(folder); });
                 }
             });

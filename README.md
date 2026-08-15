@@ -1,6 +1,6 @@
 # Mailove
 
-The fast KDE-only email client.
+The fast KDE-first email client.
 
 <img width="300" height="300" alt="org mailove Mailove" src="https://github.com/user-attachments/assets/67841075-7f20-4e41-a6ca-7814b1988757" />
 
@@ -9,7 +9,7 @@ The fast KDE-only email client.
 
 ## What it does
 
-Security-minded KDE-only IMAP and JMAP mail client, blazing fast.
+Security-minded KDE-first IMAP and JMAP mail client, blazing fast.
 
 ### General
 - **IMAP, JMAP, Gmail/365 OAuth** — multiple accounts supported. IMAP against any server (SSL/TLS, STARTTLS, plain), password or OAuth 2 for Gmail and Microsoft 365; JMAP (RFC 8620/8621) discovers its own endpoints from the address and authenticates with an API token or a password.
@@ -27,7 +27,7 @@ Security-minded KDE-only IMAP and JMAP mail client, blazing fast.
 - **Keyboard-first** — arrows, Page Up/Down, Home/End, Enter to open, Ctrl+W to close a tab, and the keyboard follows the folder you open.
 - **Tabs** — Compose, Settings and opened messages are tabs. Ctrl+W closes; Compose can be set to open in a window if preferred.
 - **Folders moving** — drag a folder onto another to reparent it, or onto the account name to move it to the top level. Rename from the context menu; where the protocol forbids it, the menu says so instead.
-- **Unread counts** — a pill on every folder, blue on the inbox. A collapsed folder shows what is unread in the subfolders folded beneath it.
+- **Copy as Markdown** - select content in HTML email to copy it as Markdown
 
 ### Security & safety
 - **Secure credential storage** — passwords and OAuth tokens in KWallet via Qt6Keychain, never a config file.

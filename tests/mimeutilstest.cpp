@@ -303,6 +303,81 @@ int main(int argc, char **argv)
               "a body with no pasted image is left as it is");
     }
 
+    // Blank-line condensing: at most two empty lines survive between text,
+    // and invisible-ink lines (nbsp spacers, object-replacement characters
+    // from extracted images, zero-width spaces) count as blank.
+    {
+        check(MimeUtils::condenseBlankLines(QStringLiteral("a\n\n\n\n\n\n\nb"))
+                  == QStringLiteral("a\n\n\nb"),
+              "runs of empty lines collapse to two");
+        check(MimeUtils::condenseBlankLines(QStringLiteral("a\n\n\nb"))
+                  == QStringLiteral("a\n\n\nb"),
+              "two empty lines are left alone");
+        const QString invisible = QStringLiteral("a\n \n￼\n  \n​\n  \nb");
+        check(MimeUtils::condenseBlankLines(invisible) == QStringLiteral("a\n\n\nb"),
+              "nbsp/object-replacement/zero-width lines count as blank");
+        check(MimeUtils::condenseBlankLines(QStringLiteral("x￼y"))
+                  == QStringLiteral("xy"),
+              "object-replacement characters go even mid-line");
+        check(MimeUtils::condenseBlankLines(QStringLiteral("plain\ntext\n"))
+                  == QStringLiteral("plain\ntext\n"),
+              "ordinary text is untouched");
+    }
+
+    // Plain text with link targets kept — what toPlainText() drops.
+    {
+        check(MimeUtils::plainTextWithLinks(
+                  QStringLiteral("<p>click <a href=\"https://x.example/p\">here</a> now</p>"))
+                  == QStringLiteral("click here (https://x.example/p) now"),
+              "an anchor's target follows its text");
+        check(MimeUtils::plainTextWithLinks(
+                  QStringLiteral("<p>click <a href=\"https://x.example/p\">right "
+                                 "<b>here</b></a></p>"))
+                  == QStringLiteral("click right here (https://x.example/p)"),
+              "a link split by formatting emits its target once");
+        check(MimeUtils::plainTextWithLinks(
+                  QStringLiteral("<p><a href=\"https://x.example/\">https://x.example/</a></p>"))
+                  == QStringLiteral("https://x.example/"),
+              "a bare URL is not repeated");
+        check(MimeUtils::plainTextWithLinks(
+                  QStringLiteral("<p><a href=\"https://www.x.example/\">www.x.example/</a></p>"))
+                  == QStringLiteral("www.x.example/"),
+              "a URL shown without its scheme is not repeated");
+        check(MimeUtils::plainTextWithLinks(
+                  QStringLiteral("<p><a href=\"mailto:a@x.example\">a@x.example</a></p>"))
+                  == QStringLiteral("a@x.example"),
+              "mailto: on the shown address stays bare");
+        check(MimeUtils::plainTextWithLinks(QStringLiteral("<p>one</p><p>two</p>"))
+                  == QStringLiteral("one\ntwo"),
+              "blocks separate with newlines, no trailing one");
+    }
+
+    // Markdown table furniture from layout-table mail is stripped down to
+    // the cells' content.
+    {
+        const QString garbage = QStringLiteral(
+            "||\n||\n|![Logo](https://x.example/l.png)||\n|-||\n| ||\n\n"
+            "|              |\n|--------------|\n|Real text [link](https://x.example/p)|\n");
+        check(MimeUtils::flattenMarkdownTables(garbage).trimmed()
+                  == QStringLiteral("![Logo](https://x.example/l.png)  \n\n"
+                                    "Real text [link](https://x.example/p)"),
+              "table scaffolding is stripped, cell content unwrapped");
+        check(MimeUtils::flattenMarkdownTables(
+                  QStringLiteral("|Suma: 84,70|\n|Splatnost: 03.09.2026|\n|IBAN: SK28|"))
+                  == QStringLiteral("Suma: 84,70  \nSplatnost: 03.09.2026  \nIBAN: SK28  "),
+              "stacked rows keep hard line breaks, not soft-joined prose");
+        check(MimeUtils::flattenMarkdownTables(
+                  QStringLiteral("|## Prehľad|Môj hosting|## Informácie:|"))
+                  == QStringLiteral("\n## Prehľad\n\nMôj hosting  \n\n## Informácie:\n"),
+              "heading cells break out onto their own lines");
+        check(MimeUtils::flattenMarkdownTables(QStringLiteral("|- alpha  |- beta   |"))
+                  == QStringLiteral("- alpha\n- beta"),
+              "a list in a table cell re-forms as a list");
+        check(MimeUtils::flattenMarkdownTables(QStringLiteral("a | b in prose"))
+                  == QStringLiteral("a | b in prose"),
+              "a pipe mid-sentence is not table furniture");
+    }
+
     out << (failures == 0 ? "all mime utils tests passed\n"
                           : QStringLiteral("%1 check(s) failed\n").arg(failures));
     out.flush();

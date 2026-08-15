@@ -108,6 +108,11 @@ QVariantMap MessageContext::forwardData()
     return m_client ? m_client->forwardDataFor(this) : QVariantMap();
 }
 
+QVariantMap MessageContext::forwardAsAttachmentData()
+{
+    return m_client ? m_client->forwardAsAttachmentDataFor(this) : QVariantMap();
+}
+
 bool MessageContext::attachmentRisky(int index) const
 {
     return m_client && m_client->attachmentRiskyFor(this, index);

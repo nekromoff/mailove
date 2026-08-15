@@ -100,7 +100,12 @@ Window {
         }
         onCloseRequested: {
             win.allowClose = true
-            win.close()
+            // Not win.close(): the contract function close() above shadows
+            // QQuickWindow.close(), so that call would re-enter sheet.close()
+            // until the stack ran out. Hide directly instead — onClosing is
+            // bypassed, so save the geometry here.
+            win.saveGeometry()
+            win.visible = false
             win.finished()
             // Deferred: tearing the window down from inside its own close is
             // asking for trouble.

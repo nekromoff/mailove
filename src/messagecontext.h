@@ -54,6 +54,10 @@ class MessageContext : public QObject
     /// True when the message came from a junk/spam folder: plain text by
     /// default, HTML only on explicit request.
     Q_PROPERTY(bool junkTextOnly READ junkTextOnly NOTIFY messageChanged)
+    /// Mirrors the viewer's HTML/Text choice for this message: replying to or
+    /// forwarding a message being read as plain text quotes the plain text.
+    Q_PROPERTY(bool quotePlainText READ quotePlainText WRITE setQuotePlainText
+                   NOTIFY quotePlainTextChanged)
     /// Per-message opt-in for remote images/CSS/fonts (persisted per sender).
     Q_PROPERTY(bool remoteContentAllowed READ remoteContentAllowed
                    WRITE setRemoteContentAllowed NOTIFY remoteContentAllowedChanged)
@@ -134,6 +138,14 @@ public:
     QString bodyUrl() const { return m_bodyUrl; }
     QVariantList attachments() const { return m_attachments; }
     bool junkTextOnly() const { return m_junk; }
+    bool quotePlainText() const { return m_quotePlain; }
+    void setQuotePlainText(bool plain)
+    {
+        if (m_quotePlain == plain)
+            return;
+        m_quotePlain = plain;
+        Q_EMIT quotePlainTextChanged();
+    }
     bool remoteContentAllowed() const { return m_remoteAllowed; }
     void setRemoteContentAllowed(bool allow);
     QString dkimStatus() const { return m_dkimStatus; }
@@ -168,6 +180,9 @@ public:
     Q_INVOKABLE QVariantMap replyData(bool replyAll);
     /// Compose prefill for forwarding this message — see MailClient::forwardData.
     Q_INVOKABLE QVariantMap forwardData();
+    /// Compose prefill for forwarding this message as a message/rfc822
+    /// attachment — see MailClient::forwardAsAttachmentData.
+    Q_INVOKABLE QVariantMap forwardAsAttachmentData();
 
     Q_INVOKABLE bool attachmentRisky(int index) const;
     Q_INVOKABLE void openAttachment(int index);
@@ -184,6 +199,7 @@ Q_SIGNALS:
     /// A different message (or none) is now behind this context.
     void messageChanged();
     void remoteContentAllowedChanged();
+    void quotePlainTextChanged();
     void dkimChanged();
     void cryptoChanged();
 
@@ -247,6 +263,7 @@ private:
     QString m_senderAddress; ///< addr-spec of the sender (remote-content key)
     bool m_junk = false;
     bool m_remoteAllowed = false;
+    bool m_quotePlain = false; ///< viewer is showing this message as plain text
     bool m_hasMessage = false;
 
     QString m_subject, m_from, m_to, m_cc, m_date, m_authInfo, m_bodyUrl;

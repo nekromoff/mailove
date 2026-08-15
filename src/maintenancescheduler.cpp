@@ -569,6 +569,7 @@ void MaintenanceScheduler::startRecipientBackfill(std::function<bool(const QStri
         }
         if (scopedFolders.isEmpty()) {
             db.close();
+            db = QSqlDatabase(); // drop the handle before removeDatabase warns
             QSqlDatabase::removeDatabase(connection);
             return;
         }
@@ -581,6 +582,7 @@ void MaintenanceScheduler::startRecipientBackfill(std::function<bool(const QStri
             total += MailStore::missingRecipientCountOn(db, folder);
         if (total == 0) {
             db.close();
+            db = QSqlDatabase(); // drop the handle before removeDatabase warns
             QSqlDatabase::removeDatabase(connection);
             return;
         }
@@ -623,6 +625,7 @@ void MaintenanceScheduler::startRecipientBackfill(std::function<bool(const QStri
             }
         }
         db.close();
+        db = QSqlDatabase(); // drop the handle before removeDatabase warns
         QSqlDatabase::removeDatabase(connection);
         QMetaObject::invokeMethod(this, [this, done] {
             endMigration();

@@ -234,7 +234,11 @@ void SyncEngine::applySelectedFolderOpened(const QString &folder, qint64 message
     qint64 maxCachedUid = m_store.maxCachedUid(folder);
     int cachedCount = m_store.cachedHeaderCount(folder);
     if (cacheDropped) {
-        m_messages.clear();
+        // Unless the user has started searching while this open was in
+        // flight — the visible rows are their results then, not the folder's,
+        // and every later delivery is already search-guarded to cache only.
+        if (!m_searchActive)
+            m_messages.clear();
         maxCachedUid = 0;
         cachedCount = 0;
     }

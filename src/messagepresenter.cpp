@@ -150,18 +150,57 @@ static QByteArray preformattedPage(const QString &content, bool monospace, bool 
 }
 
 
-void MessagePresenter::collectInlineParts(MessageContext *ctx, KMime::Content *root)
+void MessagePresenter::registerInlineParts(quint64 slot, KMime::Content *root)
 {
     if (const auto *cid = std::as_const(*root).contentID(); cid && !cid->identifier().isEmpty()) {
         const auto *ct = std::as_const(*root).contentType();
-        m_handler->setInlinePart(ctx->viewerContext(),
-                                       QString::fromLatin1(cid->identifier()),
-                                       ct ? ct->mimeType() : QByteArray(),
-                                       root->decodedBody());
+        m_handler->setInlinePart(slot, QString::fromLatin1(cid->identifier()),
+                                 ct ? ct->mimeType() : QByteArray(), root->decodedBody());
     }
     const auto children = root->contents();
     for (KMime::Content *child : children)
-        collectInlineParts(ctx, child);
+        registerInlineParts(slot, child);
+}
+
+void MessagePresenter::collectInlineParts(MessageContext *ctx, KMime::Content *root)
+{
+    registerInlineParts(ctx->viewerContext(), root);
+}
+
+QString MessagePresenter::composePreviewUrl(MessageContext *ctx, quint64 *slot)
+{
+    if (!m_handler || ctx->m_htmlBody.isEmpty())
+        return {};
+    if (!*slot)
+        *slot = m_handler->allocateContext();
+    // Its own slot with its own copy of the inline parts — the reading pane
+    // moving to another message must not blank a composer's quote preview.
+    m_handler->clearInlineParts(*slot);
+    registerInlineParts(*slot,
+                        ctx->m_decrypted ? ctx->m_decrypted.get() : ctx->m_message.get());
+    // Same treatment the viewer gives a message: sanitize, rewrite cid:
+    // references to the scheme handler, and let the CSP enforce the
+    // message's own remote-content decision.
+    QString html = sanitizeMessageHtml(ctx->m_htmlBody);
+    static const QRegularExpression attrCidRe(
+        QStringLiteral("((?:src|href|background)\\s*=\\s*[\"'])cid:"),
+        QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression cssCidRe(
+        QStringLiteral("(url\\(\\s*[\"']?)cid:"), QRegularExpression::CaseInsensitiveOption);
+    const QString cidBase = QStringLiteral("\\1mailove:cid/") + QString::number(*slot)
+        + QLatin1Char('/');
+    html.replace(attrCidRe, cidBase);
+    html.replace(cssCidRe, cidBase);
+    return m_handler->setMessageHtml(
+        *slot,
+        QByteArrayLiteral("<meta charset=\"utf-8\">")
+            + messageCsp(ctx->remoteContentAllowed()) + html.toUtf8());
+}
+
+void MessagePresenter::releasePreviewSlot(quint64 slot)
+{
+    if (m_handler && slot)
+        m_handler->releaseContext(slot);
 }
 
 
@@ -201,12 +240,14 @@ QString MessagePresenter::textViewUrl(MessageContext *ctx)
     QString text = ctx->m_textBody;
     if (text.isEmpty() && !ctx->m_htmlBody.isEmpty()) {
         // HTML-only message: show its stripped text — the junk folders'
-        // text-only default must not degrade to an empty stub.
-        text = QTextDocumentFragment::fromHtml(ctx->m_htmlBody.left(500000))
-                   .toPlainText();
+        // text-only default must not degrade to an empty stub. Link targets
+        // kept (toPlainText() drops every href); the page's linkifier then
+        // makes them clickable like any other URL in the text.
+        text = MimeUtils::plainTextWithLinks(ctx->m_htmlBody.left(500000));
     }
     if (text.isEmpty())
         text = tr("(this message has no displayable text part)");
+    text = MimeUtils::condenseBlankLines(text);
     // Monospace: plain-text mail (patches, tables, ASCII art — the Bugzilla
     // change tables are the classic case) is written for a fixed-width grid
     // and falls apart in a proportional font. Linkified so URLs are clickable
@@ -247,6 +288,43 @@ bool MessagePresenter::writeAttachment(const MessageContext *ctx, int index, con
     }
     file.write(ctx->m_attachmentParts.at(index)->decodedBody());
     return true;
+}
+
+QList<QUrl> MessagePresenter::exportAttachments(MessageContext *ctx)
+{
+    if (ctx->m_attachmentParts.isEmpty())
+        return {};
+    // Same reasoning as openAttachment: a private 0700 directory with an
+    // unpredictable name, living as long as the process — the files must still
+    // be readable when the forward sitting in an open composer is finally sent.
+    static QTemporaryDir tempDir(QDir::tempPath() + QStringLiteral("/mailove-forward-XXXXXX"));
+    if (!tempDir.isValid()) {
+        Q_EMIT errorOccurred(tr("Could not create a private temporary directory: %1")
+                                 .arg(tempDir.errorString()));
+        return {};
+    }
+    // One subdirectory per export: forwarding two messages that both carry
+    // "invoice.pdf" must not have the second overwrite the first while it is
+    // still attached to an open composer.
+    static int exportCount = 0;
+    const QDir dir(tempDir.filePath(QString::number(++exportCount)));
+    if (!dir.mkpath(QStringLiteral(".")))
+        return {};
+    QList<QUrl> out;
+    for (int i = 0; i < ctx->m_attachmentParts.size(); ++i) {
+        const QFileInfo info(attachmentName(ctx, i));
+        QString path = dir.filePath(info.fileName());
+        // One message may carry two attachments under the same name.
+        for (int n = 1; QFileInfo::exists(path); ++n) {
+            path = dir.filePath(info.completeBaseName() + QStringLiteral(" (%1)").arg(n)
+                                + (info.suffix().isEmpty()
+                                       ? QString()
+                                       : QLatin1Char('.') + info.suffix()));
+        }
+        if (writeAttachment(ctx, i, path))
+            out.append(QUrl::fromLocalFile(path));
+    }
+    return out;
 }
 
 void MessagePresenter::saveAttachment(MessageContext *ctx, int index, const QUrl &fileUrl)
@@ -450,10 +528,11 @@ void MessagePresenter::applyBodyParts(MessageContext *ctx, KMime::Message *root,
         preview = ctx->m_textBody;
     } else {
         // Cap the input: stripping hundreds of KB of HTML would defeat the
-        // purpose of an *instant* preview.
-        preview = QTextDocumentFragment::fromHtml(ctx->m_htmlBody.left(100000)).toPlainText();
+        // purpose of an *instant* preview. Link targets kept, like every
+        // text rendering.
+        preview = MimeUtils::plainTextWithLinks(ctx->m_htmlBody.left(100000));
     }
-    Q_EMIT previewTextChanged(preview);
+    Q_EMIT previewTextChanged(MimeUtils::condenseBlankLines(preview));
 
     if (m_handler) {
         m_handler->clearInlineParts(ctx->viewerContext());

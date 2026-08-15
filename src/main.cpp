@@ -4,6 +4,7 @@
 #include <QApplication>
 #include <QElapsedTimer>
 #include <QGuiApplication>
+#include <QStyleHints>
 #include <QIcon>
 #include <QTimer>
 #include <QQmlApplicationEngine>
@@ -86,6 +87,10 @@ int main(int argc, char *argv[])
     // desktop entry's basename, not the application name. X11 uses the window
     // icon instead, so set both.
     QGuiApplication::setDesktopFileName(QStringLiteral("org.mailove.Mailove"));
+    // Press-and-hold reveals secondary actions (the Forward button's
+    // "as attachment"); the platform default of 800ms reads as "nothing is
+    // happening". Snappier, still long past any click.
+    QGuiApplication::styleHints()->setMousePressAndHoldInterval(450);
 
     // The UI asks for named icons (mail-attachment, arrow-down, …), which only
     // resolve once an icon theme is set. A KDE session sets one; anything else

@@ -100,4 +100,26 @@ struct InlineImage {
 /// (http:, data:, an existing cid:) are left exactly as they are.
 QList<InlineImage> takeInlineImages(QString &html, const QString &idDomain);
 
+/// Caps runs of blank lines at two — text renditions of layout-table mail
+/// pad the content with dozens of them. Whitespace-only lines count as
+/// blank. Used by every plain-text rendering: the viewer's text view, the
+/// reply/forward text quote, and anything else that shows a text part.
+QString condenseBlankLines(QString text);
+
+/// HTML to plain text with the link targets kept: "click here" becomes
+/// "click here (https://…)". QTextDocument::toPlainText() drops every href —
+/// the URL lives in the character format, not in the text — so this walks
+/// the parsed document's fragments instead. Links whose visible text already
+/// is the target (bare URLs, mailto: on the address itself) stay bare, and
+/// image-only links stay silent — text renderings are for reading, not an
+/// inventory of every button. Callers cap the input themselves and run
+/// condenseBlankLines() after, as with any text rendering.
+QString plainTextWithLinks(const QString &html);
+
+/// Strips table scaffolding from generated Markdown: separator rows and
+/// empty cells vanish, cells with content unwrap into plain lines. Mail
+/// tables are layout, not data — QTextDocument::toMarkdown() renders them
+/// as `|`-furniture that reads as garbage wherever it is pasted.
+QString flattenMarkdownTables(const QString &markdown);
+
 } // namespace MimeUtils

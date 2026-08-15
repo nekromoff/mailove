@@ -300,10 +300,16 @@ public:
     /// account to have an OpenPGP key configured, and encryption additionally
     /// needs a key for every recipient. A missing key is refused outright
     /// rather than silently downgraded to plaintext.
+    /// \a appendQuote is a deferred reply/forward quote (too big or too
+    /// remote-image-laden for the editor — see quotedBody) appended to the
+    /// outgoing HTML here; \a appendStrip runs the remote-content strip on it
+    /// first, deferred from the open for the same reason.
     Q_INVOKABLE void sendMail(const QString &to, const QString &cc, const QString &bcc,
                               const QString &subject, const QString &html,
                               const QList<QUrl> &attachments, bool sign = false,
-                              bool encrypt = false);
+                              bool encrypt = false,
+                              const QString &appendQuote = QString(),
+                              bool appendStrip = false);
     /// APPENDs the same message to the Drafts folder instead of sending it.
     /// Unlike sendMail this accepts an unfinished message — no recipient, or
     /// an address still being typed — because that is the state a draft is
@@ -316,7 +322,9 @@ public:
     Q_INVOKABLE void saveDraft(const QString &to, const QString &cc, const QString &bcc,
                                const QString &subject, const QString &html,
                                const QList<QUrl> &attachments, qint64 replacesUid = -1,
-                               bool sign = false, bool encrypt = false);
+                               bool sign = false, bool encrypt = false,
+                               const QString &appendQuote = QString(),
+                               bool appendStrip = false);
     /// Whether a Drafts folder is known, so the UI can hide the action when
     /// there is nowhere to put one.
     Q_PROPERTY(bool hasDraftsFolder READ hasDraftsFolder NOTIFY draftsFolderChanged)
@@ -331,6 +339,18 @@ public:
     /// The original's attachments are NOT carried over (compose attaches
     /// local files only).
     Q_INVOKABLE QVariantMap forwardData();
+    /// Compose prefill for forwarding the shown message as a message/rfc822
+    /// attachment (.eml) — the original bytes, untouched: the full-fidelity
+    /// forward. {to, cc, subject, body, attachments}.
+    Q_INVOKABLE QVariantMap forwardAsAttachmentData();
+    /// Frees a composer quote-preview slot handed out in reply/forwardData
+    /// (quotePreviewSlot) once the composer is done with it.
+    Q_INVOKABLE void releaseQuotePreview(quint64 slot);
+    /// "Copy as Markdown": converts the clipboard's HTML flavour (which a
+    /// WebEngine Copy action puts there beside the plain text) to Markdown
+    /// and makes that the clipboard text. Polls briefly — the renderer fills
+    /// the clipboard asynchronously.
+    Q_INVOKABLE void clipboardSelectionToMarkdown(int attempt = 0);
     /// Compose prefill for editing the currently shown message as a draft:
     /// {to, cc, bcc, subject, body, uid} — the message verbatim, not quoted.
     /// uid is the draft's own uid so the old copy can be removed on send.
@@ -809,6 +829,12 @@ private:
     // delegates here (friend both ways keeps the logic in one place).
     QVariantMap replyDataFor(MessageContext *ctx, bool replyAll);
     QVariantMap forwardDataFor(MessageContext *ctx);
+    QVariantMap forwardAsAttachmentDataFor(MessageContext *ctx);
+    /// The message quoted for reply/forward, full HTML fidelity: returned
+    /// whole when the editor can lay it out in one pass, else empty with
+    /// \a appendQuote filled for send-time appending (see quotedBody's comment).
+    QString quotedBody(MessageContext *ctx, bool forward, QString *appendQuote,
+                       bool *appendStrip, QStringList *chunks) const;
     QString htmlViewUrlFor(MessageContext *ctx);
     QString textViewUrlFor(MessageContext *ctx);
     QString sourceViewUrlFor(MessageContext *ctx);

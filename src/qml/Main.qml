@@ -81,6 +81,12 @@ Kirigami.ApplicationWindow {
         property real folderPaneWidth: 220
         // Compose is the one view offered both ways; everything else is a tab.
         property bool composeInWindow: false
+        // The composer's editor/quote-preview divider (deferred quotes), one
+        // per composer kind — replying is mostly writing, forwarding mostly
+        // checking what goes out, so the two earn different splits.
+        // 0 = never dragged, use the default.
+        property real composeQuoteSplitReply: 0
+        property real composeQuoteSplitForward: 0
         // Definable shortcuts (Look settings); QKeySequence strings.
         property string shortcutDelete: "Del"
         property string shortcutJunk: "J"
@@ -421,6 +427,8 @@ Kirigami.ApplicationWindow {
             composeSheet().openReply(context.replyData(replyAll)))
         w.forwardRequested.connect(() =>
             composeSheet().openForward(context.forwardData()))
+        w.forwardAsAttachmentRequested.connect(() =>
+            composeSheet().openForward(context.forwardAsAttachmentData()))
         addTab(w)
     }
 
@@ -664,6 +672,23 @@ Kirigami.ApplicationWindow {
             text: "Not spam"
             icon.name: "mail-mark-notjunk"
             onTriggered: messageList.requestNotSpam()
+        }
+        QQC2.MenuSeparator {}
+        // The full-fidelity forward: the original bytes as a message/rfc822
+        // attachment — every image, attachment and signature intact, nothing
+        // stripped or re-rendered. Acts on the open message, which a
+        // right-click follows in practice; a multi-row selection has no
+        // single message to attach.
+        QQC2.MenuItem {
+            text: "Forward as attachment"
+            icon.name: "mail-forward"
+            enabled: messageMenu.rowCount === 1
+                     && Mail.messageModel.uidAt(messageMenu.rows[0]) === messageList.openedUid
+            onTriggered: {
+                const r = Mail.forwardAsAttachmentData()
+                if (r.subject !== undefined)
+                    composeSheet().openForward(r)
+            }
         }
         QQC2.MenuSeparator {}
         QQC2.MenuItem {
@@ -3403,6 +3428,8 @@ Kirigami.ApplicationWindow {
                             QQC2.SplitView.minimumWidth: Kirigami.Units.gridUnit * 18
                             onReplyRequested: replyAll => composeSheet().openReply(Mail.replyData(replyAll))
                             onForwardRequested: composeSheet().openForward(Mail.forwardData())
+                            onForwardAsAttachmentRequested:
+                                composeSheet().openForward(Mail.forwardAsAttachmentData())
                         }
                         }
                     }

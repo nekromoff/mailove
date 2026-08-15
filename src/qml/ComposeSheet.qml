@@ -5,6 +5,7 @@ import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Dialogs
 import QtQuick.Layouts
+import QtWebEngine
 import org.kde.kirigami as Kirigami
 import Mailove.Core
 
@@ -197,11 +198,77 @@ Item {
                 return
             }
         }
+        // A large draft still streaming in is completed synchronously first —
+        // a send must never carry half a body.
+        docHandler.flushQuoteStream()
         sending = true
         Mail.sendMail(toField.text, ccField.text, bccField.text,
                       subjectField.text, bodyEdit.text, attachments,
-                      pgpSign, pgpEncrypt)
+                      pgpSign, pgpEncrypt, resolvedAppendQuote(), appendStrip)
     }
+
+    /// The deferred quote as the send should carry it: with remote off the
+    /// strip runs C++-side (appendStrip); with remote on, images that
+    /// finished prefetching are swapped to local files so they get embedded.
+    /// Never both — embedding into a quote about to be stripped would smuggle
+    /// the images past the user's remote-off decision.
+    function resolvedAppendQuote() {
+        if (appendQuote.length === 0 || appendStrip)
+            return appendQuote
+        return docHandler.embedFetchedImages(appendQuote)
+    }
+
+    /// Draft saves read the body too, so they need the same completed body —
+    /// and the deferred quote goes into the draft just like into a send.
+    function saveDraftNow() {
+        docHandler.flushQuoteStream()
+        Mail.saveDraft(toField.text, ccField.text, bccField.text,
+                       subjectField.text, bodyEdit.text, attachments,
+                       sourceDraftUid, pgpSign, pgpEncrypt, resolvedAppendQuote(), appendStrip)
+    }
+
+    /// The quoted original of a reply/forward too heavy for the editor: held
+    /// here untouched and appended to the outgoing message by C++ at send or
+    /// draft-save time. The banner above the body says so; nothing about it
+    /// lives in the document, so there is no placeholder text to accidentally
+    /// edit or send.
+    property string appendQuote: ""
+    property bool appendStrip: false
+    /// Full-fidelity read-only rendering of appendQuote: a mailove: URL into
+    /// the viewer's sandboxed pipeline, shown in the WebEngine preview pane —
+    /// the user writes against what they are quoting without the editor
+    /// paying for the HTML. The slot is the scheme-handler context serving
+    /// it; this sheet owns it and must release it when done.
+    property string quotePreviewUrl: ""
+    property real quotePreviewSlot: 0
+    /// User-adjustable preview height (the splitter above the pane). Set per
+    /// open from the persisted divider position of this composer kind —
+    /// reply and forward each remember their own; the release handler writes
+    /// drags back to the matching setting.
+    property real quotePreviewHeight: Kirigami.Units.gridUnit * 12
+    function savedPreviewHeight() {
+        const saved = !ui ? 0
+            : titleBase === "Forward" ? ui.composeQuoteSplitForward
+                                      : ui.composeQuoteSplitReply
+        return saved > 0 ? saved : Kirigami.Units.gridUnit * 12
+    }
+
+    function releasePreview() {
+        if (quotePreviewSlot > 0)
+            Mail.releaseQuotePreview(quotePreviewSlot)
+        quotePreviewSlot = 0
+        quotePreviewUrl = ""
+    }
+
+    /// The banner's "Don't include": drop the deferred original entirely —
+    /// the send carries only what is in the editor. An inline quote needs no
+    /// such button; it sits in the editor and deletes like any other text.
+    function clearAppendQuote() {
+        appendQuote = ""
+        appendStrip = false
+        releasePreview()
+    }
+    Component.onDestruction: releasePreview()
 
     /// Set while closing deliberately (sent, draft saved, discard confirmed),
     /// so close() lets it through instead of asking again.
@@ -224,9 +291,10 @@ Item {
             cc: ccField.text,
             bcc: bccField.text,
             subject: subjectField.text,
-            // Read back through the editor: TextArea re-serializes rich text,
-            // so comparing against this (not the HTML we assigned) is stable.
-            body: bodyEdit.text,
+            // The document's revision counter, not its text: reading
+            // bodyEdit.text re-serializes the whole rich-text document,
+            // which on a newsletter-sized quote blocks the GUI for ~1s.
+            bodyRevision: docHandler.documentRevision(),
             attachCount: attachments.length
         }
     }
@@ -237,7 +305,11 @@ Item {
             || ccField.text !== openedState.cc
             || bccField.text !== openedState.bcc
             || subjectField.text !== openedState.subject
-            || bodyEdit.text !== openedState.body
+            // A quote still streaming bumps the revision without the user
+            // touching anything; the fields above still catch real edits,
+            // and the revision baseline is re-taken when the stream ends.
+            || (!docHandler.quoteStreaming
+                && docHandler.documentRevision() !== openedState.bodyRevision)
             || attachments.length !== openedState.attachCount
     }
 
@@ -284,6 +356,10 @@ Item {
     }
 
     function openNew() {
+        docHandler.cancelQuoteStream() // reused sheet: whatever was streaming is gone
+        appendQuote = ""
+        appendStrip = false
+        releasePreview()
         sourceDraftUid = -1
         titleBase = "Compose"
         toField.text = ""
@@ -312,6 +388,10 @@ Item {
     function openDraft(d) {
         if (!d || d.subject === undefined)
             return
+        docHandler.cancelQuoteStream() // reused sheet: whatever was streaming is gone
+        appendQuote = ""
+        appendStrip = false
+        releasePreview()
         titleBase = "Draft"
         toField.text = d.to
         ccField.text = d.cc
@@ -323,41 +403,80 @@ Item {
         content.ccExpanded = d.cc.length > 0 || d.bcc.length > 0
         focusBodyOnOpen = true
         present()
+        // A large draft arrives split: the body above was empty and the real
+        // content streams in without freezing the sheet (it stays editable —
+        // just slower, which the status line has warned about).
+        if (d.bodyChunks && d.bodyChunks.length > 0)
+            docHandler.startQuoteStream(d.bodyChunks, false)
     }
 
     /// r = Mail.replyData(): {to, cc, subject, body} — empty when no message.
     function openReply(r) {
         if (!r || r.to === undefined)
             return
+        const t0 = Date.now()
         sourceDraftUid = -1
         titleBase = "Reply"
         toField.text = r.to
         ccField.text = r.cc
         bccField.text = ""
         subjectField.text = r.subject
+        const t1 = Date.now()
         bodyEdit.text = r.body
+        const t2 = Date.now()
         attachments = []
         // Reveal Cc/Bcc when a reply pre-fills Cc, so it isn't hidden.
         content.ccExpanded = r.cc.length > 0
         focusBodyOnOpen = true
         present()
+        startQuote(r)
+        console.log("openReply: fields=" + (t1 - t0) + "ms bodyAssign=" + (t2 - t1)
+                    + "ms present=" + (Date.now() - t2) + "ms body=" + r.body.length + " chars")
     }
 
-    /// r = Mail.forwardData(): {to, cc, subject, body} — empty when no message.
+    /// Takes over a reply/forward's deferred quote (or clears it). A small
+    /// forward with allowed remote images streams into the editor while they
+    /// download; a deferred forward prefetches them in the background so the
+    /// send can embed them.
+    function startQuote(r) {
+        docHandler.cancelQuoteStream()
+        releasePreview()
+        appendQuote = r.appendQuote ? r.appendQuote : ""
+        appendStrip = r.appendStrip === true
+        quotePreviewUrl = r.quotePreviewUrl ? r.quotePreviewUrl : ""
+        quotePreviewSlot = r.quotePreviewSlot ? r.quotePreviewSlot : 0
+        quotePreviewHeight = savedPreviewHeight() // per composer kind
+        if (r.quoteChunks && r.quoteChunks.length > 0)
+            docHandler.startQuoteStream(r.quoteChunks, false)
+        if (appendQuote.length > 0 && r.prefetchImages === true)
+            docHandler.prefetchQuoteImages(appendQuote)
+    }
+
+    /// r = Mail.forwardData(): {to, cc, subject, body, attachments} — empty
+    /// when no message. The original's attachments come along as temp-file
+    /// URLs, already listed in the tray and removable like any other.
     function openForward(r) {
         if (!r || r.to === undefined)
             return
+        const t0 = Date.now()
         sourceDraftUid = -1
         titleBase = "Forward"
         toField.text = r.to
         ccField.text = r.cc
         bccField.text = ""
         subjectField.text = r.subject
+        const t1 = Date.now()
         bodyEdit.text = r.body
-        attachments = []
+        const t2 = Date.now()
+        attachments = r.attachments ? r.attachments : []
+        const t3 = Date.now()
         content.ccExpanded = r.cc.length > 0
         focusBodyOnOpen = false // recipient is still to be chosen
         present()
+        startQuote(r)
+        console.log("openForward: fields=" + (t1 - t0) + "ms bodyAssign=" + (t2 - t1)
+                    + "ms attachAssign=" + (t3 - t2) + "ms present=" + (Date.now() - t3)
+                    + "ms body=" + r.body.length + " chars")
     }
 
     // Recipient field with autocompletion from previously used addresses.
@@ -617,9 +736,7 @@ Item {
                 // throw the message away if the APPEND failed.
                 onClicked: {
                     discardDialog.close()
-                    Mail.saveDraft(toField.text, ccField.text, bccField.text,
-                                   subjectField.text, bodyEdit.text, sheet.attachments,
-                                   sheet.sourceDraftUid, sheet.pgpSign, sheet.pgpEncrypt)
+                    sheet.saveDraftNow()
                 }
             }
             QQC2.Button {
@@ -667,6 +784,22 @@ Item {
         cursorPosition: bodyEdit.cursorPosition
         selectionStart: bodyEdit.selectionStart
         selectionEnd: bodyEdit.selectionEnd
+        // The streamed quote is part of "as opened", not a user edit — fold
+        // it into the baseline so an untouched composer still closes silently.
+        // Only the body revision: the user may have edited recipients
+        // meanwhile, and those must keep counting as modifications.
+        onQuoteStreamFinished: {
+            if (sheet.openedState)
+                sheet.openedState.bodyRevision = docHandler.documentRevision()
+        }
+        // A streamed draft starts from an empty body, so the first insert
+        // drags the caret (and with it the viewport) toward the end — put it
+        // back on top, but only while it is still riding the end; a user who
+        // has already clicked or typed somewhere keeps their position.
+        onQuoteStreamContentArrived: {
+            if (bodyEdit.cursorPosition === bodyEdit.length)
+                bodyEdit.cursorPosition = 0
+        }
         // A paste that does nothing looks like a broken keyboard; say why.
         onImagePasteFailed: message => {
             sendErrorDialog.heading = "Image not pasted"
@@ -1007,9 +1140,32 @@ Item {
             }
         }
 
+        // A deferred quote never enters the document (see appendQuote), so
+        // this banner is what tells the user their content is not lost. As
+        // UI rather than body text it cannot be edited away by accident and
+        // is never part of what gets sent.
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            visible: sheet.appendQuote.length > 0
+            type: Kirigami.MessageType.Information
+            text: "The original message is large — its full content will be included below your text automatically when you send."
+            actions: [
+                Kirigami.Action {
+                    text: "Don't include"
+                    icon.name: "edit-delete"
+                    tooltip: "Send only your own text, without the original message"
+                    onTriggered: sheet.clearAppendQuote()
+                }
+            ]
+        }
+
         QQC2.ScrollView {
+            id: bodyScroll
             Layout.fillWidth: true
             Layout.fillHeight: true
+            // A hard floor the splitter cannot drag away: the layout shrinks
+            // the preview's preferred height before it touches this.
+            Layout.minimumHeight: Kirigami.Units.gridUnit * 6
             clip: true
             // The editing area is a white View surface on the gray panel.
             Kirigami.Theme.colorSet: Kirigami.Theme.View
@@ -1093,8 +1249,105 @@ Item {
                         // rub out, so Backspace steps back out of the level.
                         if (docHandler.outdentAtBlockStart())
                             event.accepted = true
+                    } else if (event.key === Qt.Key_PageDown
+                               || event.key === Qt.Key_PageUp) {
+                        // TextArea ships no page-key bindings at all; move
+                        // the caret a viewport (minus a strip of continuity)
+                        // and let cursor-following do the scrolling. Shift
+                        // extends the selection, as everywhere else.
+                        const page = Math.max(bodyScroll.height - 40, 40)
+                        const rect = bodyEdit.cursorRectangle
+                        const targetY = event.key === Qt.Key_PageDown
+                            ? rect.y + page : rect.y - page
+                        const pos = bodyEdit.positionAt(
+                            rect.x, Math.max(0, Math.min(targetY, bodyEdit.contentHeight - 1)))
+                        if (event.modifiers & Qt.ShiftModifier)
+                            bodyEdit.moveCursorSelection(pos, TextEdit.SelectCharacters)
+                        else
+                            bodyEdit.cursorPosition = pos
+                        event.accepted = true
                     }
                 }
+            }
+        }
+
+        // Draggable divider between the editor and the quote preview, so the
+        // user decides how much of each they want on screen.
+        Item {
+            visible: sheet.quotePreviewUrl.length > 0
+            Layout.fillWidth: true
+            implicitHeight: visible ? Kirigami.Units.smallSpacing * 2 : 0
+
+            Rectangle {
+                anchors.centerIn: parent
+                width: Kirigami.Units.gridUnit * 3
+                height: 3
+                radius: 1.5
+                color: splitterArea.pressed
+                       ? Kirigami.Theme.highlightColor
+                       : Qt.alpha(Kirigami.Theme.textColor, 0.4)
+            }
+            MouseArea {
+                id: splitterArea
+                anchors.fill: parent
+                anchors.margins: -Kirigami.Units.smallSpacing // easier to grab
+                cursorShape: Qt.SplitVCursor
+                property real pressY: 0
+                property real pressHeight: 0
+                property real maxHeight: 0
+                onPressed: mouse => {
+                    pressY = mapToItem(sheet, 0, mouse.y).y
+                    pressHeight = sheet.quotePreviewHeight
+                    // Only the editor and the preview trade space — the rest
+                    // of the column is fixed. The ceiling is therefore what
+                    // the editor can give up above its floor, measured at
+                    // press time; anything looser squeezes the button row
+                    // out of the bottom of the sheet.
+                    maxHeight = pressHeight
+                        + Math.max(0, bodyScroll.height - Kirigami.Units.gridUnit * 6)
+                }
+                onPositionChanged: mouse => {
+                    if (!pressed)
+                        return
+                    const dy = mapToItem(sheet, 0, mouse.y).y - pressY
+                    // Dragging down grows the editor, shrinks the preview.
+                    sheet.quotePreviewHeight = Math.max(
+                        Kirigami.Units.gridUnit * 3,
+                        Math.min(maxHeight, pressHeight - dy))
+                }
+                onReleased: {
+                    // Remembered across composers, per kind — the next reply
+                    // (or forward) opens with its divider where it was left.
+                    if (!sheet.ui)
+                        return
+                    if (sheet.titleBase === "Forward")
+                        sheet.ui.composeQuoteSplitForward = sheet.quotePreviewHeight
+                    else
+                        sheet.ui.composeQuoteSplitReply = sheet.quotePreviewHeight
+                }
+            }
+        }
+
+        // Read-only preview of a deferred quote, sitting where the quote will
+        // sit in the sent message — below the user's text. Full HTML fidelity
+        // for free: it is not the editor, so it renders through the viewer's
+        // own sandboxed WebEngine pipeline (sanitized, CSP-enforced remote
+        // policy, inline cid: images served from the composer's own slot) with
+        // Chromium's async layout — no GUI cost no matter the size.
+        Item {
+            Layout.fillWidth: true
+            Layout.preferredHeight: visible ? sheet.quotePreviewHeight : 0
+            visible: sheet.quotePreviewUrl.length > 0
+            clip: true
+
+            // Stands in while the splitter drags — and behind the first paint.
+            Rectangle {
+                anchors.fill: parent
+                color: Kirigami.Theme.backgroundColor
+            }
+            SandboxedWebView {
+                anchors.fill: parent
+                url: sheet.quotePreviewUrl.length > 0 ? sheet.quotePreviewUrl : "about:blank"
             }
         }
 
@@ -1104,30 +1357,50 @@ Item {
             id: buttonRow
             Layout.fillWidth: true
             spacing: Kirigami.Units.smallSpacing
+            // Above the preview in stacking order, with its own opaque fill:
+            // the quote preview renders out-of-process, and a mid-resize
+            // frame sized for the old geometry must repaint over panel
+            // background, never over the Send/Save buttons.
+            z: 1
 
-            QQC2.Button {
-                id: saveDraftButton
-                // Discarding now lives on the window's close button, which
-                // closed without asking anyway — this slot is worth more as
-                // the action that keeps the message.
-                text: "Save as draft"
-                icon.name: "document-save"
-                enabled: Mail.hasDraftsFolder && !sheet.sending
-                QQC2.ToolTip.text: Mail.hasDraftsFolder
-                    ? "Store this message in the Drafts folder"
-                    : "No Drafts folder on this account"
-                QQC2.ToolTip.visible: hovered
-                onClicked: Mail.saveDraft(toField.text, ccField.text, bccField.text,
-                                          subjectField.text, bodyEdit.text, sheet.attachments,
-                                          sheet.sourceDraftUid, sheet.pgpSign,
-                                          sheet.pgpEncrypt)
+            Rectangle {
+                anchors.fill: parent
+                anchors.margins: -Kirigami.Units.smallSpacing
+                z: -1
+                color: sheet.panelColor
             }
-            Item { Layout.fillWidth: true } // spacer takes the remaining left space
+
+            // Two equal-stretch halves rather than a width computed from
+            // buttonRow.width — a child sized from its own layout's width is
+            // a rearrange cycle ("Detected recursive rearrange"), and every
+            // aborted pass re-lays the whole sheet out, body editor included.
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 1
+                spacing: 0
+
+                QQC2.Button {
+                    id: saveDraftButton
+                    // Discarding now lives on the window's close button, which
+                    // closed without asking anyway — this slot is worth more
+                    // as the action that keeps the message.
+                    text: "Save as draft"
+                    icon.name: "document-save"
+                    enabled: Mail.hasDraftsFolder && !sheet.sending
+                    QQC2.ToolTip.text: Mail.hasDraftsFolder
+                        ? "Store this message in the Drafts folder"
+                        : "No Drafts folder on this account"
+                    QQC2.ToolTip.visible: hovered
+                    onClicked: sheet.saveDraftNow()
+                }
+                Item { Layout.fillWidth: true } // spacer takes the remaining left space
+            }
 
             // Right half: the Send button, or — while sending — a spinner and
             // "Sending…" label in its place (the button is hidden, not greyed).
             Item {
-                Layout.preferredWidth: (buttonRow.width - buttonRow.spacing * 2) / 2
+                Layout.fillWidth: true
+                Layout.preferredWidth: 1
                 Layout.preferredHeight: sendButton.implicitHeight
 
                 QQC2.Button {

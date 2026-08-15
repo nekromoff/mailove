@@ -7,6 +7,9 @@
 
 #include <QHash>
 #include <QRegularExpression>
+#include <QTextBlock>
+#include <QTextDocument>
+#include <QTextFragment>
 #include <QUrl>
 #include <QUuid>
 
@@ -284,6 +287,153 @@ QList<InlineImage> takeInlineImages(QString &html, const QString &idDomain)
     out += QStringView(html).sliced(copied);
     html = out;
     return images;
+}
+
+QString plainTextWithLinks(const QString &html)
+{
+    // A bare QTextDocument, parse only: resources (images, stylesheets) are
+    // requested at layout time, and nothing here ever lays out — so hostile
+    // markup cannot make this fetch anything.
+    QTextDocument doc;
+    doc.setHtml(html);
+
+    QString out;
+    out.reserve(doc.characterCount() + doc.characterCount() / 8);
+    QString anchorHref;  // href of the anchor span currently open
+    QString anchorText;  // its accumulated visible text
+
+    // The visible text already says where the link goes: a bare URL, the
+    // mailto: of the shown address, or the URL minus its scheme ("www.x.y"
+    // shown for "https://www.x.y"). Printing the target again is noise.
+    // Empty visible text is an image-only link — silent, see the header.
+    auto targetShown = [](const QString &href, const QString &shown) {
+        if (shown.isEmpty() || href == shown)
+            return true;
+        if (href.startsWith(QLatin1String("mailto:")) && href.mid(7) == shown)
+            return true;
+        return href.endsWith(shown) && href.size() - shown.size() <= 8;
+    };
+    auto closeAnchor = [&] {
+        if (anchorHref.isEmpty())
+            return;
+        out += anchorText;
+        if (!targetShown(anchorHref, anchorText.trimmed()))
+            out += QStringLiteral(" (") + anchorHref + QLatin1Char(')');
+        anchorHref.clear();
+        anchorText.clear();
+    };
+
+    for (QTextBlock block = doc.begin(); block != doc.end(); block = block.next()) {
+        for (auto it = block.begin(); !it.atEnd(); ++it) {
+            const QTextFragment fragment = it.fragment();
+            if (!fragment.isValid())
+                continue;
+            QString text = fragment.text();
+            text.replace(QChar::LineSeparator, QLatin1Char('\n')); // <br>
+            const QTextCharFormat format = fragment.charFormat();
+            const QString href = format.isAnchor() ? format.anchorHref() : QString();
+            // One link arrives as several fragments when its text changes
+            // formatting mid-way ("click <b>here</b>") — the URL is emitted
+            // once, where the anchor span ends, not per fragment.
+            if (href != anchorHref)
+                closeAnchor();
+            if (href.isEmpty()) {
+                out += text;
+            } else {
+                anchorHref = href;
+                anchorText += text;
+            }
+        }
+        closeAnchor(); // an anchor ends with its block
+        out += QLatin1Char('\n');
+    }
+    if (!out.isEmpty())
+        out.chop(1); // the loop's trailing block separator
+    return out;
+}
+
+QString flattenMarkdownTables(const QString &markdown)
+{
+    // Row furniture: only pipes, dashes, colons and spaces (separator rows,
+    // empty rows). Anything else starting with a pipe is a row whose cells
+    // may hold content worth keeping.
+    static const QRegularExpression furnitureRe(QStringLiteral("^[|\\-:\\s]*$"));
+    const QStringList lines = markdown.split(QLatin1Char('\n'));
+    QStringList out;
+    int blanks = 0;
+    auto append = [&](const QString &line) {
+        blanks = line.trimmed().isEmpty() ? blanks + 1 : 0;
+        // Dropped furniture merges the blank gaps around it; cap the runs
+        // here so the caller does not need condenseBlankLines() — which
+        // strips trailing whitespace and would eat the hard breaks below.
+        if (blanks <= 2)
+            out.append(line);
+    };
+    for (const QString &line : lines) {
+        const QString trimmed = line.trimmed();
+        if (!trimmed.startsWith(QLatin1Char('|'))) {
+            append(line); // not a table row; pipes mid-text stay untouched
+            continue;
+        }
+        if (furnitureRe.match(trimmed).hasMatch())
+            continue;
+        // Unwrap the cells: non-empty ones joined by a space, as one line —
+        // with a trailing double space, Markdown's hard line break, so
+        // stacked rows render as the separate lines they visually were.
+        // Heading cells ("## …") break out onto lines of their own with
+        // blank lines around them: heading syntax only counts at the start
+        // of a line, glued mid-line it renders as literal hashes.
+        const QStringList cells = trimmed.split(QLatin1Char('|'));
+        QStringList kept;
+        auto flushKept = [&] {
+            if (kept.isEmpty())
+                return;
+            append(kept.join(QLatin1Char(' ')) + QStringLiteral("  "));
+            kept.clear();
+        };
+        // List items land one per cell when a list sat in a table cell —
+        // joined by spaces they degrade to prose, so they too get lines of
+        // their own; consecutive ones re-form the list.
+        static const QRegularExpression listCellRe(
+            QStringLiteral("^([-*+]|\\d{1,3}[.)])\\s"));
+        for (const QString &cell : cells) {
+            const QString content = cell.trimmed();
+            if (content.isEmpty() || furnitureRe.match(content).hasMatch())
+                continue;
+            if (content.startsWith(QLatin1Char('#'))) {
+                flushKept();
+                append(QString());
+                append(content);
+                append(QString());
+            } else if (listCellRe.match(content).hasMatch()) {
+                flushKept();
+                append(content);
+            } else {
+                kept.append(content);
+            }
+        }
+        flushKept();
+    }
+    return out.join(QLatin1Char('\n'));
+}
+
+QString condenseBlankLines(QString text)
+{
+    // Object-replacement characters are where images sat in text extracted
+    // from HTML — invisible-but-not-blank, they defeat the collapse below
+    // and render as nothing (or a stray box). A text rendering has no use
+    // for them anywhere in a line.
+    text.remove(QChar::ObjectReplacementCharacter);
+    // Lines holding only invisible ink become truly empty, so they count
+    // toward the run: whitespace, no-break spaces (the &nbsp; spacer lines
+    // of layout-table mail), zero-width spaces and joiners, BOMs.
+    static const QRegularExpression invisibleTail(QStringLiteral(
+        "[ \\t\\x{00A0}\\x{200B}\\x{200C}\\x{2060}\\x{FEFF}]+\\n"));
+    text.replace(invisibleTail, QStringLiteral("\n"));
+    // Then anything past two consecutive empty lines collapses.
+    static const QRegularExpression blankRuns(QStringLiteral("\\n{4,}"));
+    text.replace(blankRuns, QStringLiteral("\n\n\n"));
+    return text;
 }
 
 } // namespace MimeUtils

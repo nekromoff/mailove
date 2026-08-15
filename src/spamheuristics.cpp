@@ -429,10 +429,10 @@ const QList<Brand> &brands()
         {QLatin1String("paypal"), QLatin1String("paypal.com paypal.co.uk paypal-communication.com")},
         {QLatin1String("apple"), QLatin1String("apple.com icloud.com apple.co cdn-apple.com")},
         {QLatin1String("icloud"), QLatin1String("apple.com icloud.com")},
-        {QLatin1String("microsoft"), QLatin1String("microsoft.com microsoftonline.com live.com aka.ms msftauth.net")},
-        {QLatin1String("outlook"), QLatin1String("microsoft.com outlook.com live.com")},
+        {QLatin1String("microsoft"), QLatin1String("microsoft.com microsoftonline.com live.com aka.ms msftauth.net office365.com office.net office.com")},
+        {QLatin1String("outlook"), QLatin1String("microsoft.com outlook.com live.com office365.com office.net office.com")},
         {QLatin1String("onedrive"), QLatin1String("microsoft.com")},
-        {QLatin1String("office365"), QLatin1String("microsoft.com microsoftonline.com")},
+        {QLatin1String("office365"), QLatin1String("microsoft.com microsoftonline.com office365.com office.net office.com")},
         {QLatin1String("amazon"), QLatin1String("amazon.com amazon.co.uk amazon.de amazonses.com amzn.to a.co")},
         {QLatin1String("netflix"), QLatin1String("netflix.com nflx.it nflxext.com")},
         {QLatin1String("google"), QLatin1String("google.com gmail.com youtube.com c.gle goo.gle goo.gl googleusercontent.com googlemail.com withgoogle.com")},
@@ -449,7 +449,7 @@ const QList<Brand> &brands()
         {QLatin1String("binance"), QLatin1String("binance.com")},
         {QLatin1String("revolut"), QLatin1String("revolut.com")},
         {QLatin1String("wise"), QLatin1String("wise.com transferwise.com")},
-        {QLatin1String("stripe"), QLatin1String("stripe.com")},
+        {QLatin1String("stripe"), QLatin1String("stripe.com stripecdn.com")},
         {QLatin1String("steam"), QLatin1String("steampowered.com valvesoftware.com")},
         {QLatin1String("spotify"), QLatin1String("spotify.com")},
         {QLatin1String("ebay"), QLatin1String("ebay.com ebay.co.uk ebay.de ebay.to ebayimg.com")},
@@ -643,6 +643,80 @@ QString encodedWordCharset(const QString &value)
     static const QRegularExpression re(QStringLiteral("=\\?([A-Za-z0-9_.:-]+)\\?[BbQq]\\?"));
     const auto m = re.match(value);
     return m.hasMatch() ? m.captured(1).toLower() : QString();
+}
+
+/// RFC 2047 encoded-words, decoded to the text the reader sees.
+///
+/// The scorer parses the raw head, and any header with a non-ASCII character
+/// arrives as "=?charset?B?...?=" — so without this, every rule that judges a
+/// subject or a display name was judging base64. A Cyrillic-homoglyph subject
+/// was *invisible* to the homoglyph rule, which is precisely the mail that
+/// rule exists for; measured over a real junk folder, subject-confusable had
+/// never fired once.
+///
+/// Deliberately tolerant, like parseHead(): spam is frequently malformed, and
+/// refusing to decode it is a way of not noticing it. Anything that fails to
+/// decode is left as it was, which can only cost a rule that would have fired.
+///
+/// Charsets: UTF-8 and ASCII are decoded properly; everything else falls back
+/// to Latin-1, because Qt 6 ships no legacy codecs. That is mojibake for a
+/// genuine gb2312 subject, but the safe kind: high bytes stay non-ASCII (which
+/// is what charset-mismatch needs to know) and the mojibake is all Latin
+/// script, so the confusable rules — which require two scripts inside one
+/// word — cannot misfire on it.
+QString decodeEncodedWords(const QString &raw)
+{
+    if (!raw.contains(QLatin1String("=?")))
+        return raw;
+    static const QRegularExpression wordRe(
+        QStringLiteral("=\\?([A-Za-z0-9_.:-]+)\\?([BbQq])\\?([^? \\t]*)\\?="));
+    QString out;
+    qsizetype last = 0;
+    bool prevWasWord = false;
+    auto it = wordRe.globalMatch(raw);
+    while (it.hasNext()) {
+        const auto m = it.next();
+        const QString between = raw.mid(last, m.capturedStart() - last);
+        // Whitespace between two encoded-words is transport padding, not text
+        // (RFC 2047 §6.2) — a long name is split across words mid-letter, and
+        // keeping the space would break the very word the rules examine.
+        if (!(prevWasWord && between.trimmed().isEmpty()))
+            out += between;
+
+        const QString charset = m.captured(1).toLower();
+        const bool base64 = m.captured(2).at(0).toLower() == QLatin1Char('b');
+        QByteArray bytes;
+        if (base64) {
+            bytes = QByteArray::fromBase64(m.captured(3).toLatin1());
+        } else {
+            // Q encoding: quoted-printable with '_' standing for space.
+            const QByteArray q = m.captured(3).toLatin1();
+            for (qsizetype i = 0; i < q.size(); ++i) {
+                if (q.at(i) == '_') {
+                    bytes += ' ';
+                } else if (q.at(i) == '=' && i + 2 < q.size()) {
+                    bool ok = false;
+                    const char c = char(QByteArray(q.constData() + i + 1, 2).toInt(&ok, 16));
+                    if (ok) {
+                        bytes += c;
+                        i += 2;
+                    } else {
+                        bytes += q.at(i);
+                    }
+                } else {
+                    bytes += q.at(i);
+                }
+            }
+        }
+        if (charset.startsWith(QLatin1String("utf-8")) || charset == QLatin1String("utf8"))
+            out += QString::fromUtf8(bytes);
+        else
+            out += QString::fromLatin1(bytes); // see the charset note above
+        last = m.capturedEnd();
+        prevWasWord = true;
+    }
+    out += raw.mid(last);
+    return out;
 }
 
 /// True when the topmost Received line names no resolvable sending host: the
@@ -839,7 +913,12 @@ Score score(const Message &msg, const Context &ctx)
     Score out;
     const QList<Field> fields = parseHead(msg.head);
 
-    const QString fromValue = firstValue(fields, QLatin1String("from"));
+    // Decoded first: everything below that reads a display name or a subject
+    // must judge what the reader sees, not the encoded-word transport form.
+    // The addr-spec side is unaffected — addresses are never encoded, and the
+    // last angle-addr is the last angle-addr in either form.
+    const QString fromValue =
+        decodeEncodedWords(firstValue(fields, QLatin1String("from")));
     const QString fromAddr = addressOf(fromValue);
     const QString fromOrg = organizationalDomainOf(fromAddr);
     const QString displayName = displayNameOf(fromValue);
@@ -1217,7 +1296,11 @@ Score score(const Message &msg, const Context &ctx)
     }
 
     // --- Subject -------------------------------------------------------
-    const QString subject = firstValue(fields, QLatin1String("subject"));
+    // The raw value is kept alongside the decoded one for exactly one reader:
+    // charset-mismatch needs the encoded-word's declared charset, and decoding
+    // erases the declaration.
+    const QString rawSubject = firstValue(fields, QLatin1String("subject"));
+    const QString subject = decodeEncodedWords(rawSubject);
     if (!subject.isEmpty()) {
         // Bidi overrides let a subject render as something other than what it
         // says. There is no legitimate use of these in a subject line.
@@ -1230,6 +1313,14 @@ Score score(const Message &msg, const Context &ctx)
                 break;
             }
         }
+        // Deliberate: this can pair with display-name-confusable (30+25), and
+        // zero-width-obfuscation can fire in both the From line and here
+        // (25+25) — the only combinations of non-decisive rules that reach the
+        // threshold. Both are the same trick executed twice, and a sender who
+        // obfuscates their name AND their subject has answered the question of
+        // intent; ordinary multilingual mail cannot produce either pair, since
+        // each side requires mixing scripts INSIDE one word or hiding
+        // invisible characters inside one.
         if (hasConfusableWord(subject)) {
             hit("subject-confusable", 25,
                 QStringLiteral("Subject mixes alphabets within a word — a common way to "
@@ -1258,13 +1349,17 @@ Score score(const Message &msg, const Context &ctx)
         // to do it is that the raw words would be read by something on the way.
         // Only legacy charsets count: UTF-8 encoded-words around ASCII are
         // written by ordinary mail software all the time.
-        const QString charset = encodedWordCharset(subject);
+        const QString charset = encodedWordCharset(rawSubject);
         static const QSet<QString> legacy{
             QStringLiteral("gb2312"), QStringLiteral("gbk"),   QStringLiteral("big5"),
             QStringLiteral("koi8-r"), QStringLiteral("koi8-u"), QStringLiteral("euc-kr"),
             QStringLiteral("iso-2022-jp"), QStringLiteral("windows-1251"),
         };
         if (legacy.contains(charset)) {
+            // Over the DECODED text. The raw form of an encoded word is ASCII
+            // by construction, so testing it answered yes for every gb2312
+            // subject including genuinely Chinese ones — the rule as first
+            // written would have fired on ordinary mail in its own language.
             bool ascii = true;
             for (const QChar c : subject) {
                 if (c.unicode() > 127) {
@@ -1318,13 +1413,18 @@ Score score(const Message &msg, const Context &ctx)
     }
 
     // --- Bulk mail shape -----------------------------------------------
+    // Read by the link rules below, where "this is list mail" changes what a
+    // click-tracked link means.
+    //
+    // Deliberately absent: "bulk mail without a List-Unsubscribe" as a rule of
+    // its own. Measured over a real mailbox it fired on 1.9% of ordinary mail
+    // and 0% of junk — spam does not claim List-Id at all, while old but
+    // legitimate notification systems send Precedence: bulk with no
+    // unsubscribe header. A rule that fires only on ham is not weak, it is
+    // inverted.
     const bool listId = hasField(fields, QLatin1String("list-id"));
     const bool unsub = hasField(fields, QLatin1String("list-unsubscribe"));
-    const QString precedence = firstValue(fields, QLatin1String("precedence")).toLower();
-    if ((listId || precedence == QLatin1String("bulk")) && !unsub) {
-        hit("bulk-no-unsubscribe", 10,
-            QStringLiteral("Sent as bulk mail but offers no List-Unsubscribe header"));
-    }
+    const bool listMail = listId || unsub;
 
     // --- Attachments ----------------------------------------------------
     // Only reachable once a body has been parsed; at list-build time the head
@@ -1479,8 +1579,17 @@ Score score(const Message &msg, const Context &ctx)
                 | QRegularExpression::DotMatchesEverythingOption);
         static const QRegularExpression domainTextRe(
             QStringLiteral("^(?:https?://)?([A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)+)/?$"));
+        // Not in list mail. Every mailing platform rewrites its links through
+        // a click tracker, so in a newsletter "the text names one domain, the
+        // href another" is how the mail was *built*, not a deception: measured
+        // over a real inbox this pair of rules was 82%% of all residual noise
+        // (gov.uk mail through Brevo's tracker, and so on), against zero
+        // catches in the junk corpus that carried list headers. A phish that
+        // adds fake list headers to buy this exemption gives up nothing it
+        // was caught by — the password-form, attachment and credential-trick
+        // rules do not read it.
         auto it = anchorRe.globalMatch(msg.html);
-        while (it.hasNext()) {
+        while (!listMail && it.hasNext()) {
             const auto m = it.next();
             const QString shown = visibleText(m.captured(2));
             const auto dm = domainTextRe.match(shown);
@@ -1525,7 +1634,7 @@ Score score(const Message &msg, const Context &ctx)
                 }
             }
             const QString linkOrg = orgOfDomain(host);
-            if (isShortener(linkOrg) && !listId && !sameBrandFamily(fromOrg, linkOrg)) {
+            if (isShortener(linkOrg) && !listMail && !sameBrandFamily(fromOrg, linkOrg)) {
                 // Bulk senders use shorteners constantly, so this only counts
                 // outside list mail, and even there it can never mark alone.
                 linkHit("url-shortener", 8,
@@ -1535,7 +1644,7 @@ Score score(const Message &msg, const Context &ctx)
             // A brand's name in the part of the host anyone can choose:
             // "paypal.com.secure-login.test" is not PayPal, and the label that
             // decides that is the registrable domain, not the prettiest one.
-            if (host != linkOrg) {
+            if (host != linkOrg && !listMail) { // list mail: see the anchor loop
                 const QString subdomain = host.left(host.size() - linkOrg.size());
                 if (const Brand *b = brandClaimedBy(subdomain);
                     b && !brandOwns(*b, linkOrg) && !linkBelongsToSender(host)) {

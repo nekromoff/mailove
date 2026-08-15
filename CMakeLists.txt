@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailove VERSION 2.5 LANGUAGES CXX)
+project(mailove VERSION 2.6 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -123,6 +123,7 @@ set_source_files_properties(src/qml/NewKeyDialog.qml PROPERTIES QT_RESOURCE_ALIA
 set_source_files_properties(src/qml/Spinner.qml PROPERTIES QT_RESOURCE_ALIAS Spinner.qml)
 set_source_files_properties(src/qml/HoverToolTip.qml PROPERTIES QT_RESOURCE_ALIAS HoverToolTip.qml)
 set_source_files_properties(src/qml/SelectableValue.qml PROPERTIES QT_RESOURCE_ALIAS SelectableValue.qml)
+set_source_files_properties(src/qml/SandboxedWebView.qml PROPERTIES QT_RESOURCE_ALIAS SandboxedWebView.qml)
 set_source_files_properties(src/qml/ExpandableValue.qml PROPERTIES QT_RESOURCE_ALIAS ExpandableValue.qml)
 
 qt_add_qml_module(mailove
@@ -140,6 +141,7 @@ qt_add_qml_module(mailove
         src/qml/HoverToolTip.qml
         src/qml/Spinner.qml
         src/qml/SelectableValue.qml
+        src/qml/SandboxedWebView.qml
         src/qml/ExpandableValue.qml
 )
 

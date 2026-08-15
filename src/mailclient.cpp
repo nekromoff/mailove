@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include "mailclient.h"
+#include "documenthandler.h"
 #include "mimeutils.h"
 #include "attachmentstore.h"
 #include "oauthhelper.h"
@@ -13,6 +14,7 @@
 #include "publicsuffixlist.h"
 
 #include <QClipboard>
+#include <QMimeData>
 #include <QDesktopServices>
 #include <QGuiApplication>
 #include <QDir>
@@ -40,7 +42,13 @@
 
 #include <QMimeDatabase>
 
+#include <QTextBlock>
+#include <QTextCursor>
+#include <QTextDocument>
 #include <QTextDocumentFragment>
+#include <QTextFrame>
+#include <QTextImageFormat>
+#include <QTextTable>
 
 #include "viewersecurity.h"
 
@@ -1944,10 +1952,15 @@ std::shared_ptr<KMime::Message> MailClient::composeMessage(
         }
     }
 
+    // Link targets kept — a recipient reading the text alternative must not
+    // lose where "click here" pointed; toPlainText() would drop every href.
+    QString plain = MimeUtils::plainTextWithLinks(bodyHtml);
     // The object-replacement characters are where the images sat: a stand-in
     // the layout needs and the plain-text alternative has no use for.
-    QString plain = QTextDocumentFragment::fromHtml(bodyHtml).toPlainText();
     plain.remove(QChar::ObjectReplacementCharacter);
+    // What a recipient's text-mode client shows — same blank-line cap as
+    // every text rendering of ours.
+    plain = MimeUtils::condenseBlankLines(plain);
 
     auto makeTextPart = [&plain]() {
         auto part = std::make_unique<KMime::Content>();
@@ -2252,9 +2265,34 @@ void MailClient::applyOutgoingCrypto(const std::shared_ptr<KMime::Message> &msg,
                     });
 }
 
+/// Splices a deferred quote into the outgoing HTML, just before </body> so
+/// it lands inside the document like the inline path would have put it. The
+/// remote strip deferred at open time runs here — one parse at the send or
+/// save click instead of a freeze at the open.
+static QString appendQuoteHtml(QString html, QString quote, bool strip)
+{
+    if (quote.isEmpty())
+        return html;
+    QElapsedTimer timer;
+    timer.start();
+    if (strip)
+        quote = DocumentHandler::stripRemoteContent(quote);
+    const QString block =
+        QStringLiteral("<blockquote>") + quote + QStringLiteral("</blockquote>");
+    const qsizetype at = html.lastIndexOf(QLatin1String("</body>"), -1, Qt::CaseInsensitive);
+    if (at >= 0)
+        html.insert(at, block);
+    else
+        html += block;
+    qCDebug(logTrace, "appendQuoteHtml: %lldms, strip=%d, quote=%lld chars",
+            timer.elapsed(), int(strip), static_cast<qint64>(quote.size()));
+    return html;
+}
+
 void MailClient::sendMail(const QString &to, const QString &cc, const QString &bcc,
                           const QString &subject, const QString &html,
-                          const QList<QUrl> &attachments, bool sign, bool encrypt)
+                          const QList<QUrl> &attachments, bool sign, bool encrypt,
+                          const QString &appendQuote, bool appendStrip)
 {
     const bool haveCredential = m_acct.authType != 0
         ? !m_accounts.accessToken().isEmpty()
@@ -2273,8 +2311,9 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &b
         return;
     }
     QStringList toList, ccList, bccList;
-    auto msg = composeMessage(to, cc, bcc, subject, html, attachments, true,
-                              &toList, &ccList, &bccList);
+    auto msg = composeMessage(to, cc, bcc, subject,
+                              appendQuoteHtml(html, appendQuote, appendStrip),
+                              attachments, true, &toList, &ccList, &bccList);
     if (!msg)
         return;
     if (toList.isEmpty()) {
@@ -2327,7 +2366,8 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &b
 void MailClient::saveDraft(const QString &to, const QString &cc, const QString &bcc,
                            const QString &subject, const QString &html,
                            const QList<QUrl> &attachments, qint64 replacesUid,
-                           bool sign, bool encrypt)
+                           bool sign, bool encrypt,
+                           const QString &appendQuote, bool appendStrip)
 {
     if (!connected()) {
         Q_EMIT sendFailed(tr("Cannot save a draft while offline."));
@@ -2340,7 +2380,11 @@ void MailClient::saveDraft(const QString &to, const QString &cc, const QString &
     // Bcc is a header here rather than an envelope field — a draft is not
     // being delivered, and dropping it would lose it when the draft is
     // reopened — which is what the non-strict composeMessage() does with it.
-    auto msg = composeMessage(to, cc, bcc, subject, html, attachments, false);
+    // The deferred quote goes into the draft too — a draft missing the
+    // content it promises to send would be silent data loss.
+    auto msg = composeMessage(to, cc, bcc, subject,
+                              appendQuoteHtml(html, appendQuote, appendStrip),
+                              attachments, false);
     if (!msg)
         return;
 
@@ -2467,6 +2511,320 @@ static QString quotableHtml(QString html)
     return html;
 }
 
+// Chops a big HTML quote into structurally self-contained chunks the
+// composer can insert one frame's budget at a time — see
+// DocumentHandler::startQuoteStream. Cuts happen between top-level elements
+// and after any table row: at a cut, every element still open (the
+// newsletter's wrapper chain — centering table, row, cell, content table) is
+// closed to finish the chunk and reopened, with its original attributes, at
+// the head of the next, so each chunk parses standalone and the wrapper
+// formatting carries across. When no safe cut exists the quote is one chunk.
+static QStringList splitQuoteHtml(const QString &html, qsizetype budget)
+{
+    static const QRegularExpression tagRe(
+        QStringLiteral("<(/?)([a-zA-Z][a-zA-Z0-9]*)((?:[^>\"']|\"[^\"]*\"|'[^']*')*)>"));
+    // Elements that never close; treating them as opens would corrupt the
+    // open-tag stack.
+    static const QSet<QString> voidTags = {
+        QStringLiteral("area"),  QStringLiteral("base"),  QStringLiteral("br"),
+        QStringLiteral("col"),   QStringLiteral("embed"), QStringLiteral("hr"),
+        QStringLiteral("img"),   QStringLiteral("input"), QStringLiteral("link"),
+        QStringLiteral("meta"),  QStringLiteral("param"), QStringLiteral("source"),
+        QStringLiteral("track"), QStringLiteral("wbr")};
+
+    struct OpenTag { QString name; QString tag; };
+    QList<OpenTag> stack;
+    QStringList chunks;
+    qsizetype chunkStart = 0;
+    QString reopen; // open tags carried over from the previous chunk's cut
+
+    auto emitChunk = [&](qsizetype end) {
+        QString chunk = reopen + html.sliced(chunkStart, end - chunkStart);
+        for (auto it = stack.crbegin(); it != stack.crend(); ++it)
+            chunk += QStringLiteral("</") + it->name + QLatin1Char('>');
+        chunks.append(chunk);
+        chunkStart = end;
+        reopen.clear();
+        for (const OpenTag &open : std::as_const(stack))
+            reopen += open.tag;
+    };
+
+    auto matches = tagRe.globalMatch(html);
+    while (matches.hasNext()) {
+        const auto match = matches.next();
+        const QString name = match.captured(2).toLower();
+        const bool closing = !match.captured(1).isEmpty();
+        const bool selfClosing = match.captured(3).endsWith(QLatin1Char('/'));
+        if (voidTags.contains(name) || selfClosing)
+            continue;
+        if (!closing) {
+            stack.append({name, match.captured(0)});
+            continue;
+        }
+        // Pop to the matching open, tolerating the misnesting real mail has.
+        for (qsizetype i = stack.size() - 1; i >= 0; --i) {
+            if (stack.at(i).name == name) {
+                stack.remove(i, stack.size() - i);
+                break;
+            }
+        }
+        const qsizetype cut = match.capturedEnd();
+        if (cut - chunkStart + reopen.size() < budget)
+            continue;
+        // Rows are the natural section boundary of table-built mail; between
+        // top-level siblings (empty stack) anything may cut.
+        if (name == QLatin1String("tr") || stack.isEmpty())
+            emitChunk(cut);
+    }
+    if (chunkStart < html.size())
+        chunks.append(reopen + html.sliced(chunkStart));
+    return chunks;
+}
+
+namespace
+{
+/// cid → the part carrying it, for a whole MIME tree.
+void indexContentIds(KMime::Content *node, QHash<QString, KMime::Content *> *out)
+{
+    if (const auto *cid = std::as_const(*node).contentID(); cid && !cid->identifier().isEmpty())
+        out->insert(QString::fromLatin1(cid->identifier()), node);
+    const auto children = node->contents();
+    for (KMime::Content *child : children)
+        indexContentIds(child, out);
+}
+
+/// Points a message's cid: images back at files the composer can render.
+///
+/// A pasted image in a saved draft — or an inline image in a message being
+/// replied to or forwarded — is an ordinary cid: part, and the compose editor
+/// cannot resolve a cid: — left alone they come back as empty boxes (or are
+/// stripped by quotableHtml), and are gone for good on the next save or send.
+/// Writing them back out gives the composer local-file references, which
+/// composeMessage() turns into parts again on the way out.
+QString restoreDraftImages(QString html, KMime::Content *root)
+{
+    static const QRegularExpression cidRe(
+        QStringLiteral("(\\bsrc\\s*=\\s*)([\"'])cid:([^\"']+)\\2"),
+        QRegularExpression::CaseInsensitiveOption);
+    if (!root || !html.contains(QLatin1String("cid:"), Qt::CaseInsensitive))
+        return html;
+
+    QHash<QString, KMime::Content *> parts;
+    indexContentIds(root, &parts);
+    if (parts.isEmpty())
+        return html;
+
+    // Same reasoning as MessagePresenter::openAttachment: a private 0700
+    // directory with an unpredictable name, living as long as the process, so
+    // a draft left open all afternoon still has its images.
+    static QTemporaryDir tempDir(QDir::tempPath() + QStringLiteral("/mailove-draft-images-XXXXXX"));
+    if (!tempDir.isValid())
+        return html;
+
+    QMimeDatabase mimeDb;
+    QHash<QString, QString> written; // cid → file URL, for an image used twice
+    QString out;
+    out.reserve(html.size());
+    qsizetype copied = 0;
+    auto matches = cidRe.globalMatch(html);
+    while (matches.hasNext()) {
+        const auto match = matches.next();
+        const QString cid = match.captured(3);
+        QString url = written.value(cid);
+        if (url.isEmpty()) {
+            KMime::Content *part = parts.value(cid);
+            if (!part)
+                continue;
+            const auto *ct = std::as_const(*part).contentType();
+            const QByteArray mimeType = ct ? ct->mimeType() : QByteArray();
+            // Images only. Anything else a cid: may point at (a stylesheet, a
+            // part of a calendar invitation) is not something the editor
+            // renders, and writing it out would gain nothing.
+            if (!mimeType.startsWith("image/"))
+                continue;
+            const QString suffix =
+                mimeDb.mimeTypeForName(QString::fromLatin1(mimeType)).preferredSuffix();
+            const QString path = tempDir.filePath(
+                QStringLiteral("draft-%1.%2")
+                    .arg(written.size() + 1)
+                    .arg(suffix.isEmpty() ? QStringLiteral("png") : suffix));
+            QFile file(path);
+            if (!file.open(QIODevice::WriteOnly))
+                continue;
+            file.write(part->decodedBody());
+            file.close();
+            url = QUrl::fromLocalFile(path).toString();
+            written.insert(cid, url);
+        }
+        out += QStringView(html).sliced(copied, match.capturedStart() - copied);
+        out += match.captured(1) + QLatin1Char('"') + url + QLatin1Char('"');
+        copied = match.capturedEnd();
+    }
+    if (written.isEmpty())
+        return html;
+    out += QStringView(html).sliced(copied);
+    return out;
+}
+} // namespace
+
+/// The original message quoted for a reply or forward body — full HTML
+/// fidelity either way, in one of two shapes:
+///
+/// Small quote: returned whole, remote content already stripped when not
+/// allowed; the caller embeds it in the body and the composer lays it out in
+/// one affordable pass.
+///
+/// Big quote (or one carrying remote images the user allowed): returns empty
+/// and hands the prepared HTML back via \a appendQuote instead. It never
+/// enters the editor — the composer shows a banner and the quote is appended
+/// to the outgoing HTML at send/draft time (appendQuoteHtml), with
+/// \a appendStrip saying whether the remote strip still has to run then.
+/// doc/COMPOSER_ROADMAP.md records why the editor cannot afford these and
+/// where this is headed.
+QString MailClient::quotedBody(MessageContext *ctx, bool forward, QString *appendQuote,
+                               bool *appendStrip, QStringList *chunks) const
+{
+    QElapsedTimer timer;
+    timer.start();
+    constexpr qsizetype maxInlineQuote = 64 * 1024;
+    *appendStrip = false;
+
+    // No HTML part — or the reader switched this message's view to plain
+    // text, which the quote follows: quoting HTML the reader deliberately
+    // chose not to look at would be quoting a message they did not read.
+    // Plain text lays out for next to nothing, so it always goes inline.
+    if (ctx->m_htmlBody.isEmpty() || ctx->m_quotePlain) {
+        QString text = ctx->m_textBody.trimmed();
+        if (text.isEmpty() && !ctx->m_htmlBody.isEmpty()) {
+            // HTML-only message read as text: extract, capped like the
+            // viewer's own text view, link targets kept.
+            text = MimeUtils::plainTextWithLinks(ctx->m_htmlBody.left(500000)).trimmed();
+        }
+        text = MimeUtils::condenseBlankLines(text);
+        const QString quoted = text.toHtmlEscaped()
+            .replace(QLatin1Char('\n'), QLatin1String("<br>"));
+        qCDebug(logTrace, "quotedBody: text quote%s, %lld chars",
+                ctx->m_quotePlain ? " (viewer in text mode)" : "",
+                static_cast<qint64>(quoted.size()));
+        return quoted;
+    }
+
+    // cid: images become file: references the editor can render (and
+    // composeMessage() re-embeds on send) — cheap, so done up front whole.
+    QString html = restoreDraftImages(
+        ctx->m_htmlBody, ctx->m_decrypted ? ctx->m_decrypted.get() : ctx->m_message.get());
+    const qint64 restoreMs = timer.restart();
+    html = quotableHtml(html);
+
+    // Reply and forward part ways over remote images — a reply quotes for
+    // context, a forward IS the content:
+    //
+    // Small reply quote: inline, remote references stripped no matter what
+    // the viewer's remote toggle said. The strip is editor safety as much as
+    // policy: an http: src reaching the editor is loaded by Qt Quick's
+    // render thread, which blocks scene-graph sync for seconds and touches
+    // the QML engine off-thread. Structure and text keep full fidelity.
+    //
+    // Small forward quote with remote images the user allowed: streamed into
+    // the editor in chunks while the images download — each chunk rewritten
+    // to local file: references before insertion
+    // (DocumentHandler::resolveChunkImages), which composeMessage() embeds
+    // as cid: parts on send. The recipient sees the pictures without
+    // allowing remote content. With remote off, a forward strips like a
+    // reply: the user declined this sender's remote content, and quoting is
+    // not the moment to fetch it after all ("Forward as attachment" is the
+    // full-fidelity route there).
+    //
+    // A big quote must not enter the editor at all (laying it out freezes
+    // the GUI on open, and typing into a document sharing space with
+    // hundreds of tables costs ~150ms a keystroke): it is stashed whole and
+    // appended at send/draft time, with the composer showing a banner and a
+    // plain-text preview meanwhile.
+    const bool mayHoldRemoteImages =
+        html.contains(QLatin1String("<img"), Qt::CaseInsensitive)
+        && html.contains(QLatin1String("http"), Qt::CaseInsensitive);
+    if (html.size() <= maxInlineQuote) {
+        if (forward && ctx->m_remoteAllowed && mayHoldRemoteImages) {
+            *chunks = splitQuoteHtml(html, 2 * 1024);
+            qCDebug(logTrace,
+                    "quotedBody: forward image stream, restoreImages=%lldms, "
+                    "%lld chars -> %lld chunks",
+                    restoreMs, static_cast<qint64>(html.size()),
+                    static_cast<qint64>(chunks->size()));
+            return QString();
+        }
+        if (!ctx->m_remoteAllowed || mayHoldRemoteImages)
+            html = DocumentHandler::stripRemoteContent(html);
+        qCDebug(logTrace,
+                "quotedBody: inline quote, restoreImages=%lldms stripAndTotal=%lldms, %lld chars",
+                restoreMs, timer.elapsed(), static_cast<qint64>(html.size()));
+        return html;
+    }
+
+    *appendQuote = html;
+    // Stripping a 400 KB quote parses it whole (~300ms) — deferred to the
+    // send/save click rather than paid on the open.
+    *appendStrip = !ctx->m_remoteAllowed;
+    qCDebug(logTrace,
+            "quotedBody: deferred quote, restoreImages=%lldms, %lld chars, strip=%d",
+            restoreMs, static_cast<qint64>(html.size()), int(*appendStrip));
+    return QString();
+}
+
+void MailClient::releaseQuotePreview(quint64 slot)
+{
+    m_presenter->releasePreviewSlot(slot);
+}
+
+void MailClient::clipboardSelectionToMarkdown(int)
+{
+    // Called right after a WebEngine Copy action is *triggered*. The
+    // renderer writes the clipboard asynchronously, so the current content
+    // is whatever was copied last — polling it raced the write and, when it
+    // lost, converted stale content or left the plain copy (links gone).
+    // Convert on the clipboard's next change instead: that change IS the
+    // renderer's write landing, HTML flavour included.
+    QClipboard *clipboard = QGuiApplication::clipboard();
+    auto conn = std::make_shared<QMetaObject::Connection>();
+    QElapsedTimer started;
+    started.start();
+    auto finish = [conn] { QObject::disconnect(*conn); };
+    *conn = connect(clipboard, &QClipboard::dataChanged, this,
+                    [this, clipboard, finish, started] {
+        const QMimeData *mime = clipboard->mimeData();
+        if (!mime || !mime->hasHtml())
+            return; // an ownership-only change; the data write follows
+        finish();
+        QTextDocument doc;
+        doc.setHtml(mime->html());
+        // <br> parses to line-separator characters, which toMarkdown() emits
+        // as bare newlines — soft breaks that renderers join into one line.
+        // Promoted to real paragraph breaks, they survive as the separate
+        // lines the reader saw. (The writer's own 80-column prose wrapping
+        // also emits bare newlines, so this cannot be fixed after the fact —
+        // only here, where the two are still distinguishable.)
+        for (QTextCursor cursor(&doc);;) {
+            cursor = doc.find(QString(QChar::LineSeparator), cursor);
+            if (cursor.isNull())
+                break;
+            cursor.insertBlock();
+        }
+        // Layout-table furniture stripped (with blank runs capped) — the
+        // paste target gets content, not a diagram of the newsletter's grid.
+        const QString markdown = MimeUtils::flattenMarkdownTables(
+            doc.toMarkdown(QTextDocument::MarkdownDialectGitHub)).trimmed();
+        if (markdown.isEmpty())
+            return; // leave the renderer's copy as it is
+        // Our own setText fires dataChanged too — disconnected above.
+        clipboard->setText(markdown);
+        qCDebug(logTrace, "copy as markdown: %lld chars, %lldms after trigger",
+                static_cast<qint64>(markdown.size()), started.elapsed());
+    });
+    // If the renderer's write never comes (nothing was selected after all),
+    // stop listening — a later ordinary copy must not get converted.
+    QTimer::singleShot(3000, this, finish);
+}
+
 QString MailClient::newMessageBody() const
 {
     const QString sig = signatureBlock();
@@ -2539,11 +2897,14 @@ QVariantMap MailClient::replyDataFor(MessageContext *ctx, bool replyAll)
         subject = QStringLiteral("Re: ") + subject;
 
     // Quote the HTML part when there is one so the reply keeps the original's
-    // formatting; the plain-text part is the fallback.
-    const QString quoted = ctx->m_htmlBody.isEmpty()
-        ? ctx->m_textBody.trimmed().toHtmlEscaped()
-              .replace(QLatin1Char('\n'), QLatin1String("<br>"))
-        : quotableHtml(ctx->m_htmlBody);
+    // formatting; the plain-text part is the fallback. A big quote never
+    // enters the editor — it comes back via appendQuote and is appended to
+    // the outgoing message on send; the composer shows a banner meanwhile.
+    QString appendQuote;
+    bool appendStrip = false;
+    QStringList quoteChunks; // stays empty: replies never image-stream
+    const QString quoted =
+        quotedBody(ctx, /*forward=*/false, &appendQuote, &appendStrip, &quoteChunks);
     const QString fromDisplay = msg->from() ? msg->from()->asUnicodeString() : QString();
     QString date;
     if (msg->date()) {
@@ -2551,106 +2912,35 @@ QVariantMap MailClient::replyDataFor(MessageContext *ctx, bool replyAll)
             m_dateFormat + QStringLiteral(" hh:mm"));
     }
     // Signature goes above the quoted original, right under the cursor line.
+    // A deferred quote leaves only the attribution line in the document; the
+    // quote itself is appended at send time.
     const QString body = QStringLiteral("<p><br></p>") + signatureBlock()
         + QStringLiteral("<p>")
         + tr("On %1, %2 wrote:").arg(date, fromDisplay).toHtmlEscaped()
-        + QStringLiteral("</p><blockquote>") + quoted
-        + QStringLiteral("</blockquote>");
+        + QStringLiteral("</p>")
+        + (appendQuote.isEmpty()
+               ? QStringLiteral("<blockquote>") + quoted + QStringLiteral("</blockquote>")
+               : QString());
+
+    // Full-fidelity read-only preview of a deferred quote, rendered by the
+    // viewer's own sandboxed pipeline into a slot the composer owns.
+    quint64 previewSlot = 0;
+    const QString previewUrl = appendQuote.isEmpty()
+        ? QString() : m_presenter->composePreviewUrl(ctx, &previewSlot);
 
     return {{QStringLiteral("to"), to.join(QStringLiteral(", "))},
             {QStringLiteral("cc"), cc.join(QStringLiteral(", "))},
             {QStringLiteral("subject"), subject},
-            {QStringLiteral("body"), body}};
+            {QStringLiteral("body"), body},
+            {QStringLiteral("appendQuote"), appendQuote},
+            {QStringLiteral("appendStrip"), appendStrip},
+            {QStringLiteral("quotePreviewUrl"), previewUrl},
+            {QStringLiteral("quotePreviewSlot"), previewSlot}};
 }
 
 /// The message as it stands, for reopening a draft in the composer. Unlike
 /// replyData/forwardData nothing is quoted or prefixed — a draft is resumed,
 /// not responded to.
-namespace
-{
-/// cid → the part carrying it, for a whole MIME tree.
-void indexContentIds(KMime::Content *node, QHash<QString, KMime::Content *> *out)
-{
-    if (const auto *cid = std::as_const(*node).contentID(); cid && !cid->identifier().isEmpty())
-        out->insert(QString::fromLatin1(cid->identifier()), node);
-    const auto children = node->contents();
-    for (KMime::Content *child : children)
-        indexContentIds(child, out);
-}
-
-/// Points a reopened draft's images back at files the composer can render.
-///
-/// Once saved, a pasted image is an ordinary cid: part, and the compose
-/// editor cannot resolve a cid: — left alone they come back as empty boxes,
-/// and are gone for good the next time the draft is saved. Writing them back
-/// out makes the reopened draft exactly what the composer had: local-file
-/// references, which composeMessage() turns into parts again on the way out.
-QString restoreDraftImages(QString html, KMime::Content *root)
-{
-    static const QRegularExpression cidRe(
-        QStringLiteral("(\\bsrc\\s*=\\s*)([\"'])cid:([^\"']+)\\2"),
-        QRegularExpression::CaseInsensitiveOption);
-    if (!root || !html.contains(QLatin1String("cid:"), Qt::CaseInsensitive))
-        return html;
-
-    QHash<QString, KMime::Content *> parts;
-    indexContentIds(root, &parts);
-    if (parts.isEmpty())
-        return html;
-
-    // Same reasoning as MessagePresenter::openAttachment: a private 0700
-    // directory with an unpredictable name, living as long as the process, so
-    // a draft left open all afternoon still has its images.
-    static QTemporaryDir tempDir(QDir::tempPath() + QStringLiteral("/mailove-draft-images-XXXXXX"));
-    if (!tempDir.isValid())
-        return html;
-
-    QMimeDatabase mimeDb;
-    QHash<QString, QString> written; // cid → file URL, for an image used twice
-    QString out;
-    out.reserve(html.size());
-    qsizetype copied = 0;
-    auto matches = cidRe.globalMatch(html);
-    while (matches.hasNext()) {
-        const auto match = matches.next();
-        const QString cid = match.captured(3);
-        QString url = written.value(cid);
-        if (url.isEmpty()) {
-            KMime::Content *part = parts.value(cid);
-            if (!part)
-                continue;
-            const auto *ct = std::as_const(*part).contentType();
-            const QByteArray mimeType = ct ? ct->mimeType() : QByteArray();
-            // Images only. Anything else a cid: may point at (a stylesheet, a
-            // part of a calendar invitation) is not something the editor
-            // renders, and writing it out would gain nothing.
-            if (!mimeType.startsWith("image/"))
-                continue;
-            const QString suffix =
-                mimeDb.mimeTypeForName(QString::fromLatin1(mimeType)).preferredSuffix();
-            const QString path = tempDir.filePath(
-                QStringLiteral("draft-%1.%2")
-                    .arg(written.size() + 1)
-                    .arg(suffix.isEmpty() ? QStringLiteral("png") : suffix));
-            QFile file(path);
-            if (!file.open(QIODevice::WriteOnly))
-                continue;
-            file.write(part->decodedBody());
-            file.close();
-            url = QUrl::fromLocalFile(path).toString();
-            written.insert(cid, url);
-        }
-        out += QStringView(html).sliced(copied, match.capturedStart() - copied);
-        out += match.captured(1) + QLatin1Char('"') + url + QLatin1Char('"');
-        copied = match.capturedEnd();
-    }
-    if (written.isEmpty())
-        return html;
-    out += QStringView(html).sliced(copied);
-    return out;
-}
-} // namespace
-
 QVariantMap MailClient::draftData()
 {
     MessageContext *ctx = m_reading;
@@ -2674,10 +2964,31 @@ QVariantMap MailClient::draftData()
     // The HTML part when the draft has one, so formatting survives a
     // save/reopen round trip — pasted images included, which is what
     // restoreDraftImages() is for; the plain part is the fallback.
-    const QString body = !ctx->m_htmlBody.isEmpty()
+    QString body = !ctx->m_htmlBody.isEmpty()
         ? restoreDraftImages(ctx->m_htmlBody,
                              ctx->m_decrypted ? ctx->m_decrypted.get() : ctx->m_message.get())
         : ctx->m_textBody.toHtmlEscaped().replace(QLatin1Char('\n'), QLatin1String("<br>"));
+
+    // A draft that carries a deferred quote (or any other huge HTML) gets the
+    // same protection the reply/forward paths have: assigned whole it would
+    // freeze the composer for seconds, so it is split and streamed in instead
+    // (DocumentHandler::startQuoteStream — which also resolves any remote
+    // images to local files, keeping http: srcs away from the render thread).
+    // It stays fully editable; on this size, editing is simply slower.
+    QStringList bodyChunks;
+    constexpr qsizetype maxInlineDraft = 64 * 1024;
+    // src="http, not just <img + http anywhere: a small draft with a pasted
+    // (file:) image and a web link in its text is not carrying remote images.
+    const bool remoteImages =
+        body.contains(QLatin1String("src=\"http"), Qt::CaseInsensitive)
+        || body.contains(QLatin1String("src='http"), Qt::CaseInsensitive);
+    if (body.size() > maxInlineDraft || remoteImages) {
+        bodyChunks = splitQuoteHtml(body, 2 * 1024);
+        qCDebug(logTrace, "draftData: streaming %lld chars in %lld chunks",
+                static_cast<qint64>(body.size()), static_cast<qint64>(bodyChunks.size()));
+        body.clear();
+        setStatus(tr("⏳ Large draft — its content loads progressively."));
+    }
 
     return {{QStringLiteral("to"), addressesOf(msg->to()).join(QStringLiteral(", "))},
             {QStringLiteral("cc"), addressesOf(msg->cc()).join(QStringLiteral(", "))},
@@ -2685,6 +2996,7 @@ QVariantMap MailClient::draftData()
             {QStringLiteral("subject"),
              msg->subject() ? msg->subject()->asUnicodeString() : QString()},
             {QStringLiteral("body"), body},
+            {QStringLiteral("bodyChunks"), bodyChunks},
             {QStringLiteral("uid"), ctx->m_uid}};
 }
 
@@ -2726,10 +3038,17 @@ QVariantMap MailClient::forwardDataFor(MessageContext *ctx)
         && !subject.startsWith(QLatin1String("Fw:"), Qt::CaseInsensitive))
         subject = QStringLiteral("Fwd: ") + subject;
 
-    const QString quoted = ctx->m_htmlBody.isEmpty()
-        ? ctx->m_textBody.trimmed().toHtmlEscaped()
-              .replace(QLatin1Char('\n'), QLatin1String("<br>"))
-        : quotableHtml(ctx->m_htmlBody);
+    // Inline cid: images are rewritten to temp files first — quotableHtml()
+    // drops any cid: image left over (the editor cannot resolve them), which
+    // would silently forward the mail without its pictures. As with a reopened
+    // draft, composeMessage() turns the file references back into inline parts
+    // on the way out. Remote content follows the viewer's decision — see
+    // stripRemoteContent.
+    QString appendQuote;
+    bool appendStrip = false;
+    QStringList quoteChunks;
+    const QString quoted =
+        quotedBody(ctx, /*forward=*/true, &appendQuote, &appendStrip, &quoteChunks);
     const QString from = msg->from() ? msg->from()->asUnicodeString() : QString();
     const QString origTo = msg->to() ? msg->to()->asUnicodeString() : QString();
     const QString origSubject =
@@ -2747,15 +3066,110 @@ QVariantMap MailClient::forwardDataFor(MessageContext *ctx)
     header += QStringLiteral("<br>") + tr("To: %1").arg(origTo.toHtmlEscaped());
 
     // Signature goes above the forwarded block, right under the cursor line.
+    // A deferred quote leaves only the forwarded-message header block in the
+    // document (content appended at send time); an image-streamed quote
+    // arrives as chunks after the header instead of an inline blockquote.
     const QString body = QStringLiteral("<p><br></p>") + signatureBlock()
-        + QStringLiteral("<p>") + header
-        + QStringLiteral("</p><blockquote>") + quoted
-        + QStringLiteral("</blockquote>");
+        + QStringLiteral("<p>") + header + QStringLiteral("</p>")
+        + (!quoted.isEmpty()
+               ? QStringLiteral("<blockquote>") + quoted + QStringLiteral("</blockquote>")
+               : QString());
+
+    // The original's attachments, exported as temp files the composer can
+    // list and composeMessage() can read back — a forward without them sends
+    // a mail that talks about an attachment it does not carry.
+    QElapsedTimer timer;
+    timer.start();
+    QVariantList attachmentUrls;
+    const QList<QUrl> exported = m_presenter->exportAttachments(ctx);
+    for (const QUrl &url : exported)
+        attachmentUrls.append(url);
+    qCDebug(logTrace, "forwardData: exportAttachments=%lldms (%lld files)",
+            timer.elapsed(), static_cast<qint64>(exported.size()));
+
+    // Full-fidelity read-only preview of a deferred quote, rendered by the
+    // viewer's own sandboxed pipeline into a slot the composer owns.
+    quint64 previewSlot = 0;
+    const QString previewUrl = appendQuote.isEmpty()
+        ? QString() : m_presenter->composePreviewUrl(ctx, &previewSlot);
 
     return {{QStringLiteral("to"), QString()},
             {QStringLiteral("cc"), QString()},
             {QStringLiteral("subject"), subject},
-            {QStringLiteral("body"), body}};
+            {QStringLiteral("body"), body},
+            {QStringLiteral("attachments"), attachmentUrls},
+            {QStringLiteral("appendQuote"), appendQuote},
+            {QStringLiteral("appendStrip"), appendStrip},
+            {QStringLiteral("quoteChunks"), quoteChunks},
+            // A deferred forward with remote content allowed: its images are
+            // fetched while the user writes, so the send can embed them —
+            // the recipient sees the pictures without allowing anything.
+            {QStringLiteral("prefetchImages"),
+             !appendQuote.isEmpty() && ctx->m_remoteAllowed
+                 && (appendQuote.contains(QLatin1String("src=\"http"), Qt::CaseInsensitive)
+                     || appendQuote.contains(QLatin1String("src='http"), Qt::CaseInsensitive))},
+            {QStringLiteral("quotePreviewUrl"), previewUrl},
+            {QStringLiteral("quotePreviewSlot"), previewSlot}};
+}
+
+QVariantMap MailClient::forwardAsAttachmentData()
+{
+    return forwardAsAttachmentDataFor(m_reading);
+}
+
+QVariantMap MailClient::forwardAsAttachmentDataFor(MessageContext *ctx)
+{
+    if (!ctx->m_message)
+        return {};
+    const KMime::Message *msg = ctx->m_message.get();
+
+    QString subject = msg->subject() ? msg->subject()->asUnicodeString() : QString();
+    const QString origSubject = subject;
+    if (!subject.startsWith(QLatin1String("Fwd:"), Qt::CaseInsensitive)
+        && !subject.startsWith(QLatin1String("Fw:"), Qt::CaseInsensitive))
+        subject = QStringLiteral("Fwd: ") + subject;
+
+    // The message as it arrived, byte for byte — attachments, inline images,
+    // headers and signatures intact and verifiable, which no inline forward
+    // can fully match. A decrypted message forwards its decrypted form: the
+    // ciphertext would be addressed to the wrong key to be of any use.
+    const QByteArray &raw = ctx->m_decrypted && !ctx->m_decryptedRaw.isEmpty()
+        ? ctx->m_decryptedRaw : ctx->m_raw;
+    if (raw.isEmpty())
+        return {};
+
+    // Same reasoning as every other composer temp file: private 0700
+    // directory, process lifetime — it must survive until the send reads it.
+    static QTemporaryDir tempDir(QDir::tempPath() + QStringLiteral("/mailove-forward-eml-XXXXXX"));
+    if (!tempDir.isValid())
+        return {};
+    static int count = 0;
+    QString base;
+    for (const QChar &c : origSubject) {
+        base.append(c.isLetterOrNumber() || c == QLatin1Char(' ') || c == QLatin1Char('-')
+                        ? c : QLatin1Char('_'));
+    }
+    base = base.trimmed().left(60);
+    if (base.isEmpty())
+        base = QStringLiteral("forwarded message");
+    const QString path =
+        tempDir.filePath(QStringLiteral("%1-%2.eml").arg(++count).arg(base));
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) {
+        Q_EMIT errorOccurred(tr("Could not write %1: %2").arg(path, file.errorString()));
+        return {};
+    }
+    file.write(raw);
+    file.close();
+    qCDebug(logTrace, "forwardAsAttachment: %lld bytes -> %s",
+            static_cast<qint64>(raw.size()), qUtf8Printable(path));
+
+    return {{QStringLiteral("to"), QString()},
+            {QStringLiteral("cc"), QString()},
+            {QStringLiteral("subject"), subject},
+            {QStringLiteral("body"), QStringLiteral("<p><br></p>") + signatureBlock()},
+            {QStringLiteral("attachments"),
+             QVariantList{QUrl::fromLocalFile(path)}}};
 }
 
 QStringList MailClient::recipientSuggestions(const QString &prefix)
@@ -3592,6 +4006,18 @@ void MailClient::applyFolderListing(const QList<MailBackend::FolderInfo> &listed
     }
     if (!m_allMailFolder.isEmpty() && target == m_allMailFolder)
         target = QStringLiteral("INBOX"); // it is no longer in the list
+    // The user is searching this folder right now. This reopen is a
+    // background step (connect, reconnect), and openFolder() starts by
+    // cancelling the search and refilling the list with fresh folder rows —
+    // the GUI serves the user before any worker, so the results stay until
+    // the user leaves them. Nothing is lost: the folder tree above is
+    // already updated, and clearSearch() reopens the folder itself (which
+    // also re-arms the refresh and the IDLE watch).
+    if (m_searchActive && target == m_selectedFolder) {
+        qCDebug(logTrace, "listFolders done: search active, not reopening %s",
+                qUtf8Printable(target));
+        return;
+    }
     openFolder(target);
 }
 
@@ -5011,6 +5437,9 @@ void MailClient::localKeywordFilter(const QString &keyword, const QString &reaso
     const bool byRecipient = listsRecipients(m_selectedFolder);
     auto *thread = QThread::create([this, seq, scopedFolder, keyword, fts, connection, delivered,
                                     headersOnly, byRecipient] {
+        // Scoped so the handle is gone before removeDatabase — a live handle
+        // is "still in use" to Qt and the removal only warns.
+        {
         QSqlDatabase db = MailStore::openWorkerConnection(connection);
         if (db.isOpen()) {
             MailStore::searchOn(
@@ -5045,6 +5474,7 @@ void MailClient::localKeywordFilter(const QString &keyword, const QString &reaso
                 },
                 headersOnly, byRecipient);
             db.close();
+        }
         }
         QSqlDatabase::removeDatabase(connection);
     });

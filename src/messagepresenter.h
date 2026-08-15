@@ -60,6 +60,10 @@ public:
     /// Saves attachment \a index into ~/Downloads under its own filename,
     /// deduplicating ("name (1).pdf") instead of overwriting.
     void saveAttachmentToDownloads(MessageContext *ctx, int index);
+    /// Writes every attachment out as a temp file and returns their URLs, so a
+    /// forward can pre-fill the composer's attachment list — composeMessage()
+    /// reads them back into parts on send.
+    QList<QUrl> exportAttachments(MessageContext *ctx);
 
     /// Offers a public key attached to the message, if there is one.
     void findAttachedKey(MessageContext *ctx, KMime::Content *root);
@@ -67,6 +71,14 @@ public:
     /// own slot. Public because a detached window re-registers the parts it
     /// inherited, so it keeps rendering once the reading pane moves on.
     void collectInlineParts(MessageContext *ctx, KMime::Content *root);
+
+    /// Renders \a ctx's HTML into a slot of its own for the composer's
+    /// read-only quote preview — the same sanitize/CSP/cid pipeline the
+    /// viewer uses, so a deferred quote previews with full fidelity.
+    /// Allocates *slot on first use; the caller keeps it alive until
+    /// releasePreviewSlot(). Empty when the message has no HTML part.
+    QString composePreviewUrl(MessageContext *ctx, quint64 *slot);
+    void releasePreviewSlot(quint64 slot);
 
 Q_SIGNALS:
     void statusMessage(const QString &text);
@@ -80,6 +92,7 @@ private:
     /// the confirmation dialog and the on-disk name all agree on.
     QString attachmentName(const MessageContext *ctx, int index) const;
     void collectAttachments(MessageContext *ctx, KMime::Content *root);
+    void registerInlineParts(quint64 slot, KMime::Content *root);
     bool writeAttachment(const MessageContext *ctx, int index, const QString &path);
 
     ViewerSchemeHandler *m_handler = nullptr;

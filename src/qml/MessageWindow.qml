@@ -28,6 +28,7 @@ Item {
 
     signal replyRequested(bool replyAll)
     signal forwardRequested()
+    signal forwardAsAttachmentRequested()
 
     /// Tab page contract (see Main.qml).
     property string title: context && context.subject.length > 0
@@ -73,5 +74,6 @@ Item {
         Kirigami.Theme.inherit: false
         onReplyRequested: replyAll => win.replyRequested(replyAll)
         onForwardRequested: win.forwardRequested()
+        onForwardAsAttachmentRequested: win.forwardAsAttachmentRequested()
     }
 }

@@ -507,6 +507,157 @@ void testJunkFolderIsDecisive()
               .arg(hitList(elsewhere)));
 }
 
+/// The scorer reads the raw head, where any non-ASCII header travels as an
+/// RFC 2047 encoded-word — so every rule that judges a name or a subject has
+/// to be shown the decoded text or it is judging base64. Measured before the
+/// fix, subject-confusable had never fired on a real junk folder: the mail it
+/// exists for was invisible to it.
+void testEncodedHeaders()
+{
+    // "РayРal alert" — Cyrillic Р in a Latin word, base64-encoded as mail
+    // software really sends it. The homoglyph rule must see through the coat.
+    const SpamHeuristics::Score subj = SpamHeuristics::score(
+        headOnly("Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+                 " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+                 "From: Sender <s@x1z.test>\r\n"
+                 "To: You <you@example.org>\r\n"
+                 "Subject: =?UTF-8?B?0KBhedCgYWwgYWxlcnQ=?=\r\n"
+                 "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+                 "Message-ID: <w1@x1z.test>\r\n"),
+        {});
+    check(fired(subj, "subject-confusable"),
+          QStringLiteral("an encoded-word homoglyph subject is seen (%1)").arg(hitList(subj)));
+
+    // "PayPal" as an encoded display name from a domain that is not PayPal's.
+    const SpamHeuristics::Score name = SpamHeuristics::score(
+        headOnly("Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+                 " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+                 "From: =?UTF-8?B?UGF5UGFs?= <billing@x1z.test>\r\n"
+                 "To: You <you@example.org>\r\n"
+                 "Subject: Account notice\r\n"
+                 "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+                 "Message-ID: <w2@x1z.test>\r\n"),
+        {});
+    check(fired(name, "brand-impersonation"),
+          QStringLiteral("an encoded-word brand name is seen (%1)").arg(hitList(name)));
+
+    // charset-mismatch, both directions. The raw form of an encoded word is
+    // ASCII by construction, so before the fix the "decodes to plain ASCII"
+    // test was vacuously true and the rule fired on genuinely Chinese mail.
+    const char *gbAscii =
+        "Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+        " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+        "From: Sender <s@x1z.test>\r\n"
+        "To: You <you@example.org>\r\n"
+        "Subject: =?gb2312?B?SGVsbG8gZnJpZW5k?=\r\n"
+        "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+        "Message-ID: <w3@x1z.test>\r\n";
+    check(fired(SpamHeuristics::score(headOnly(gbAscii), {}), "charset-mismatch"),
+          QStringLiteral("gb2312 wrapping plain ASCII still fires"));
+    const char *gbReal =
+        "Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+        " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+        "From: Sender <s@x1z.test>\r\n"
+        "To: You <you@example.org>\r\n"
+        "Subject: =?gb2312?B?xOO6ww==?=\r\n"
+        "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+        "Message-ID: <w4@x1z.test>\r\n";
+    const SpamHeuristics::Score real = SpamHeuristics::score(headOnly(gbReal), {});
+    check(!fired(real, "charset-mismatch"),
+          QStringLiteral("a genuinely Chinese gb2312 subject does not (%1)").arg(hitList(real)));
+    check(!fired(real, "subject-confusable"),
+          QStringLiteral("...and its mojibake does not read as a homoglyph (%1)")
+              .arg(hitList(real)));
+
+    // Two encoded words joined across transport whitespace stay one word —
+    // splitting mid-word is how long names travel, and a space inserted there
+    // would hide the very word the rules examine.
+    const SpamHeuristics::Score split = SpamHeuristics::score(
+        headOnly("Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+                 " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+                 "From: =?UTF-8?B?UGF5?= =?UTF-8?B?UGFsIHNlcnZpY2U=?= <b@x1z.test>\r\n"
+                 "To: You <you@example.org>\r\n"
+                 "Subject: Account notice\r\n"
+                 "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+                 "Message-ID: <w5@x1z.test>\r\n"),
+        {});
+    check(fired(split, "brand-impersonation"),
+          QStringLiteral("a name split across two encoded words is rejoined (%1)")
+              .arg(hitList(split)));
+}
+
+/// Click trackers: in list mail, "the text names one domain, the href another"
+/// is how the mail was built, not a deception. Measured over a real inbox this
+/// was 82% of all residual noise, against zero list-mail catches in junk.
+void testListMailLinksAreExempt()
+{
+    SpamHeuristics::Message m;
+    m.head = QByteArray(
+        "Received: from mta.esp.test (mta.esp.test [198.51.100.4]) by mx.example.org;"
+        " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+        "From: News <news@shop.test>\r\n"
+        "To: You <you@example.org>\r\n"
+        "Subject: This week\r\n"
+        "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+        "List-Unsubscribe: <https://esp.test/u/1>\r\n"
+        "Message-ID: <l1@esp.test>\r\n");
+    m.html = QStringLiteral(
+        "<a href=\"https://tr.esp-track.test/c/9\">www.gov.uk</a>"
+        "<a href=\"https://facebook.assets.esp-track.test/i\">pic</a>");
+    const SpamHeuristics::Score list = SpamHeuristics::score(m, {});
+    check(!fired(list, "link-text-mismatch") && !fired(list, "url-brand-subdomain"),
+          QStringLiteral("tracked links in list mail say nothing (%1)").arg(hitList(list)));
+
+    // The same message without the list header is still judged.
+    m.head = QByteArray(
+        "Received: from mta.esp.test (mta.esp.test [198.51.100.4]) by mx.example.org;"
+        " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+        "From: News <news@shop.test>\r\n"
+        "To: You <you@example.org>\r\n"
+        "Subject: This week\r\n"
+        "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+        "Message-ID: <l2@esp.test>\r\n");
+    const SpamHeuristics::Score bare = SpamHeuristics::score(m, {});
+    check(fired(bare, "link-text-mismatch"),
+          QStringLiteral("outside list mail the mismatch still fires (%1)").arg(hitList(bare)));
+
+    // What the exemption must NOT cover: fake list headers buy nothing the
+    // message was actually caught by.
+    m.html = QStringLiteral("<form><input type=\"password\"></form>"
+                            "<a href=\"https://paypal.com@evil.test/\">x</a>");
+    m.head = QByteArray(
+        "Received: from a.test (a.test [198.51.100.4]) by mx.example.org;"
+        " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+        "From: X <x@evil.test>\r\n"
+        "To: You <you@example.org>\r\n"
+        "Subject: verify\r\n"
+        "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+        "List-Unsubscribe: <https://evil.test/u>\r\n"
+        "Message-ID: <l3@evil.test>\r\n");
+    const SpamHeuristics::Score phish = SpamHeuristics::score(m, {});
+    check(fired(phish, "html-password-form") && fired(phish, "url-credential-trick"),
+          QStringLiteral("fake list headers do not exempt the real catches (%1)")
+              .arg(hitList(phish)));
+
+    // P2, pinned: Stripe's CDN belongs to Stripe even when the sender is a
+    // customer of Stripe's (an invoice mail), and Microsoft's office domains
+    // belong to the outlook/microsoft names.
+    m.head = QByteArray(
+        "Received: from mail.vendor.test (mail.vendor.test [198.51.100.5])"
+        " by mx.example.org; Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+        "From: Billing <invoice@vendor.test>\r\n"
+        "To: You <you@example.org>\r\n"
+        "Subject: Your receipt\r\n"
+        "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+        "Message-ID: <l4@vendor.test>\r\n");
+    m.html = QStringLiteral(
+        "<a href=\"https://stripe.assets.stripecdn.com/x\">receipt</a>"
+        "<a href=\"https://outlook.cdn.office.net/y\">calendar</a>");
+    const SpamHeuristics::Score vendors = SpamHeuristics::score(m, {});
+    check(!fired(vendors, "url-brand-subdomain"),
+          QStringLiteral("brand asset domains are the brand's (%1)").arg(hitList(vendors)));
+}
+
 // --- the body rules ------------------------------------------------------
 
 void testBodyRules()
@@ -768,6 +919,8 @@ int main(int argc, char **argv)
     testMeasuredFalsePositives();
     testPlatformMailStaysQuiet();
     testJunkFolderIsDecisive();
+    testEncodedHeaders();
+    testListMailLinksAreExempt();
     testBodyRules();
     testLinkGroupIsCapped();
     testHamStaysUnmarked();

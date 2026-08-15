@@ -32,6 +32,15 @@ ColumnLayout {
 
     readonly property bool hasMessage: context ? context.hasMessage : false
     property string viewMode: "html"
+    // The mode buttons' checked states are synced here, not bound: a click on
+    // a checkable button overwrites (and thereby severs) a declarative
+    // binding, which is how the active mode once showed unchecked while its
+    // content stayed on screen. Assignment survives any amount of clicking.
+    onViewModeChanged: {
+        modeHtmlButton.checked = viewMode === "html"
+        modeTextButton.checked = viewMode === "text"
+        modeSourceButton.checked = viewMode === "source"
+    }
 
     /// True while the find bar is open. The message window checks this so its
     /// Esc-closes-the-window shortcut does not swallow Esc-closes-the-find-bar.
@@ -44,6 +53,9 @@ ColumnLayout {
     signal replyRequested(bool replyAll)
     /// Forward was clicked for the shown message.
     signal forwardRequested()
+    /// The full-fidelity forward: original bytes as a message/rfc822
+    /// attachment (the Forward button's press-and-hold option).
+    signal forwardAsAttachmentRequested()
 
     // Reset to the "Select a message" placeholder (e.g. the shown message was
     // deleted and the list is now empty).
@@ -60,6 +72,7 @@ ColumnLayout {
         // Junk folders open as plain text; the HTML button is the explicit
         // opt-in to render the (still sandboxed) HTML.
         viewMode = context.junkTextOnly ? "text" : "html"
+        context.quotePlainText = viewMode === "text"
         web.url = context.bodyUrl
     }
 
@@ -154,7 +167,15 @@ ColumnLayout {
     function showMode(mode) {
         if (!context || !context.hasMessage)
             return
+        if (viewMode === mode)
+            return // clicking the active mode is a no-op, not a reload
         viewMode = mode
+        // Reply/Forward quote what the reader is looking at: reading the
+        // plain text quotes the plain text. (Source view is a way of
+        // inspecting the message, not a way of reading it — it changes
+        // nothing here.)
+        if (mode !== "source")
+            context.quotePlainText = mode === "text"
         web.url = mode === "text" ? context.textViewUrl()
                 : mode === "source" ? context.sourceViewUrl()
                                     : context.htmlViewUrl()
@@ -322,10 +343,37 @@ ColumnLayout {
                 QQC2.ToolTip.visible: hovered
             }
             QQC2.ToolButton {
+                id: forwardButton
                 text: "Forward →"
                 onClicked: viewer.forwardRequested()
-                QQC2.ToolTip.text: "Forward this message"
+                // Holding to the end IS the other forward: the original
+                // bytes as a message/rfc822 attachment, full fidelity. The
+                // filling line below counts down to it.
+                onPressAndHold: viewer.forwardAsAttachmentRequested()
+                QQC2.ToolTip.text: "Forward this message (hold to forward as attachment)"
                 QQC2.ToolTip.visible: hovered
+
+                // The hold made visible: a thin line filling left to right,
+                // timed to the press-and-hold interval, so reaching the far
+                // edge and the menu opening are the same moment. Releasing
+                // early snaps it away (the Behavior only animates the grow).
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.bottom: parent.bottom
+                    anchors.leftMargin: 3
+                    anchors.bottomMargin: 2
+                    height: 2
+                    radius: 1
+                    color: Kirigami.Theme.highlightColor
+                    width: forwardButton.pressed ? forwardButton.width - 6 : 0
+                    Behavior on width {
+                        enabled: forwardButton.pressed
+                        NumberAnimation {
+                            duration: Qt.styleHints.mousePressAndHoldInterval
+                        }
+                    }
+                }
+
             }
             QQC2.ToolButton {
                 icon.name: "image-x-generic"
@@ -387,22 +435,34 @@ ColumnLayout {
                                                            : (viewer.hasMessage ? "(no subject)" : ""))
                       : ""
             }
+            // One representation is always showing, so these are radio-like,
+            // not toggles: the exclusive group means the active mode cannot
+            // be clicked "off" — only checking another moves it. The checked
+            // states are kept in step by onViewModeChanged below rather than
+            // by bindings, which a user click would silently break.
+            QQC2.ButtonGroup { id: viewModeGroup }
             QQC2.ToolButton {
+                id: modeHtmlButton
                 text: "HTML"
                 checkable: true
                 checked: viewer.viewMode === "html"
+                QQC2.ButtonGroup.group: viewModeGroup
                 onClicked: viewer.showMode("html")
             }
             QQC2.ToolButton {
+                id: modeTextButton
                 text: "Text"
                 checkable: true
                 checked: viewer.viewMode === "text"
+                QQC2.ButtonGroup.group: viewModeGroup
                 onClicked: viewer.showMode("text")
             }
             QQC2.ToolButton {
+                id: modeSourceButton
                 text: "Source"
                 checkable: true
                 checked: viewer.viewMode === "source"
+                QQC2.ButtonGroup.group: viewModeGroup
                 onClicked: viewer.showMode("source")
                 QQC2.ToolTip.text: "Show the raw message source ("
                                    + (viewer.ui ? viewer.ui.shortcutSource : "Ctrl+U") + ")"
@@ -803,19 +863,11 @@ ColumnLayout {
         Layout.fillHeight: true
         visible: viewer.hasMessage
 
-    WebEngineView {
+    // Sandbox settings and console-dedupe live in the shared component —
+    // the composer's quote preview is the same caged animal.
+    SandboxedWebView {
         id: web
         anchors.fill: parent
-
-        // Hostile-content sandbox: no scripts, no plugins, nothing local.
-        // Remote requests are additionally blocked by the C++ interceptor.
-        settings.javascriptEnabled: false
-        settings.pluginsEnabled: false
-        settings.localContentCanAccessFileUrls: false
-        settings.localContentCanAccessRemoteUrls: false
-        settings.localStorageEnabled: false
-        settings.autoLoadImages: true
-        settings.hyperlinkAuditingEnabled: false
 
         onLoadingChanged: function (loadInfo) {
             if (loadInfo.status === WebEngineView.LoadFailedStatus)
