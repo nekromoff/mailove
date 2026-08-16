@@ -324,6 +324,20 @@ ColumnLayout {
         QQC2.Label { text: "From:"; opacity: 0.8 }
         RowLayout {
             Layout.fillWidth: true
+            // The sender's picture, when there is one and they are switched on.
+            // Image.Error is the ordinary answer — most addresses have no
+            // Gravatar — and it takes the row back to text with no gap.
+            Image {
+                id: senderAvatar
+                readonly property int px: Mail.avatarSize()
+                source: viewer.context ? Mail.avatarSource(viewer.context.from) : ""
+                visible: status === Image.Ready
+                Layout.preferredWidth: visible ? px : 0
+                Layout.preferredHeight: visible ? px : 0
+                fillMode: Image.PreserveAspectFit
+                asynchronous: true
+                sourceSize: Qt.size(px, px)
+            }
             SelectableValue {
                 id: fromLabel
                 text: viewer.context ? viewer.context.from : ""

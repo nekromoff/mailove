@@ -11,7 +11,10 @@
 #include <QQmlContext>
 #include <QQuickStyle>
 #include <QtWebEngineQuick/qtwebenginequickglobal.h>
+#include <qt6keychain/keychain.h>
 
+#include "advancedconfig.h"
+#include "avatarprovider.h"
 #include "documenthandler.h"
 #include "mailclient.h"
 #include "messagecontext.h"
@@ -136,20 +139,58 @@ int main(int argc, char *argv[])
     // follows the system palette instead.
     QQuickStyle::setFallbackStyle(QStringLiteral("Fusion"));
 
+    // Startup phases, so a slow launch says which one it was rather than only
+    // that the GUI thread stalled. Cheap: four timestamps, all behind the
+    // trace category.
+    QElapsedTimer boot;
+    boot.start();
+
+    // Where a secret typed into advanced.conf goes. AdvancedConfig itself
+    // knows nothing about wallets — it links into the test binaries, which
+    // have none — so the one wallet write it needs is handed to it here, and
+    // the sweep below moves anything a hand-edited file is already holding
+    // before the first read of that file can see it.
+    AdvancedConfig::setSecretSink([](const QString &walletKey, const QString &value) {
+        if (value.isEmpty()) {
+            auto *del = new QKeychain::DeletePasswordJob(QStringLiteral("mailove"), qApp);
+            del->setKey(walletKey);
+            del->start();
+            return;
+        }
+        auto *write = new QKeychain::WritePasswordJob(QStringLiteral("mailove"), qApp);
+        write->setKey(walletKey);
+        write->setTextData(value);
+        write->start();
+    });
+    AdvancedConfig::instance().sweepSecrets();
+    qCDebug(logTrace, "boot: advanced settings %lld ms", boot.restart());
+
     ViewerSchemeHandler *viewerHandler = ViewerSchemeHandler::install();
+    qCDebug(logTrace, "boot: viewer scheme handler %lld ms", boot.restart());
 
     MailClient client;
+    qCDebug(logTrace, "boot: MailClient %lld ms", boot.restart());
     client.setViewerHandler(viewerHandler);
 
     // Constructed before the QML engine so PgpEngine::instance() is already
     // there when QML creates its first PgpKeyModel. Cheap when gpg is absent:
     // it works out that it is, and every operation then reports why.
     PgpEngine pgp;
+    qCDebug(logTrace, "boot: PgpEngine %lld ms", boot.restart());
     client.setPgpEngine(&pgp);
 
     QQmlApplicationEngine engine;
     qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "Mail", &client);
     qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "Pgp", &pgp);
+    // The advanced settings editor. A singleton instance rather than a type:
+    // the values it edits are read from every corner of the client, and there
+    // is exactly one file behind them.
+    qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "Advanced", &AdvancedConfig::instance());
+    // Sender pictures. Registered only when they are switched on, so with the
+    // default off there is not even a provider for an image://gravatar URL to
+    // reach — and no fetcher thread standing by for one.
+    if (AdvancedConfig::b("avatars/enabled"))
+        engine.addImageProvider(QStringLiteral("gravatar"), new AvatarProvider);
     qmlRegisterType<DocumentHandler>("Mailove.Core", 1, 0, "DocumentHandler");
     // Created per view: the key manager and each key picker filter differently
     // over the one keyring snapshot PgpEngine holds.
@@ -161,7 +202,9 @@ int main(int argc, char *argv[])
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed,
                      &app, [] { QCoreApplication::exit(1); },
                      Qt::QueuedConnection);
+    qCDebug(logTrace, "boot: QML registration %lld ms", boot.restart());
     engine.loadFromModule("Mailove", "Main");
+    qCDebug(logTrace, "boot: Main.qml %lld ms", boot.restart());
 
     const int rc = app.exec();
     // Bracket the teardown: if the window disappears but the process does not,

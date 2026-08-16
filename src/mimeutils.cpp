@@ -65,7 +65,7 @@ QList<MailStore::PartRef> stripAttachments(KMime::Message *msg)
         if (!isAttachmentPart(part))
             return;
         const QByteArray decoded = part->decodedBody();
-        if (decoded.size() < AttachmentStore::kExternalizeThreshold)
+        if (decoded.size() < AttachmentStore::externalizeThreshold())
             return; // small enough that a file of its own would cost more
         const AttachmentStore::Stored stored = AttachmentStore::put(decoded);
         if (stored.hash.isEmpty())

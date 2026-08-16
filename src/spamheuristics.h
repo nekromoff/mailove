@@ -45,10 +45,13 @@ enum class Verdict {
     Spam,
 };
 
-/// Score at or above this is marked. Chosen so that no two ordinary rules can
-/// reach it together — it takes either one decisive signal (a known contact
-/// whose authentication failed) or an accumulation of three or four.
-inline constexpr int SpamThreshold = 50;
+/// Score at or above this is marked. The default is chosen so that no two
+/// ordinary rules can reach it together — it takes either one decisive signal
+/// (a known contact whose authentication failed) or an accumulation of three
+/// or four. Not a constant: it is read from the advanced-settings schema
+/// (spam/threshold), which is where mail unusual enough to need a different
+/// number is accommodated.
+int spamThreshold();
 /// The weight of a fact rather than an inference: a message already filed as
 /// junk. Far above the threshold on purpose — no accumulation of ham credit,
 /// not an OpenPGP signature and a long correspondence together, may pull a

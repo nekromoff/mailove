@@ -365,7 +365,7 @@ int main(int argc, char **argv)
     store.storeHeaders(folder, {makeHeader(302, QStringLiteral("ordinary"), QString())});
 
     const MessageListModel::Header inJunk = find(store, junk, 300);
-    check(inJunk.spamScore >= SpamHeuristics::SpamThreshold && inJunk.spamState == 1,
+    check(inJunk.spamScore >= SpamHeuristics::spamThreshold() && inJunk.spamState == 1,
           QStringLiteral("a cached junk row with no stored verdict comes back marked"));
     check(inJunk.spamDetail.contains(QLatin1String("Junk folder")),
           QStringLiteral("…and says why: \"%1\"").arg(inJunk.spamDetail.section('\n', 0, 0)));
@@ -379,7 +379,7 @@ int main(int argc, char **argv)
     const auto page = store.cachedHeadersBefore(junk, QDateTime::currentSecsSinceEpoch(), 0);
     bool pagedMarked = !page.isEmpty();
     for (const auto &h : page) {
-        if (h.uid == 300 && h.spamScore < SpamHeuristics::SpamThreshold)
+        if (h.uid == 300 && h.spamScore < SpamHeuristics::spamThreshold())
             pagedMarked = false;
     }
     check(pagedMarked, QStringLiteral("the pagination path marks them too"));
@@ -387,7 +387,7 @@ int main(int argc, char **argv)
     const auto sorted = store.sortedHeaders(junk, 0, true, 50, nullptr);
     bool sortedMarked = !sorted.isEmpty();
     for (const auto &h : sorted) {
-        if (h.uid == 300 && h.spamScore < SpamHeuristics::SpamThreshold)
+        if (h.uid == 300 && h.spamScore < SpamHeuristics::spamThreshold())
             sortedMarked = false;
     }
     check(sortedMarked, QStringLiteral("and so does the sorted path"));
@@ -410,7 +410,7 @@ int main(int argc, char **argv)
         check(find(store, junk, 500).spamScore == 0,
               QStringLiteral("an imported archive's junk folder is left unmarked"));
         store.setAccountKey(wasKey);
-        check(find(store, junk, 300).spamScore >= SpamHeuristics::SpamThreshold,
+        check(find(store, junk, 300).spamScore >= SpamHeuristics::spamThreshold(),
               QStringLiteral("…while a server account's junk folder still is"));
     }
 

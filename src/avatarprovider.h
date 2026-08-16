@@ -14,10 +14,15 @@ class QNetworkAccessManager;
 /**
  * Gravatar sender pictures, fetched off the GUI thread.
  *
- * Off unless the reader turns it on (Settings -> General -> Sender pictures):
- * asking gravatar.com for a picture tells gravatar.com that this address was
- * seen, so nothing is requested until that is agreed to. MailClient owns the
- * switch; this class only knows how to fetch.
+ * Off unless the reader turns it on (advanced.conf, avatars/enabled): asking
+ * gravatar.com for a picture tells gravatar.com that this address was seen, so
+ * nothing is requested — or cached — until that is agreed to. The switch is
+ * read where the source URL is built and again here, because this is the class
+ * that would make the request.
+ *
+ * How long an answer is kept is avatars/cacheDays (a year by default, since a
+ * stale avatar costs nothing and every re-ask is another request gravatar.com
+ * sees) and avatars/missCacheDays for "this address has none", a month.
  *
  * The address itself never leaves the machine — what goes out is its SHA-256,
  * which is what Gravatar keys avatars by, and the provider is handed the hash

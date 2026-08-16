@@ -3,6 +3,8 @@
 
 #include "spamheuristics.h"
 
+#include "advancedconfig.h"
+
 #include "publicsuffixlist.h"
 
 #include <QRegularExpression>
@@ -14,6 +16,12 @@
 
 namespace SpamHeuristics
 {
+
+int spamThreshold()
+{
+    return AdvancedConfig::i("spam/threshold");
+}
+
 
 namespace
 {
@@ -900,10 +908,10 @@ QString Score::explanation() const
     }
     lines.append(QString(width + 2 + 8, QLatin1Char('-')));
     const QString verdictLine = verdict == Verdict::Spam
-        ? QStringLiteral("Marked as spam (threshold %1)").arg(SpamThreshold)
+        ? QStringLiteral("Marked as spam (threshold %1)").arg(spamThreshold())
         : verdict == Verdict::Unsure
-        ? QStringLiteral("Not marked — below the spam threshold of %1").arg(SpamThreshold)
-        : QStringLiteral("Not spam (threshold %1)").arg(SpamThreshold);
+        ? QStringLiteral("Not marked — below the spam threshold of %1").arg(spamThreshold())
+        : QStringLiteral("Not spam (threshold %1)").arg(spamThreshold());
     lines.append(QStringLiteral("%1  %2").arg(QString::number(total), width).arg(verdictLine));
     return lines.join(QLatin1Char('\n'));
 }
@@ -989,8 +997,8 @@ Score score(const Message &msg, const Context &ctx)
     // writes back to their bank. Volume *and* age are both required: a single
     // spam run can put fifty messages from one domain in the cache in an
     // afternoon, but it cannot make them two months old.
-    constexpr int familiarCount = 20;
-    constexpr int familiarDays = 60;
+    const int familiarCount = AdvancedConfig::i("spam/familiarCount");
+    const int familiarDays = AdvancedConfig::i("spam/familiarDays");
     const bool familiarOrg = ctx.seenFromOrg >= familiarCount
         && ctx.daysKnownOrg >= familiarDays;
     const QString familiarDetail =
@@ -1660,7 +1668,7 @@ Score score(const Message &msg, const Context &ctx)
         // three times the signal of one.
         std::stable_sort(linkHits.begin(), linkHits.end(),
                          [](const Hit &a, const Hit &b) { return a.weight > b.weight; });
-        constexpr int linkGroupCap = 40;
+        const int linkGroupCap = AdvancedConfig::i("spam/linkGroupCap");
         int linkTotal = 0;
         for (qsizetype i = 0; i < linkHits.size() && i < 2; ++i) {
             const Hit &h = linkHits.at(i);
@@ -1686,7 +1694,7 @@ Score score(const Message &msg, const Context &ctx)
         }
     }
 
-    out.verdict = out.total >= SpamThreshold  ? Verdict::Spam
+    out.verdict = out.total >= spamThreshold()  ? Verdict::Spam
         : out.total >= UnsureThreshold        ? Verdict::Unsure
                                               : Verdict::Ham;
     return out;

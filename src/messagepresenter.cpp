@@ -3,6 +3,8 @@
 
 #include "messagepresenter.h"
 
+#include "advancedconfig.h"
+
 #include "messagecontext.h"
 #include "mimeutils.h"
 #include "viewersecurity.h"
@@ -243,7 +245,8 @@ QString MessagePresenter::textViewUrl(MessageContext *ctx)
         // text-only default must not degrade to an empty stub. Link targets
         // kept (toPlainText() drops every href); the page's linkifier then
         // makes them clickable like any other URL in the text.
-        text = MimeUtils::plainTextWithLinks(ctx->m_htmlBody.left(500000));
+        text = MimeUtils::plainTextWithLinks(
+            ctx->m_htmlBody.left(AdvancedConfig::i("view/maxHtmlPreviewChars")));
     }
     if (text.isEmpty())
         text = tr("(this message has no displayable text part)");
@@ -461,7 +464,7 @@ void MessagePresenter::findAttachedKey(MessageContext *ctx, KMime::Content *root
             continue;
         // Keys are small. Anything this size is not one, and refusing it here
         // keeps a hostile attachment out of gpg entirely.
-        if (body.isEmpty() || body.size() > 1024 * 1024)
+        if (body.isEmpty() || body.size() > AdvancedConfig::i("view/maxTextBodyBytes"))
             continue;
 
         ctx->m_attachedKeyData = body;

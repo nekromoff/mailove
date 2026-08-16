@@ -3,6 +3,8 @@
 
 #include "mailstore.h"
 
+#include "advancedconfig.h"
+
 #include "attachmentstore.h"
 #include "spamheuristics.h"
 
@@ -80,7 +82,7 @@ bool MailStore::open()
     // The purge and vacuum workers write on their own connections. Without a
     // busy timeout this connection would fail its writes outright the moment
     // one of them held the lock, instead of waiting the few ms it takes.
-    q.exec(QStringLiteral("PRAGMA busy_timeout=15000"));
+    q.exec(QStringLiteral("PRAGMA busy_timeout=%1").arg(AdvancedConfig::i("db/busyTimeoutMs")));
 
     // Gates every one-time migration below, so create it before the first one.
     q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS meta_flags (flag TEXT PRIMARY KEY)"));
@@ -540,7 +542,7 @@ void applyJunkVerdict(QList<MessageListModel::Header> &rows, const QString &scop
     if (!g_isJunkFolder(scopedFolder))
         return;
     for (MessageListModel::Header &h : rows) {
-        if (h.spamState == 3 || h.spamScore >= SpamHeuristics::SpamThreshold)
+        if (h.spamState == 3 || h.spamScore >= SpamHeuristics::spamThreshold())
             continue;
         SpamHeuristics::Score s;
         s.verdict = SpamHeuristics::Verdict::Spam;
@@ -1502,7 +1504,7 @@ QSqlDatabase MailStore::openWorkerConnection(const QString &name)
     }
     QSqlQuery pragma(db);
     // Several connections write now; each must wait rather than fail.
-    pragma.exec(QStringLiteral("PRAGMA busy_timeout=15000"));
+    pragma.exec(QStringLiteral("PRAGMA busy_timeout=%1").arg(AdvancedConfig::i("db/busyTimeoutMs")));
     return db;
 }
 
@@ -2066,7 +2068,7 @@ void MailStore::purgeFolder(const QString &scopedFolder, const QAtomicInt &cance
             QSqlQuery pragma(db);
             // The GUI thread is the other writer. Chunks are small enough that
             // it never waits long, but it must be willing to wait at all.
-            pragma.exec(QStringLiteral("PRAGMA busy_timeout=15000"));
+            pragma.exec(QStringLiteral("PRAGMA busy_timeout=%1").arg(AdvancedConfig::i("db/busyTimeoutMs")));
             // 100 rows keeps a single write-lock hold to a few ms, so a folder
             // switch on the GUI thread is never stuck behind this.
             while (!cancel.loadRelaxed()) {
@@ -2121,7 +2123,8 @@ bool MailStore::vacuum(QString *error)
             QSqlQuery q(db);
             // No busy_timeout would make this fail instantly whenever the GUI
             // thread happens to hold a write lock.
-            q.exec(QStringLiteral("PRAGMA busy_timeout=30000"));
+            q.exec(QStringLiteral("PRAGMA busy_timeout=%1")
+           .arg(AdvancedConfig::i("db/rebuildBusyTimeoutMs")));
             ok = q.exec(QStringLiteral("VACUUM"));
             if (!ok && error)
                 *error = q.lastError().text();

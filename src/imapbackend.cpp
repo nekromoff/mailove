@@ -3,6 +3,8 @@
 
 #include "imapbackend.h"
 
+#include "advancedconfig.h"
+
 #include <QDebug>
 #include <QDateTime>
 #include <QHash>
@@ -53,7 +55,7 @@ ImapBackend::ImapBackend(QObject *parent)
 {
     // A quiet connection gets closed by most servers within some minutes; a
     // periodic CAPABILITY is the cheapest thing that counts as traffic.
-    m_keepAlive.setInterval(3 * 60 * 1000);
+    m_keepAlive.setInterval(AdvancedConfig::i("imap/keepAliveSeconds") * 1000);
     connect(&m_keepAlive, &QTimer::timeout, this, [this] {
         if (m_connected && m_session)
             (new KIMAP::CapabilitiesJob(m_session))->start();
@@ -927,8 +929,10 @@ void ImapBackend::ensureBodyPool()
         return;
     // Keep the total concurrent connection count low (interactive + IDLE +
     // background + these) — well under the ~15 servers like Gmail cap, and near
-    // the 2–3 recommended to avoid throttling.
-    while (m_bodyPool.size() < 2) {
+    // the 2–3 recommended to avoid throttling. imap/bodyPoolSize is where a
+    // server with a stricter (or looser) limit is accommodated; 0 turns the
+    // pool off and leaves body fetches on the shared session.
+    while (m_bodyPool.size() < AdvancedConfig::i("imap/bodyPoolSize")) {
         auto conn = std::make_shared<BodyConn>();
         conn->session = new KIMAP::Session(m_credentials.host,
                                            quint16(m_credentials.port), this);

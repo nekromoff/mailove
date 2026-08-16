@@ -6,6 +6,8 @@
 #include "jmaprequest.h"
 #include "jmapsession.h"
 
+#include "advancedconfig.h"
+
 #include <KMime/Message>
 
 #include <QCryptographicHash>
@@ -24,34 +26,34 @@ namespace
 /// How many blob downloads to keep in the air. HTTP does not serialize, but a
 /// server states maxConcurrentRequests for a reason and the whole point of the
 /// backfill is that nobody is waiting on it.
-constexpr int kMaxConcurrentBodies = 4;
+int kMaxConcurrentBodies() { return AdvancedConfig::i("jmap/maxConcurrentBodies"); }
 /// A single message body. Larger than any mail worth rendering, and small
 /// enough that a server answering with something else does not exhaust memory.
-constexpr qint64 kMaxBodyBytes = 128 * 1024 * 1024;
-constexpr int kBodyTimeoutMs = 120000;
+qint64 kMaxBodyBytes() { return AdvancedConfig::i("jmap/maxBodyBytes"); }
+int kBodyTimeoutMs() { return AdvancedConfig::i("jmap/bodyTimeoutMs"); }
 /// An upload answers with a four-field JSON object (RFC 8620 §6.1). The cap is
 /// so a server answering with something else — an HTML error page from a proxy
 /// in front of it — cannot be read into memory unbounded.
-constexpr qint64 kMaxUploadReplyBytes = 64 * 1024;
+qint64 kMaxUploadReplyBytes() { return AdvancedConfig::i("jmap/maxUploadReplyBytes"); }
 /// How many changes to ask for in one `Email/changes`. A cap the client sets
 /// rather than the server, so a folder that has been away for months arrives in
 /// pages that can be merged as they come instead of one reply holding
 /// everything. `hasMoreChanges` is what says another call is due.
-constexpr int kMaxChangesPerCall = 500;
+int kMaxChangesPerCall() { return AdvancedConfig::i("jmap/maxChangesPerCall"); }
 
 /// How often the server should send a keepalive comment down the EventSource.
 /// Not for us — the stream would work without it — but for everything between
 /// us and the server: a NAT or proxy that sees nothing for minutes closes the
 /// connection, and a client that has stopped receiving push has no way to
 /// notice that from silence alone.
-constexpr int kPushPingSeconds = 300;
+int kPushPingSeconds() { return AdvancedConfig::i("jmap/pushPingSeconds"); }
 /// One StateChange is a small JSON object. The cap is a guard against a server
 /// (or something in front of it) streaming bytes that are not events at all,
 /// which would otherwise grow this buffer without bound.
-constexpr int kMaxPushBufferBytes = 256 * 1024;
-constexpr int kPushBaseRetryMs = 2000;
-constexpr int kPushMaxBackoffShift = 7; ///< 2s → ~4min before the cap applies
-constexpr int kPushMaxRetryMs = 300000;
+int kMaxPushBufferBytes() { return AdvancedConfig::i("jmap/maxPushBufferBytes"); }
+int kPushBaseRetryMs() { return AdvancedConfig::i("jmap/pushBaseRetryMs"); }
+int kPushMaxBackoffShift() { return AdvancedConfig::i("jmap/pushMaxBackoffShift"); } ///< 2s → ~4min before the cap applies
+int kPushMaxRetryMs() { return AdvancedConfig::i("jmap/pushMaxRetryMs"); }
 
 QString jmapString(const QJsonObject &object, const char *key)
 {
@@ -334,7 +336,7 @@ void JmapBackend::listChangedMailboxes()
         QStringLiteral("Mailbox/changes"),
         QJsonObject{{QStringLiteral("accountId"), m_session->mailAccountId()},
                     {QStringLiteral("sinceState"), m_mailboxState},
-                    {QStringLiteral("maxChanges"), kMaxChangesPerCall}});
+                    {QStringLiteral("maxChanges"), kMaxChangesPerCall()}});
     // Created and updated are fetched together — the tree is merged from both
     // the same way, an id we have being an update and one we do not being new.
     for (const char *path : {"/created", "/updated"}) {
@@ -621,7 +623,7 @@ void JmapBackend::fetchHeadersSince(const QString &folder, const QString &sinceR
         QStringLiteral("Email/changes"),
         QJsonObject{{QStringLiteral("accountId"), m_session->mailAccountId()},
                     {QStringLiteral("sinceState"), since},
-                    {QStringLiteral("maxChanges"), kMaxChangesPerCall}});
+                    {QStringLiteral("maxChanges"), kMaxChangesPerCall()}});
 
     // Both lists are read in the same request through back-references, so a
     // delta costs one round trip however much changed. They need separate
@@ -791,7 +793,7 @@ void JmapBackend::fetchHeadersById(const QString &folder, const QStringList &rem
 
 int JmapBackend::freeBodySlots() const
 {
-    return qMax(0, kMaxConcurrentBodies - m_bodiesInFlight);
+    return qMax(0, kMaxConcurrentBodies() - m_bodiesInFlight);
 }
 
 void JmapBackend::fetchBodies(const QString &folder, const QStringList &remoteIds,
@@ -897,7 +899,7 @@ void JmapBackend::downloadNextBody()
                                                    QStringLiteral("message/rfc822"),
                                                    QStringLiteral("message.eml")));
     m_session->authorize(request);
-    request.setTransferTimeout(kBodyTimeoutMs);
+    request.setTransferTimeout(kBodyTimeoutMs());
 
     ++m_bodiesInFlight;
     QNetworkReply *reply = m_net->get(request);
@@ -908,8 +910,8 @@ void JmapBackend::downloadNextBody()
 
         const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         if (status == 200) {
-            const QByteArray raw = reply->read(kMaxBodyBytes + 1);
-            if (raw.size() > kMaxBodyBytes) {
+            const QByteArray raw = reply->read(kMaxBodyBytes() + 1);
+            if (raw.size() > kMaxBodyBytes()) {
                 Q_EMIT bodyUnavailable(body.folder, body.remoteId, raw.size());
             } else {
                 auto message = std::make_shared<KMime::Message>();
@@ -1556,14 +1558,14 @@ void JmapBackend::uploadBlob(const QByteArray &raw, const QByteArray &contentTyp
     QNetworkRequest request(m_session->uploadUrl(m_session->mailAccountId()));
     m_session->authorize(request);
     request.setHeader(QNetworkRequest::ContentTypeHeader, contentType);
-    request.setTransferTimeout(kBodyTimeoutMs);
+    request.setTransferTimeout(kBodyTimeoutMs());
 
     QNetworkReply *reply = m_net->post(request, raw);
     m_session->guardRedirects(reply);
     connect(reply, &QNetworkReply::finished, this, [this, reply, done] {
         reply->deleteLater();
         const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-        const QByteArray body = reply->read(kMaxUploadReplyBytes);
+        const QByteArray body = reply->read(kMaxUploadReplyBytes());
 
         if (status == 200 || status == 201) {
             const QString blobId = QJsonDocument::fromJson(body)
@@ -2080,7 +2082,7 @@ void JmapBackend::openPushStream()
         return;
 
     const QUrl url = m_session->eventSourceUrl(
-        {QStringLiteral("Email"), QStringLiteral("Mailbox")}, kPushPingSeconds);
+        {QStringLiteral("Email"), QStringLiteral("Mailbox")}, kPushPingSeconds());
     if (!url.isValid() || url.isEmpty())
         return; // the server offers no EventSource; the caller keeps polling
 
@@ -2164,7 +2166,7 @@ void JmapBackend::readPushStream()
     }
 
     m_pushBuffer += m_pushReply->readAll();
-    if (m_pushBuffer.size() > kMaxPushBufferBytes) {
+    if (m_pushBuffer.size() > kMaxPushBufferBytes()) {
         // A server streaming something that is not events, or one event larger
         // than any StateChange could be. Drop it rather than grow without
         // bound; the next event boundary resynchronises.
@@ -2277,8 +2279,8 @@ void JmapBackend::schedulePushRetry()
     }
     // Exponential with jitter: a server coming back up is met by clients
     // spread over the interval rather than all of them on the same second.
-    const int step = qMin(m_pushRetries++, kPushMaxBackoffShift);
-    const int base = kPushBaseRetryMs << step;
+    const int step = qMin(m_pushRetries++, kPushMaxBackoffShift());
+    const int base = kPushBaseRetryMs() << step;
     const int delay = base + QRandomGenerator::global()->bounded(base / 2 + 1);
-    m_pushRetryTimer->start(qMin(delay, kPushMaxRetryMs));
+    m_pushRetryTimer->start(qMin(delay, kPushMaxRetryMs()));
 }

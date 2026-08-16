@@ -32,7 +32,7 @@ public:
         /// PgpMime::StoredKind — 0 none, 1 encrypted, 2 signed, 3 both. Comes
         /// from the messages.crypto column, so the list costs no extra query.
         CryptoRole,
-        /// True when the local spam score reached SpamHeuristics::SpamThreshold.
+        /// True when the local spam score reached SpamHeuristics::spamThreshold().
         /// Shares the "!" marker with SuspiciousRole: to a reader both mean
         /// "this message is not what it appears to be", and two different
         /// warning glyphs in one row would be two things to learn instead of one.
@@ -136,7 +136,14 @@ public:
     /// Visible row showing \a uid, or -1 when it is not in the model. Lets the
     /// view re-find the message the user picked after a reset renumbers rows.
     Q_INVOKABLE int rowForUid(qint64 uid) const;
-    bool seenAt(int row) const;
+    /// Invokable because the message context menu flips between "Mark read"
+    /// and "Mark unread" on it, and the menu sits outside the delegate that
+    /// has the roles.
+    Q_INVOKABLE bool seenAt(int row) const;
+    /// The same verdict SpamRole shows — confident spam only, an unsure score
+    /// is not a mark. The context menu flips between "Mark as spam" and "Not
+    /// spam" on it.
+    Q_INVOKABLE bool spamAt(int row) const;
     void markSeen(int row);
     void markUnseen(int row);
     /// Marks every listed message read at once — the model side of a folder's

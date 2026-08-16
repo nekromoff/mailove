@@ -654,24 +654,29 @@ Kirigami.ApplicationWindow {
         // (its item count), and shadowing it fails the whole component load.
         readonly property int rowCount: rows ? rows.length : 0
 
+        // One entry that flips, not two of which one is always a no-op. The
+        // row the menu was opened on decides — with several selected that is
+        // the one under the pointer, and the command then applies to all of
+        // them, which is what a reader who selected them meant either way.
         QQC2.MenuItem {
-            text: "Mark unread"
-            icon.name: "mail-mark-unread"
-            onTriggered: Mail.markMessagesUnread(messageMenu.rows)
+            readonly property bool unread: messageMenu.rowCount > 0
+                                           && !Mail.messageModel.seenAt(messageMenu.rows[0])
+            text: unread ? "Mark read" : "Mark unread"
+            icon.name: unread ? "mail-mark-read" : "mail-mark-unread"
+            onTriggered: unread ? Mail.markMessagesRead(messageMenu.rows)
+                                : Mail.markMessagesUnread(messageMenu.rows)
         }
         QQC2.MenuSeparator {}
-        // These go through the list's own handlers rather than calling Mail
+        // Goes through the list's own handlers rather than calling Mail
         // directly, so the menu and the keyboard shortcuts cannot drift apart —
         // and so Delete still asks first when the folder is the trash.
         QQC2.MenuItem {
-            text: "Mark as spam"
-            icon.name: "mail-mark-junk"
-            onTriggered: messageList.requestJunk()
-        }
-        QQC2.MenuItem {
-            text: "Not spam"
-            icon.name: "mail-mark-notjunk"
-            onTriggered: messageList.requestNotSpam()
+            readonly property bool spam: messageMenu.rowCount > 0
+                                         && (Mail.viewingJunk
+                                             || Mail.messageModel.spamAt(messageMenu.rows[0]))
+            text: spam ? "Not spam" : "Mark as spam"
+            icon.name: spam ? "mail-mark-notjunk" : "mail-mark-junk"
+            onTriggered: spam ? messageList.requestNotSpam() : messageList.requestJunk()
         }
         QQC2.MenuSeparator {}
         // The full-fidelity forward: the original bytes as a message/rfc822

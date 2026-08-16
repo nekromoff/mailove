@@ -70,7 +70,7 @@ QVariant MessageListModel::data(const QModelIndex &index, int role) const
         // Only the confident tail is shown. "Unsure" deliberately renders as
         // nothing at all: a maybe-mark on an ordinary message is a false
         // positive the reader still has to spend attention dismissing.
-        return h.spamState != 3 && h.spamScore >= SpamHeuristics::SpamThreshold;
+        return h.spamState != 3 && h.spamScore >= SpamHeuristics::spamThreshold();
     case SpamDetailRole:
         return h.spamDetail;
     }
@@ -411,6 +411,16 @@ int MessageListModel::rowForUid(qint64 uid) const
 bool MessageListModel::seenAt(int row) const
 {
     return row >= 0 && row < m_rows.size() && m_all.at(m_rows.at(row)).seen;
+}
+
+bool MessageListModel::spamAt(int row) const
+{
+    if (row < 0 || row >= m_rows.size())
+        return false;
+    // Same test as SpamRole, deliberately: what the list marks and what the
+    // menu offers to undo have to be the same message.
+    const Header &h = m_all.at(m_rows.at(row));
+    return h.spamState != 3 && h.spamScore >= SpamHeuristics::spamThreshold();
 }
 
 void MessageListModel::removeByUids(const QList<qint64> &uids)

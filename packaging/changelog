@@ -1,3 +1,73 @@
+mailove (2.7) unstable; urgency=medium
+
+  * Advanced settings, under Settings -> Advanced: everything with no widget of
+    its own — sync pacing, connection counts, protocol timeouts, spam weights,
+    cache thresholds, database timeouts — edited as plain INI in
+    ~/.config/mailove/advanced.conf, with a searchable reference beside the
+    editor generated from the same schema the values are read through.
+  * A value outside its range is corrected on save and an unknown key ignored
+    with a warning; neither stops the rest of the file from applying. Only a
+    syntax error is refused, and it names the line it is on. Comments, blank
+    lines and ordering survive exactly as typed.
+  * Keys that only take effect on restart say so, under the Apply button, and
+    keep saying so after the save rather than the moment before it.
+  * Emptying the file removes it and restores stock behaviour; blank lines at
+    the top and bottom are trimmed, the ones between sections left alone.
+  * No secret is ever written to that file. An OAuth client secret typed there
+    is moved into the system wallet on save and the line rewritten to @wallet
+    — including for a file edited by hand outside the client, which is swept
+    at startup. Nothing in the client can read a secret back out of the file.
+  * Sender pictures (Gravatar), off by default: asking gravatar.com for a
+    picture tells gravatar.com that the address was seen, so nothing is
+    requested or cached until avatars/enabled says so. The address never
+    leaves the machine — what goes out is its SHA-256 — and answers are kept
+    for a year, misses for a month.
+  * How long a message must stay open before it counts as read is now a number
+    of seconds rather than on or off, decimals included. 0 leaves it unread
+    until marked read by hand, and moving through a list no longer marks
+    everything on the way past.
+  * The message context menu alternates instead of offering the command that
+    does nothing: Mark read or Mark unread by the message's own state, Mark as
+    spam or Not spam by its mark — and always Not spam in the junk folder,
+    where a message put there by a server-side rule carries no local score.
+  * DKIM key records are cached for at least half an hour rather than five
+    minutes. Key rotation publishes a new selector, so a stale record for the
+    old one is never asked for again.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Sun, 16 Aug 2026 00:00:00 +0200
+
+mailove (2.6) unstable; urgency=medium
+
+  * Forward as attachment: forwards the message being read as a message/rfc822
+    attachment — the original bytes untouched, every image, attachment and
+    signature intact and nothing re-rendered. In the message context menu, for
+    a single message.
+  * Copy as Markdown: select part of an HTML message and copy it as Markdown
+    rather than as flattened plain text.
+  * HTML to plain text rewritten: layout tables, lists and block structure now
+    survive the conversion instead of collapsing, and runs of blank lines are
+    capped. Used everywhere text is rendered — the text view, plain-text
+    quoting, and the body the spam rules read.
+  * Reply and forward quotes stream into the composer a batch per event-loop
+    tick, so the composer opens instantly on a newsletter-sized message and
+    stays responsive while the quote fills in. Send and Save as draft flush
+    what is still pending first.
+  * Remote content in a quote is neutralized on a parsed document rather than
+    with regexes over markup: remote images and backgrounds go, only data:,
+    file: and cid: references survive. Where remote content was allowed, the
+    images are prefetched and embedded as cid: parts at send time, per image,
+    without the send ever waiting on the network.
+  * The composer's modified check compares the document revision instead of
+    serializing the whole body to HTML, which blocked the GUI for the better
+    part of a second on a large message.
+  * Spam scoring decodes RFC 2047 headers before judging them. Encoded-word
+    subjects were invisible to the homoglyph and confusable rules — precisely
+    the mail those rules exist for.
+  * List mail is recognised where the link rules read it, and a rule that
+    fired only on ordinary mail was dropped rather than weakened.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Sat, 15 Aug 2026 00:00:00 +0200
+
 mailove (2.5) unstable; urgency=medium
 
   * Spam detection rewritten around the message rather than the X-Spam headers:

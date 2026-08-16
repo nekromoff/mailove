@@ -3,6 +3,8 @@
 
 #include "syncengine.h"
 
+#include "advancedconfig.h"
+
 #include <QLoggingCategory>
 #include <QRandomGenerator>
 
@@ -16,19 +18,24 @@ Q_DECLARE_LOGGING_CATEGORY(logTrace)
 // bandwidth limits that make servers like Gmail drop the connection. The
 // adaptive backoff (backoffBackfill) still layers on top when a server pushes
 // back regardless.
-static constexpr int kHeaderWindow = 200;   ///< headers fetched per request
+//
+// The numbers are read per use from the advanced-settings schema, which owns
+// their defaults, ranges and descriptions (see kSchema in advancedconfig.cpp)
+// — a server that wants slower or larger windows is exactly what that file is
+// for. Nothing here caches them, so a save reaches the next window.
+static int headerWindow() { return AdvancedConfig::i("sync/headerWindow"); }
 /// Bigger for a folder nobody is watching: fewer round trips for the same
 /// history, and no one is waiting on any single window of it.
-static constexpr int kBackfillFolderWindow = 250;
-static constexpr int kHeaderPauseMs = 400;  ///< pause between header windows
-static constexpr int kBodyPauseMs = 600;    ///< pause between body-fetch batches
+static int backfillFolderWindow() { return AdvancedConfig::i("sync/backfillFolderWindow"); }
+static int headerPauseMs() { return AdvancedConfig::i("sync/headerPauseMs"); }
+static int bodyPauseMs() { return AdvancedConfig::i("sync/bodyPauseMs"); }
 
 // Throttle backoff: exponential with full jitter, so a server that pushed back
 // is not met by every client at the same moment on the way back up.
-static constexpr int kBackoffBaseMs = 1000;   ///< 2^1 * 500 → ~1 s first wait
-static constexpr int kBackoffCapMs = 64000;   ///< per-attempt ceiling (64 s)
-static constexpr int kBackoffJitterMs = 1000; ///< full jitter added on top
-static constexpr int kBackoffMaxAttempts = 8; ///< then pause syncing
+static int backoffBaseMs() { return AdvancedConfig::i("sync/backoffBaseMs"); }
+static int backoffCapMs() { return AdvancedConfig::i("sync/backoffCapMs"); }
+static int backoffJitterMs() { return AdvancedConfig::i("sync/backoffJitterMs"); }
+static int backoffMaxAttempts() { return AdvancedConfig::i("sync/backoffMaxAttempts"); }
 
 SyncEngine::SyncEngine(MailStore &store, MessageListModel &messages, FolderModel &folders,
                        QObject *parent)
@@ -42,7 +49,7 @@ SyncEngine::SyncEngine(MailStore &store, MessageListModel &messages, FolderModel
     // cache the missing bodies. Headers strictly first, so a freshly added
     // account shows the complete list before any body downloads.
     m_backfillTimer.setSingleShot(true);
-    m_backfillTimer.setInterval(4000);
+    m_backfillTimer.setInterval(AdvancedConfig::i("sync/backfillIdleMs"));
     connect(&m_backfillTimer, &QTimer::timeout, this, &SyncEngine::onBackfillTick);
 }
 
@@ -336,7 +343,7 @@ void SyncEngine::scheduleBackfill(int delayMs)
 void SyncEngine::backoffBackfill()
 {
     ++m_backfillAttempt;
-    if (m_backfillAttempt > kBackoffMaxAttempts) {
+    if (m_backfillAttempt > backoffMaxAttempts()) {
         // Give up retrying for now — the server is persistently pushing back.
         // Sync resumes on the next (re)connect or when the user opens another
         // folder (both reset the attempt counter via resetBackfillBackoff).
@@ -345,14 +352,14 @@ void SyncEngine::backoffBackfill()
         Q_EMIT statusMessage(tr("%1 — sync paused (server busy)")
                       .arg(m_selectedFolder.isEmpty() ? tr("Mail")
                                                        : m_selectedFolder));
-        qWarning() << "mailove: backfill paused after" << kBackoffMaxAttempts
+        qWarning() << "mailove: backfill paused after" << backoffMaxAttempts()
                    << "throttle/backoff attempts";
         return;
     }
     // Wait = min(2^n * base + full jitter, cap).
-    const qint64 exp = qint64(kBackoffBaseMs) << m_backfillAttempt; // 2^n * base
-    const int jitter = int(QRandomGenerator::global()->bounded(kBackoffJitterMs + 1));
-    const int wait = int(qMin<qint64>(exp + jitter, kBackoffCapMs));
+    const qint64 exp = qint64(backoffBaseMs()) << m_backfillAttempt; // 2^n * base
+    const int jitter = int(QRandomGenerator::global()->bounded(backoffJitterMs() + 1));
+    const int wait = int(qMin<qint64>(exp + jitter, backoffCapMs()));
     scheduleBackfill(wait);
 }
 
@@ -534,7 +541,7 @@ void SyncEngine::continueFolderBackfill()
         // Next header window; cache-only — applyFetchedHeaders never touches
         // the visible list for a folder that is not the open one.
         m_backfill = true;
-        requestHeaderWindow(folder, m_backfillFetchedFromNewest, kBackfillFolderWindow,
+        requestHeaderWindow(folder, m_backfillFetchedFromNewest, backfillFolderWindow(),
                             /*append=*/true, /*background=*/true);
         return;
     }
@@ -645,7 +652,7 @@ void SyncEngine::fetchOlderFromServer()
     // Fetch older history in modest windows with a pause between them
     // (scheduleBackfill below) so sustained backfill stays under server rate
     // limits instead of hammering the connection until it drops.
-    requestHeaderWindow(m_selectedFolder, m_fetchedFromNewest, kHeaderWindow,
+    requestHeaderWindow(m_selectedFolder, m_fetchedFromNewest, headerWindow(),
                         /*append=*/true, m_backfill);
 }
 
@@ -707,7 +714,7 @@ void SyncEngine::applyFetchedHeaders(const QString &folder, qint64 reachedFromNe
     // cursor and keep chaining its windows.
     if (folder != m_selectedFolder && folder == m_backfillFolder) {
         m_backfillFetchedFromNewest = qMax(m_backfillFetchedFromNewest, reachedFromNewest);
-        scheduleBackfill(kHeaderPauseMs);
+        scheduleBackfill(headerPauseMs());
         return;
     }
     // The user may have moved on: results for a folder that is no longer open
@@ -774,9 +781,9 @@ void SyncEngine::applyFetchedHeaders(const QString &folder, qint64 reachedFromNe
             Q_EMIT statusMessage(tr("%1 — %2 cached").arg(m_selectedFolder).arg(total));
     }
     // Pace the next window: a deliberate pause between windows keeps the
-    // sustained fetch rate under server limits (see kHeaderPauseMs). The longer
+    // sustained fetch rate under server limits (see headerPauseMs()). The longer
     // idle pause is only for entering the body-caching phase.
-    scheduleBackfill(moreHistory ? kHeaderPauseMs : 500);
+    scheduleBackfill(moreHistory ? headerPauseMs() : 500);
 }
 
 
@@ -846,7 +853,7 @@ void SyncEngine::processPrefetchQueue()
             // server bandwidth limits (bodies are far heavier than headers),
             // rather than requesting the next one immediately.
             if (m_prefetchQueue.isEmpty() && !m_backend->bodyFetchActive())
-                scheduleBackfill(kBodyPauseMs);
+                scheduleBackfill(bodyPauseMs());
         });
     }
 }

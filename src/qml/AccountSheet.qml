@@ -796,6 +796,18 @@ Item {
             }
             QQC2.ItemDelegate {
                 Layout.fillWidth: true
+                text: "Advanced"
+                icon.name: "configure-toolbars"
+                highlighted: sheet.page === 5
+                // Activating the loader here rather than binding it to
+                // sheet.page keeps the page alive once opened.
+                onClicked: {
+                    advancedLoader.active = true
+                    sheet.page = 5
+                }
+            }
+            QQC2.ItemDelegate {
+                Layout.fillWidth: true
                 text: "About"
                 icon.name: "help-about"
                 highlighted: sheet.page === 4
@@ -2003,6 +2015,27 @@ Item {
                 }
             }
         } // about ScrollView
+
+        // --- Page 5: Advanced ---
+        // Built on first use, not with the rest of Settings. A StackLayout
+        // constructs every page whether or not it is the current one, and this
+        // page's reference list is ~70 delegates deep — eagerly building it put
+        // a visible stall (340 ms on the GUI thread) in front of opening
+        // Settings at all, which normally lands on Accounts. Once built it
+        // stays, so an unsaved edit survives a trip to another page.
+        Loader {
+            id: advancedLoader
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            active: false
+            // Built off the critical path: even on its own, this page is more
+            // than one frame's worth of items, and the GUI thread has 20 ms.
+            asynchronous: true
+            // A file rather than an inline Component: this page is compiled
+            // only when it is first opened, instead of with the sheet.
+            source: "AdvancedSheet.qml"
+        }
+
         } // StackLayout
         } // content RowLayout
 
@@ -2103,4 +2136,5 @@ Item {
             }
         }
     }
+
 }

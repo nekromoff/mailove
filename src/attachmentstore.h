@@ -31,7 +31,9 @@ namespace AttachmentStore
 {
 /// Payloads at or above this go to their own file; smaller parts stay inline
 /// in the message stub, where per-file overhead would outweigh the saving.
-constexpr int kExternalizeThreshold = 32 * 1024;
+/// From the advanced-settings schema (attachments/externalizeThresholdBytes),
+/// since where that line falls depends on the filesystem underneath.
+int externalizeThreshold();
 
 /// Result of storing a payload.
 struct Stored {

@@ -3,6 +3,8 @@
 
 #include "oauthhelper.h"
 
+#include "advancedconfig.h"
+
 #include <QCryptographicHash>
 #include <QDesktopServices>
 #include <QJsonDocument>
@@ -27,15 +29,18 @@ OAuthHelper::OAuthHelper(QObject *parent)
 
 OAuthHelper::Endpoints OAuthHelper::endpointsFor(Provider provider)
 {
+    // The stock endpoints are the schema's defaults, so overriding them is an
+    // ordinary advanced setting: a Microsoft 365 tenant that refuses the
+    // /common/ authority needs its own tenant id in the two URLs, and a
+    // self-hosted proxy needs all three.
     if (provider == Gmail) {
-        return {QStringLiteral("https://accounts.google.com/o/oauth2/v2/auth"),
-                QStringLiteral("https://oauth2.googleapis.com/token"),
-                QStringLiteral("https://mail.google.com/")};
+        return {AdvancedConfig::s("oauth/googleAuthUrl"),
+                AdvancedConfig::s("oauth/googleTokenUrl"),
+                AdvancedConfig::s("oauth/googleScope")};
     }
-    return {QStringLiteral("https://login.microsoftonline.com/common/oauth2/v2.0/authorize"),
-            QStringLiteral("https://login.microsoftonline.com/common/oauth2/v2.0/token"),
-            QStringLiteral("https://outlook.office365.com/IMAP.AccessAsUser.All "
-                           "https://outlook.office365.com/SMTP.Send offline_access")};
+    return {AdvancedConfig::s("oauth/microsoftAuthUrl"),
+            AdvancedConfig::s("oauth/microsoftTokenUrl"),
+            AdvancedConfig::s("oauth/microsoftScope")};
 }
 
 static QByteArray base64Url(const QByteArray &data)
@@ -177,7 +182,8 @@ void OAuthHelper::authorize(Provider provider, const QString &clientId,
 
     // Don't keep a loopback port open indefinitely when the user abandons the
     // browser tab — that is the window in which an injected code would land.
-    QTimer::singleShot(std::chrono::minutes(5), this, [this] {
+    QTimer::singleShot(std::chrono::minutes(AdvancedConfig::i("oauth/authTimeoutMinutes")),
+                       this, [this] {
         if (m_state.isEmpty())
             return; // already finished
         endRedirectListener();
@@ -238,9 +244,12 @@ void OAuthHelper::requestToken(Provider provider, const QString &clientId,
                                                                     : reply->errorString()));
             return;
         }
-        const int expiresIn = obj.value(QStringLiteral("expires_in")).toInt(3600);
+        const int expiresIn =
+            obj.value(QStringLiteral("expires_in")).toInt(AdvancedConfig::i("oauth/defaultExpiresIn"));
+        // Refreshed a little early, so a token does not expire mid-request.
+        const int skew = AdvancedConfig::i("oauth/tokenExpirySkewSeconds");
         Q_EMIT tokensReady(accessToken,
                            obj.value(QStringLiteral("refresh_token")).toString(),
-                           QDateTime::currentDateTimeUtc().addSecs(expiresIn - 60));
+                           QDateTime::currentDateTimeUtc().addSecs(expiresIn - skew));
     });
 }

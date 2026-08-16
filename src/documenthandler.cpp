@@ -3,6 +3,8 @@
 
 #include "documenthandler.h"
 
+#include "advancedconfig.h"
+
 #include <QBuffer>
 #include <QClipboard>
 #include <QFile>
@@ -347,7 +349,7 @@ QStringList remoteImageSources(const QString &html)
 void DocumentHandler::prefetchQuoteImages(const QString &html)
 {
     const QStringList urls = remoteImageSources(html);
-    constexpr int maxPrefetch = 40;
+    const int maxPrefetch = AdvancedConfig::i("compose/remoteImagePrefetch");
     int started = 0;
     for (const QString &url : urls) {
         if (m_remoteImageCache.contains(url) || m_remoteImageReplies.contains(url))
@@ -427,7 +429,7 @@ void DocumentHandler::fetchRemoteImage(const QString &url)
         if (m_remoteImageReplies.take(url) == nullptr)
             return;
         QString path;
-        constexpr qint64 maxImageBytes = 10 * 1024 * 1024;
+        const qint64 maxImageBytes = AdvancedConfig::i("compose/maxRemoteImageBytes");
         const QByteArray data = reply->error() == QNetworkReply::NoError
             ? reply->read(maxImageBytes + 1) : QByteArray();
         QBuffer probe;
@@ -826,14 +828,14 @@ namespace {
 /// Mail carries pictures badly enough without a screenshot pasted at retina
 /// size; past this the paste is refused rather than quietly building a message
 /// no server will accept.
-constexpr qint64 kMaxPastedImage = 20 * 1024 * 1024;
+qint64 kMaxPastedImage() { return AdvancedConfig::i("compose/maxPastedImageBytes"); }
 
 /// How wide a pasted image is drawn — in the editor and, since the size
 /// travels with the HTML, in the recipient's client. The pixels are all still
 /// there; this is the display size, the way any editor scales an image dropped
 /// into a page. A modern screenshot is several thousand pixels wide and would
 /// otherwise arrive at that width.
-constexpr int kDisplayWidth = 640;
+int kDisplayWidth() { return AdvancedConfig::i("compose/pastedImageDisplayWidth"); }
 
 /// Clipboard formats worth taking as they are, best first. A JPEG photo
 /// re-encoded as PNG is several times the size for no gain, and a GIF loses
@@ -943,7 +945,7 @@ bool DocumentHandler::insertImage(const QByteArray &data, const QString &suffix)
 {
     if (!m_document)
         return false;
-    if (data.size() > kMaxPastedImage) {
+    if (data.size() > kMaxPastedImage()) {
         Q_EMIT imagePasteFailed(
             tr("That image is %1 MB — too large to put in a message. Attach it instead.")
                 .arg(data.size() / (1024 * 1024)));
@@ -985,9 +987,9 @@ bool DocumentHandler::insertImage(const QByteArray &data, const QString &suffix)
 
     QTextImageFormat format;
     format.setName(url.toString());
-    if (image.width() > kDisplayWidth) {
-        format.setWidth(kDisplayWidth);
-        format.setHeight(qRound(double(image.height()) * kDisplayWidth / image.width()));
+    if (image.width() > kDisplayWidth()) {
+        format.setWidth(kDisplayWidth());
+        format.setHeight(qRound(double(image.height()) * kDisplayWidth() / image.width()));
     }
     cursor.beginEditBlock();
     if (cursor.hasSelection())

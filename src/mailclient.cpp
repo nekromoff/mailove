@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include "mailclient.h"
+
+#include "advancedconfig.h"
 #include "documenthandler.h"
 #include "mimeutils.h"
 #include "attachmentstore.h"
@@ -15,6 +17,7 @@
 
 #include <QClipboard>
 #include <QMimeData>
+#include <QCryptographicHash>
 #include <QDesktopServices>
 #include <QGuiApplication>
 #include <QDir>
@@ -63,28 +66,10 @@ static QSettings appSettings()
 /// it are AccountStore's to name — see walletKeyFor()/oauthWalletKeyFor().
 static const auto kWalletService = QStringLiteral("mailove");
 
-// Background-sync pacing. Headers are cheap, bodies move real bandwidth, so
-// they are fetched in modest windows with a deliberate pause between windows
-// rather than back-to-back. This keeps sustained backfill under the rate/
-// bandwidth limits that make servers like Gmail drop the connection. The
-// adaptive backoff (backoffBackfill) still layers on top when a server pushes
-// back regardless.
-static constexpr int kHeaderWindow = 200;   ///< headers fetched per request
-/// Windows for a folder nobody is looking at: larger, because nothing is
-/// waiting on them and fewer round trips means less time under rate limits.
-static constexpr int kBackfillFolderWindow = 250;
-static constexpr int kHeaderPauseMs = 400;  ///< pause between header windows
-static constexpr int kBodyPauseMs = 600;    ///< pause between body-fetch batches
-
-// Truncated exponential backoff with full jitter, applied when the server
-// throttles or drops the backfill (see backoffBackfill). Wait time on attempt
-// n (1-based) = min(2^n seconds + [0,1000) ms jitter, cap). After the max
-// number of attempts the backfill pauses until the next (re)connect or folder
-// change, rather than retrying forever.
-static constexpr int kBackoffBaseMs = 1000;   ///< 2^1 * 500 → ~1 s first wait
-static constexpr int kBackoffCapMs = 64000;   ///< per-attempt ceiling (64 s)
-static constexpr int kBackoffJitterMs = 1000; ///< full jitter added on top
-static constexpr int kBackoffMaxAttempts = 8; ///< then pause syncing
+// Background-sync pacing and the throttle backoff used to be duplicated here
+// as well; both now live in SyncEngine, which is the only thing that ever read
+// them, and their numbers come from the advanced-settings schema
+// (kSchema in advancedconfig.cpp) rather than from a constant.
 
 /// True when the IMAP error text carries a throttling response code such as
 /// Gmail's [THROTTLED] or [TOO-MANY-SIMULTANEOUS-CONNECTIONS]. Case-folded so
@@ -1236,6 +1221,15 @@ void MailClient::setSelectedFolder(const QString &folder)
 {
     const bool changed = m_selectedFolder != folder;
     m_selectedFolder = folder;
+    // The junk answer belongs to the folder being opened, so it is worked out
+    // here — once, as the folder loads — rather than every time a menu asks.
+    // Set from the new folder outright: a change must never leave the previous
+    // folder's answer standing, so anything not known to be junk is not.
+    m_selectedIsJunk = !folder.isEmpty() && isJunkFolderKey(folder);
+    // A message left behind by a folder change was not read: its pending mark
+    // goes with it.
+    if (changed && m_markReadTimer)
+        m_markReadTimer->stop();
     m_sync->setOpenFolder(folder);
     // The one place the open folder changes, so the one place that can say so.
     // Without this the properties bound to selectedFolderChanged — the "To"
@@ -3177,6 +3171,30 @@ QStringList MailClient::recipientSuggestions(const QString &prefix)
     return m_store.recipientCompletions(prefix);
 }
 
+QString MailClient::avatarSource(const QString &from) const
+{
+    if (!AdvancedConfig::b("avatars/enabled"))
+        return {};
+    // "Name <addr>" as often as not, and Gravatar keys on the address alone,
+    // lowercased and trimmed.
+    QString address = from.trimmed();
+    const qsizetype open = address.lastIndexOf(u'<');
+    const qsizetype close = address.lastIndexOf(u'>');
+    if (open >= 0 && close > open)
+        address = address.mid(open + 1, close - open - 1);
+    address = address.trimmed().toLower();
+    if (address.isEmpty() || !address.contains(u'@'))
+        return {};
+    const QString hash = QString::fromLatin1(
+        QCryptographicHash::hash(address.toUtf8(), QCryptographicHash::Sha256).toHex());
+    return QStringLiteral("image://gravatar/%1/%2").arg(avatarSize()).arg(hash);
+}
+
+int MailClient::avatarSize() const
+{
+    return AdvancedConfig::i("avatars/sizePixels");
+}
+
 QStringList MailClient::ownAddresses() const
 {
     // Every configured account, not just the active one: mail to a second
@@ -3668,8 +3686,21 @@ void MailClient::acquireTokenAndConnect()
     // Built-in desktop-client IDs so sign-in needs no manual setup (same
     // publicly-documented installed-app credentials Thunderbird ships; a
     // clientId in the account config overrides them).
+    // Three places, most specific first: this account's own pair, then the
+    // advanced-settings pair (one registration for every account), then the
+    // built-ins. An own registration is the reason either override exists —
+    // Google's and Microsoft's quotas are per client id, not per user.
+    const bool gmail = provider == OAuthHelper::Gmail;
     QString clientId = m_acct.clientId;
     QString clientSecret = m_acct.clientSecret;
+    // Whether the pair in force is the advanced-settings one, whose secret is
+    // in the wallet rather than in advanced.conf and so has to be fetched.
+    bool advancedPair = false;
+    if (clientId.isEmpty()) {
+        clientId = AdvancedConfig::s(gmail ? "oauth/googleClientId" : "oauth/microsoftClientId");
+        clientSecret.clear();
+        advancedPair = !clientId.isEmpty();
+    }
     if (clientId.isEmpty()) {
         if (provider == OAuthHelper::Gmail) {
             clientId = QStringLiteral(
@@ -3682,13 +3713,33 @@ void MailClient::acquireTokenAndConnect()
     }
 
     setBusy(true);
-    if (!m_accounts.refreshToken().isEmpty()) {
-        setStatus(tr("Refreshing sign-in"));
-        m_oauth->refresh(provider, clientId, clientSecret, m_accounts.refreshToken());
-    } else {
-        setStatus(tr("Sign in in your browser"));
-        m_oauth->authorize(provider, clientId, clientSecret);
+    const auto start = [this, provider](const QString &id, const QString &secret) {
+        if (!m_accounts.refreshToken().isEmpty()) {
+            setStatus(tr("Refreshing sign-in"));
+            m_oauth->refresh(provider, id, secret, m_accounts.refreshToken());
+        } else {
+            setStatus(tr("Sign in in your browser"));
+            m_oauth->authorize(provider, id, secret);
+        }
+    };
+
+    if (advancedPair) {
+        // advanced.conf holds the client id and a placeholder; the secret
+        // itself is in the wallet, under the key AdvancedConfig named when it
+        // put it there. Absent is normal — most installed-app registrations
+        // have no secret — so a failed lookup carries on without one.
+        setStatus(tr("Reading sign-in details"));
+        auto *read = new QKeychain::ReadPasswordJob(kWalletService, this);
+        read->setKey(AdvancedConfig::walletKeyFor(gmail
+                                                      ? QStringLiteral("oauth/googleClientSecret")
+                                                      : QStringLiteral("oauth/microsoftClientSecret")));
+        connect(read, &QKeychain::Job::finished, this, [read, clientId, start] {
+            start(clientId, read->error() ? QString() : read->textData());
+        });
+        read->start();
+        return;
     }
+    start(clientId, clientSecret);
 }
 
 void MailClient::connectAccount()
@@ -3914,6 +3965,17 @@ void MailClient::applyFolderListing(const QList<MailBackend::FolderInfo> &listed
         // pathRows() — they depend on which ancestors are really mailboxes,
         // which a single descriptor cannot say.
         folders.append(f);
+    }
+
+    // The roles above are what isJunkFolderKey() answers from, and this
+    // listing is where they arrive — usually after a folder is already open.
+    // Re-deciding here is what makes the cached answer right for an account
+    // whose server names its junk folder rather than spelling it "Spam".
+    {
+        const bool wasJunk = m_selectedIsJunk;
+        m_selectedIsJunk = !m_selectedFolder.isEmpty() && isJunkFolderKey(m_selectedFolder);
+        if (wasJunk != m_selectedIsJunk)
+            Q_EMIT selectedFolderChanged();
     }
 
     // The same order the rest of the app builds trees in: inbox first,
@@ -5772,6 +5834,36 @@ void MailClient::markMessagesUnread(const QVariantList &rows)
     });
 }
 
+void MailClient::markMessagesRead(const QVariantList &rows)
+{
+    QList<qint64> uids;
+    for (const QVariant &v : rows) {
+        const int row = v.toInt();
+        const qint64 uid = m_messageModel.uidAt(row);
+        if (uid < 0 || m_messageModel.seenAt(row))
+            continue; // already read: nothing to do
+        m_messageModel.markSeen(row);
+        m_store.setSeen(m_selectedFolder, uid);
+        uids.append(uid);
+    }
+    if (uids.isEmpty())
+        return;
+    scheduleUnreadRecount();
+
+    if (!connected())
+        return;
+    // Set \Seen server-side so other clients and the next header sync agree,
+    // exactly as markMessagesUnread() clears it. Best effort, same as there.
+    QStringList ids;
+    for (qint64 uid : std::as_const(uids))
+        ids.append(QString::number(uid));
+    m_backend->setFlags(m_selectedFolder, ids, {QStringLiteral("seen")}, {},
+                        [this](MailBackend::Error error, const QString &) {
+        if (error != MailBackend::Error::None)
+            setStatus(tr("Marking read failed on the server"));
+    });
+}
+
 bool MailClient::folderHasUnread(const QString &mailBox)
 {
     // The sidebar's own figure, already in memory — asking the cache here
@@ -5837,6 +5929,39 @@ void MailClient::flushPendingSeen()
 }
 
 void MailClient::markMessageRead(int row)
+{
+    // Opening a message is what marks it read, after it has been open for
+    // view/markReadSeconds. 0 turns that off entirely, for anyone who keeps
+    // unread as a to-do list and marks read by hand; a long value means only
+    // a message actually read counts, not one glanced at while moving through
+    // the list. Only this path is affected — marking read explicitly still
+    // works.
+    const double seconds = AdvancedConfig::d("view/markReadSeconds");
+    if (seconds <= 0.0)
+        return;
+    const qint64 uid = m_messageModel.uidAt(row);
+    if (uid < 0 || m_messageModel.seenAt(row))
+        return;
+    // One pending mark at a time: opening another message replaces it, so the
+    // one left behind stays unread — which is the whole point of the delay.
+    m_pendingReadUid = uid;
+    if (!m_markReadTimer) {
+        m_markReadTimer = new QTimer(this);
+        m_markReadTimer->setSingleShot(true);
+        connect(m_markReadTimer, &QTimer::timeout, this, [this] {
+            // By the row it is on now: a sync or a re-sort may have moved it,
+            // and it may have left the folder altogether.
+            const int at = m_messageModel.rowForUid(m_pendingReadUid);
+            if (at >= 0)
+                applyReadMark(at);
+        });
+    }
+    // Never below a millisecond: the default is a tenth of a second, which is
+    // there to let a keypress move on before the mark lands, not to delay it.
+    m_markReadTimer->start(qMax(1, qRound(seconds * 1000.0)));
+}
+
+void MailClient::applyReadMark(int row)
 {
     const qint64 uid = m_messageModel.uidAt(row);
     if (uid < 0)

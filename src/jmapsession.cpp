@@ -3,6 +3,7 @@
 
 #include "jmapsession.h"
 
+#include "advancedconfig.h"
 #include "publicsuffixlist.h"
 
 #include <QJsonDocument>
@@ -17,10 +18,10 @@ namespace
 /// A session object is a few kilobytes; a megabyte is already a sign the URL
 /// answered with something else entirely (a login page, a proxy error). Refuse
 /// it rather than parse it.
-constexpr qint64 kMaxSessionBytes = 1024 * 1024;
+qint64 kMaxSessionBytes() { return AdvancedConfig::i("jmap/maxSessionBytes"); }
 /// Discovery blocks the account coming up, so it fails fast enough that a
 /// wrong hostname is a visible error rather than a spinner.
-constexpr int kDiscoveryTimeoutMs = 30000;
+int kDiscoveryTimeoutMs() { return AdvancedConfig::i("jmap/discoveryTimeoutMs"); }
 
 /// The template with its braces readable. QUrl percent-encodes `{` and `}`
 /// because they are not legal URL characters, which is harmless for transport
@@ -248,7 +249,7 @@ void JmapSession::discover(const MailBackend::Credentials &credentials)
     // https down to http, which would leak the credential above.
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                          QVariant::fromValue(QNetworkRequest::NoLessSafeRedirectPolicy));
-    request.setTransferTimeout(kDiscoveryTimeoutMs);
+    request.setTransferTimeout(kDiscoveryTimeoutMs());
 
     m_reply = m_net->get(request);
     connect(m_reply, &QNetworkReply::finished, this, [this] {
@@ -309,8 +310,8 @@ void JmapSession::handleReply(QNetworkReply *reply)
         return;
     }
 
-    const QByteArray body = reply->read(kMaxSessionBytes + 1);
-    if (body.size() > kMaxSessionBytes) {
+    const QByteArray body = reply->read(kMaxSessionBytes() + 1);
+    if (body.size() > kMaxSessionBytes()) {
         Q_EMIT failed(MailBackend::Error::Protocol,
                       tr("The JMAP session object is implausibly large; this does not look "
                          "like a JMAP server."));

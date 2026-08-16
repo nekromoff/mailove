@@ -33,6 +33,43 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="2.7" date="2026-08-16" type="stable">
+      <description>
+        <ul>
+          <li>Advanced settings: everything with no widget of its own — sync
+              pacing, connection counts, protocol timeouts, spam weights,
+              cache thresholds — edited as plain INI beside a searchable
+              reference. Out-of-range values are corrected on save and unknown
+              keys ignored with a warning.</li>
+          <li>No secret is ever written to that file: an OAuth client secret
+              typed there is moved into the system wallet and the line
+              rewritten to @wallet.</li>
+          <li>Optional Gravatar sender pictures, off by default — nothing is
+              requested or cached until they are turned on.</li>
+          <li>How long a message stays open before it counts as read is now a
+              number of seconds; 0 leaves it unread until marked by hand.</li>
+          <li>The message context menu alternates between Mark read and Mark
+              unread, and between Mark as spam and Not spam, instead of
+              offering the command that does nothing.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="2.6" date="2026-08-15" type="stable">
+      <description>
+        <ul>
+          <li>Forward as attachment: the original bytes as a message/rfc822
+              attachment, with every image, attachment and signature intact.</li>
+          <li>Copy as Markdown: select part of an HTML message and copy it as
+              Markdown rather than flattened plain text.</li>
+          <li>HTML to plain text rewritten — tables, lists and block structure
+              survive the conversion.</li>
+          <li>Reply and forward quotes stream into the composer, so it opens
+              instantly on a large message and stays responsive.</li>
+          <li>Spam scoring decodes RFC 2047 headers before judging them, so
+              encoded-word subjects reach the homoglyph rules.</li>
+        </ul>
+      </description>
+    </release>
     <release version="2.5" date="2026-08-14" type="stable">
       <description>
         <ul>

@@ -3,6 +3,8 @@
 
 #include "jmaprequest.h"
 
+#include "advancedconfig.h"
+
 #include "jmapsession.h"
 
 #include <QJsonDocument>
@@ -24,7 +26,7 @@ constexpr int kMethodCallSize = 3;
 /// downloadUrl, not from here — so a ceiling well above any plausible batch
 /// still catches a proxy error page or a redirect to a login form.
 constexpr qint64 kMaxResponseBytes = 64 * 1024 * 1024;
-constexpr int kRequestTimeoutMs = 60000;
+int kRequestTimeoutMs() { return AdvancedConfig::i("jmap/requestTimeoutMs"); }
 } // namespace
 
 QString JmapRequest::Response::errorType() const
@@ -114,7 +116,7 @@ void JmapRequest::post(bool isRetry)
                       QStringLiteral("application/json; charset=utf-8"));
     request.setRawHeader(QByteArrayLiteral("Accept"), QByteArrayLiteral("application/json"));
     m_session->authorize(request);
-    request.setTransferTimeout(kRequestTimeoutMs);
+    request.setTransferTimeout(kRequestTimeoutMs());
 
     const QByteArray body = QJsonDocument(requestObject()).toJson(QJsonDocument::Compact);
     m_reply = m_net->post(request, body);

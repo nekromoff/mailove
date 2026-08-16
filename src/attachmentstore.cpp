@@ -3,6 +3,8 @@
 
 #include "attachmentstore.h"
 
+#include "advancedconfig.h"
+
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
@@ -16,10 +18,10 @@ namespace
 {
 /// zstd level 3 (its default): most of the ratio of the slower levels at a
 /// speed where compressing a mail attachment is not worth measuring.
-constexpr int kZstdLevel = 3;
+int kZstdLevel() { return AdvancedConfig::i("attachments/zstdLevel"); }
 
 /// Bytes sampled to decide whether compressing the whole payload is worth it.
-constexpr int kSampleBytes = 64 * 1024;
+int kSampleBytes() { return AdvancedConfig::i("attachments/compressionSampleBytes"); }
 
 /// Every payload file starts with these four bytes: a magic pair, a format
 /// version, and the codec. The codec has to live *in the file* rather than
@@ -48,24 +50,27 @@ int codecOfFile(const QString &path)
 /// Compress only when the sample shrinks at least this much. JPEG/PNG/MP4/ZIP
 /// (and so also docx/xlsx/pptx, which are ZIP containers) sit well above it
 /// and are stored raw rather than burning CPU to grow them by a few bytes.
-constexpr double kWorthwhileRatio = 0.90;
+double kWorthwhileRatio() { return AdvancedConfig::d("attachments/worthwhileRatio"); }
 
 /// Nothing this store handles legitimately approaches it; the point of the
 /// ceiling is that the sizes below stay inside what a qsizetype allocation can
 /// actually express, whatever a frame header claims.
-constexpr unsigned long long kMaxPayloadBytes = 1024ull * 1024 * 1024;
+unsigned long long kMaxPayloadBytes()
+{
+    return static_cast<unsigned long long>(AdvancedConfig::i("attachments/maxPayloadBytes"));
+}
 
 QByteArray zstdCompress(const QByteArray &in)
 {
     const size_t bound = ZSTD_compressBound(size_t(in.size()));
-    if (bound > kMaxPayloadBytes)
+    if (bound > kMaxPayloadBytes())
         return {};
     // qsizetype, never int: QByteArray is 64-bit-sized in Qt 6, and narrowing
     // the length to int here would allocate a buffer smaller than the length
     // handed to zstd alongside it — a heap overflow written by zstd itself.
     QByteArray out(qsizetype(bound), Qt::Uninitialized);
     const size_t n = ZSTD_compress(out.data(), bound, in.constData(), size_t(in.size()),
-                                   kZstdLevel);
+                                   kZstdLevel());
     if (ZSTD_isError(n))
         return {};
     out.resize(qsizetype(n));
@@ -79,7 +84,7 @@ QByteArray zstdDecompress(const QByteArray &in)
     if (size == ZSTD_CONTENTSIZE_ERROR || size == ZSTD_CONTENTSIZE_UNKNOWN)
         return {};
     // The frame header states this length; it is not evidence of anything.
-    if (size > kMaxPayloadBytes)
+    if (size > kMaxPayloadBytes())
         return {};
     QByteArray out(qsizetype(size), Qt::Uninitialized);
     const size_t n = ZSTD_decompress(out.data(), size_t(size), in.constData(),
@@ -93,12 +98,17 @@ QByteArray zstdDecompress(const QByteArray &in)
 /// small compression instead of a full-size one.
 bool worthCompressing(const QByteArray &data)
 {
-    const QByteArray sample = data.left(kSampleBytes);
+    const QByteArray sample = data.left(kSampleBytes());
     const QByteArray probe = zstdCompress(sample);
     if (probe.isEmpty())
         return false;
-    return double(probe.size()) / double(sample.size()) < kWorthwhileRatio;
+    return double(probe.size()) / double(sample.size()) < kWorthwhileRatio();
 }
+}
+
+int AttachmentStore::externalizeThreshold()
+{
+    return AdvancedConfig::i("attachments/externalizeThresholdBytes");
 }
 
 QString AttachmentStore::rootDir()

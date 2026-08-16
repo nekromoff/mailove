@@ -3,6 +3,8 @@
 
 #include "avatarprovider.h"
 
+#include "advancedconfig.h"
+
 #include <QBuffer>
 #include <QDateTime>
 #include <QDir>
@@ -19,14 +21,22 @@
 
 #include <chrono>
 
-/// How long a fetched picture is reused before asking again. Avatars change
-/// rarely and a stale one is a cosmetic problem, so this is generous: the
-/// point of the cache is that opening a thread of twenty messages from the
-/// same person is one request, not twenty.
-static constexpr qint64 kHitDays = 30;
-/// And how long "this address has no picture" is remembered. Shorter: someone
-/// who signs up for Gravatar should show up within the week.
-static constexpr qint64 kMissDays = 7;
+/// How long a fetched picture is reused before asking again, and how long
+/// "this address has no picture" is remembered. Both from advanced.conf: a
+/// stale avatar is a cosmetic problem and every re-ask is another request
+/// gravatar.com sees, so the default year is deliberate — the point of the
+/// cache is that a mailbox full of the same correspondents is one request per
+/// person, not one per message. The miss is remembered for less — most
+/// addresses have no picture, and re-asking about all of them monthly is
+/// already more traffic than the answer is worth.
+static qint64 hitDays()
+{
+    return AdvancedConfig::i("avatars/cacheDays");
+}
+static qint64 missDays()
+{
+    return AdvancedConfig::i("avatars/missCacheDays");
+}
 /// Refuse anything implausible for a small square avatar. Gravatar sends a few
 /// KB; this is only here so a hostile or broken response cannot be read into
 /// memory unbounded.
@@ -52,13 +62,13 @@ QImage AvatarFetcher::cached(const QString &hash, int size, bool *known) const
     const QDateTime now = QDateTime::currentDateTimeUtc();
 
     const QFileInfo miss(cacheFile(hash, size, true));
-    if (miss.exists() && miss.lastModified().daysTo(now) < kMissDays) {
+    if (miss.exists() && miss.lastModified().daysTo(now) < missDays()) {
         *known = true;
         return QImage();
     }
 
     const QFileInfo hit(cacheFile(hash, size, false));
-    if (hit.exists() && hit.lastModified().daysTo(now) < kHitDays) {
+    if (hit.exists() && hit.lastModified().daysTo(now) < hitDays()) {
         QImage image;
         if (image.load(hit.absoluteFilePath())) {
             *known = true;
@@ -90,6 +100,13 @@ void AvatarFetcher::store(const QString &hash, int size, const QImage &image)
 
 void AvatarFetcher::fetch(const QString &hash, int size)
 {
+    // The switch is checked here as well as where the source URL is built:
+    // this is the object that would make the request, and it is the only
+    // place that can promise none is made.
+    if (!AdvancedConfig::b("avatars/enabled")) {
+        Q_EMIT fetched(hash, size, QImage());
+        return;
+    }
     if (m_dir.isEmpty()) {
         m_dir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation)
             + QLatin1String("/avatars");

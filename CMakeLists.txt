@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailove VERSION 2.6 LANGUAGES CXX)
+project(mailove VERSION 2.7 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -50,6 +50,8 @@ qt_standard_project_setup(REQUIRES 6.5)
 
 qt_add_executable(mailove
     src/main.cpp
+    src/advancedconfig.cpp
+    src/advancedconfig.h
     src/mailclient.cpp
     src/mailclient.h
     src/accountstore.cpp
@@ -91,6 +93,8 @@ qt_add_executable(mailove
     src/attachmentstore.h
     src/documenthandler.cpp
     src/documenthandler.h
+    src/avatarprovider.cpp
+    src/avatarprovider.h
     src/oauthhelper.cpp
     src/oauthhelper.h
     src/viewersecurity.cpp
@@ -114,6 +118,7 @@ set_target_properties(mailove PROPERTIES
 
 set_source_files_properties(src/qml/Main.qml PROPERTIES QT_RESOURCE_ALIAS Main.qml)
 set_source_files_properties(src/qml/AccountSheet.qml PROPERTIES QT_RESOURCE_ALIAS AccountSheet.qml)
+set_source_files_properties(src/qml/AdvancedSheet.qml PROPERTIES QT_RESOURCE_ALIAS AdvancedSheet.qml)
 set_source_files_properties(src/qml/MessageViewer.qml PROPERTIES QT_RESOURCE_ALIAS MessageViewer.qml)
 set_source_files_properties(src/qml/ComposeSheet.qml PROPERTIES QT_RESOURCE_ALIAS ComposeSheet.qml)
 set_source_files_properties(src/qml/ComposeWindow.qml PROPERTIES QT_RESOURCE_ALIAS ComposeWindow.qml)
@@ -132,6 +137,7 @@ qt_add_qml_module(mailove
     QML_FILES
         src/qml/Main.qml
         src/qml/AccountSheet.qml
+        src/qml/AdvancedSheet.qml
         src/qml/KeyManagerSheet.qml
         src/qml/NewKeyDialog.qml
         src/qml/MessageViewer.qml
@@ -310,7 +316,8 @@ add_custom_target(packages)
 add_dependencies(packages package-deb package-appimage)
 
 qt_add_executable(attachmenttest tests/attachmenttest.cpp
-    src/attachmentstore.cpp src/attachmentstore.h)
+    src/attachmentstore.cpp src/attachmentstore.h
+    src/advancedconfig.cpp src/advancedconfig.h)
 target_link_libraries(attachmenttest PRIVATE Qt6::Core PkgConfig::ZSTD)
 
 qt_add_executable(viewertest tests/viewertest.cpp src/viewersecurity.cpp src/viewersecurity.h)
@@ -319,7 +326,8 @@ target_link_libraries(viewertest PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick 
 # Checks DKIM canonicalization against the vectors published in RFC 6376 3.4.5.
 # Self-contained: no network, no fixtures. Exit 0 = all vectors match.
 qt_add_executable(dkimtest tests/dkimtest.cpp src/dkimverifier.cpp src/dkimverifier.h
-    src/publicsuffixlist.cpp src/publicsuffixlist.h)
+    src/publicsuffixlist.cpp src/publicsuffixlist.h
+    src/advancedconfig.cpp src/advancedconfig.h)
 target_link_libraries(dkimtest PRIVATE Qt6::Core Qt6::Network PkgConfig::LIBCRYPTO)
 
 # Diagnostic, not a pass/fail test: runs the real verifier over .eml files and
@@ -328,7 +336,8 @@ target_link_libraries(dkimtest PRIVATE Qt6::Core Qt6::Network PkgConfig::LIBCRYP
 #   ./dkimchecktool msg1.eml msg2.eml
 qt_add_executable(dkimchecktool tests/dkimchecktool.cpp
     src/dkimverifier.cpp src/dkimverifier.h
-    src/publicsuffixlist.cpp src/publicsuffixlist.h)
+    src/publicsuffixlist.cpp src/publicsuffixlist.h
+    src/advancedconfig.cpp src/advancedconfig.h)
 target_link_libraries(dkimchecktool PRIVATE
     Qt6::Core Qt6::Network KPim6::Mime PkgConfig::LIBCRYPTO)
 
@@ -345,7 +354,8 @@ target_link_libraries(rawfidelitytest PRIVATE Qt6::Core KPim6::Mime)
 #   ./fidelitytool --account 0 --folder INBOX --count 30
 qt_add_executable(fidelitytool tests/fidelitytool.cpp
     src/dkimverifier.cpp src/dkimverifier.h
-    src/publicsuffixlist.cpp src/publicsuffixlist.h)
+    src/publicsuffixlist.cpp src/publicsuffixlist.h
+    src/advancedconfig.cpp src/advancedconfig.h)
 target_link_libraries(fidelitytool PRIVATE
     Qt6::Core Qt6::Network Qt6::Sql KPim6::Mime KPim6::IMAP
     Qt6Keychain::Qt6Keychain PkgConfig::LIBCRYPTO)
@@ -365,7 +375,8 @@ qt_add_executable(spamtool tests/spamtool.cpp
     src/mailstore.cpp src/mailstore.h
     src/messagelistmodel.cpp src/messagelistmodel.h
     src/attachmentstore.cpp src/attachmentstore.h
-    src/publicsuffixlist.cpp src/publicsuffixlist.h)
+    src/publicsuffixlist.cpp src/publicsuffixlist.h
+    src/advancedconfig.cpp src/advancedconfig.h)
 target_link_libraries(spamtool PRIVATE
     Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql KPim6::Mime PkgConfig::ZSTD)
 
@@ -377,7 +388,8 @@ qt_add_executable(storetest tests/storetest.cpp
     src/messagelistmodel.cpp src/messagelistmodel.h
     src/attachmentstore.cpp src/attachmentstore.h
     src/spamheuristics.cpp src/spamheuristics.h
-    src/publicsuffixlist.cpp src/publicsuffixlist.h)
+    src/publicsuffixlist.cpp src/publicsuffixlist.h
+    src/advancedconfig.cpp src/advancedconfig.h)
 target_include_directories(storetest PRIVATE src)
 target_link_libraries(storetest PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql PkgConfig::ZSTD)
 
@@ -387,7 +399,8 @@ target_link_libraries(storetest PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql
 qt_add_executable(jmapsessiontest tests/jmapsessiontest.cpp
     src/jmapsession.cpp src/jmapsession.h
     src/publicsuffixlist.cpp src/publicsuffixlist.h
-    src/mailbackend.h)
+    src/mailbackend.h
+    src/advancedconfig.cpp src/advancedconfig.h)
 target_include_directories(jmapsessiontest PRIVATE src)
 target_compile_definitions(jmapsessiontest PRIVATE
     JMAP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
@@ -400,7 +413,8 @@ qt_add_executable(jmaprequesttest tests/jmaprequesttest.cpp
     src/jmaprequest.cpp src/jmaprequest.h
     src/jmapsession.cpp src/jmapsession.h
     src/publicsuffixlist.cpp src/publicsuffixlist.h
-    src/mailbackend.h)
+    src/mailbackend.h
+    src/advancedconfig.cpp src/advancedconfig.h)
 target_include_directories(jmaprequesttest PRIVATE src)
 target_compile_definitions(jmaprequesttest PRIVATE
     JMAP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
@@ -414,7 +428,8 @@ qt_add_executable(jmapbackendtest tests/jmapbackendtest.cpp
     src/jmaprequest.cpp src/jmaprequest.h
     src/jmapsession.cpp src/jmapsession.h
     src/publicsuffixlist.cpp src/publicsuffixlist.h
-    src/mailbackend.h)
+    src/mailbackend.h
+    src/advancedconfig.cpp src/advancedconfig.h)
 target_include_directories(jmapbackendtest PRIVATE src)
 target_compile_definitions(jmapbackendtest PRIVATE
     JMAP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
@@ -445,18 +460,28 @@ qt_add_executable(mimeutilstest tests/mimeutilstest.cpp
     src/messagelistmodel.cpp src/messagelistmodel.h
     src/attachmentstore.cpp src/attachmentstore.h
     src/spamheuristics.cpp src/spamheuristics.h
-    src/publicsuffixlist.cpp src/publicsuffixlist.h)
+    src/publicsuffixlist.cpp src/publicsuffixlist.h
+    src/advancedconfig.cpp src/advancedconfig.h)
 target_include_directories(mimeutilstest PRIVATE src)
 target_link_libraries(mimeutilstest PRIVATE
     Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql KPim6::Mime PkgConfig::ZSTD)
 set_target_properties(mimeutilstest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)
+
+# The advanced-settings file: parsing, clamping and the verbatim round trip.
+# Writes into a throwaway XDG_CONFIG_HOME, so it never touches a real config.
+qt_add_executable(advancedconfigtest tests/advancedconfigtest.cpp
+    src/advancedconfig.cpp src/advancedconfig.h)
+target_include_directories(advancedconfigtest PRIVATE src)
+target_link_libraries(advancedconfigtest PRIVATE Qt6::Core)
+set_target_properties(advancedconfigtest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)
 
 # Pass/fail companion to spamtool: every rule fires on the shape it was written
 # for, and none of the ham corpus below the unsure threshold moves. The second
 # half is the one that must not be relaxed to fit a new rule.
 qt_add_executable(spamheuristicstest tests/spamheuristicstest.cpp
     src/spamheuristics.cpp src/spamheuristics.h
-    src/publicsuffixlist.cpp src/publicsuffixlist.h)
+    src/publicsuffixlist.cpp src/publicsuffixlist.h
+    src/advancedconfig.cpp src/advancedconfig.h)
 target_include_directories(spamheuristicstest PRIVATE src)
 target_link_libraries(spamheuristicstest PRIVATE Qt6::Core Qt6::Network)
 set_target_properties(spamheuristicstest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)

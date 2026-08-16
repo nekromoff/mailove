@@ -3,6 +3,8 @@
 
 #include "dkimverifier.h"
 
+#include "advancedconfig.h"
+
 #include "publicsuffixlist.h"
 
 #include <QCryptographicHash>
@@ -513,11 +515,16 @@ QByteArray DkimVerifier::publicKeyRecord(const QString &dnsName, bool *tempError
         // "No such key" is an answer too (NXDOMAIN), and the one senders with
         // no DKIM produce on every message — cache it briefly rather than
         // hammering the resolver with known misses. Positive answers keep the
-        // record's TTL, clamped: a 5 s TTL is load-balancer noise, and hours
-        // past a day defeats key rotation.
+        // record's TTL, clamped: the floor outlives the short TTLs key records
+        // usually publish, which is where the repeat lookups come from, and
+        // hours past a day defeats key rotation. Rotation is what the ceiling
+        // protects — it publishes a new selector, so a stale record for the
+        // old one is simply never asked for again. Revocation reuses the
+        // selector, which is what the floor is kept to half an hour for.
         const qint64 keep = record.isEmpty()
-            ? 600
-            : qBound(qint64(300), ttl, qint64(24) * 3600);
+            ? qint64(AdvancedConfig::i("dkim/dnsNegativeTtl"))
+            : qBound(qint64(AdvancedConfig::i("dkim/dnsCacheMinTtl")), ttl,
+                     qint64(AdvancedConfig::i("dkim/dnsCacheMaxTtl")));
         m_dnsCache.insert(dnsName, {record, now + keep});
     }
     return record;

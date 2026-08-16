@@ -362,6 +362,8 @@ public:
     /// list shows To instead, and search looks there too.
     Q_PROPERTY(bool viewingOutgoing READ viewingOutgoing NOTIFY selectedFolderChanged)
     bool viewingOutgoing() const { return listsRecipients(m_selectedFolder); }
+    /// True while the open folder is the junk one — see viewingJunkFolder().
+    Q_PROPERTY(bool viewingJunk READ viewingJunkFolder NOTIFY selectedFolderChanged)
     /// True while the open folder is this account's Drafts folder — clicking a
     /// message there reopens it in the composer instead of the reader.
     Q_PROPERTY(bool viewingDrafts READ viewingDrafts NOTIFY selectedFolderChanged)
@@ -384,6 +386,17 @@ public:
     /// Known recipient addresses (previously sent to) matching \a prefix,
     /// best-ranked first — compose field autocompletion.
     Q_INVOKABLE QStringList recipientSuggestions(const QString &prefix);
+    /// The Image.source that shows \a from's picture, or an empty string when
+    /// sender pictures are off (advanced.conf, avatars/enabled) or the header
+    /// carries no address. \a from may be a full "Name <addr>" header.
+    ///
+    /// What goes into the URL — and out to gravatar.com — is the SHA-256 of
+    /// the lowercased address, never the address, because that is what
+    /// Gravatar keys pictures by. Off by default: the request itself tells
+    /// gravatar.com this reader saw that address.
+    Q_INVOKABLE QString avatarSource(const QString &from) const;
+    /// Pixel size avatarSource() asks for, for the QML that lays it out.
+    Q_INVOKABLE int avatarSize() const;
     Q_INVOKABLE void connectAccount();
     Q_INVOKABLE void openFolder(const QString &mailBox);
     Q_INVOKABLE void fetchMessage(int row);
@@ -594,9 +607,14 @@ private:
     /// Records a body-derived attachment kind (e.g. calendar invite) in the
     /// cache and the visible list.
     void refineAttachKind(const QString &folder, qint64 uid, KMime::Message *msg);
-    /// Marks a message read everywhere: visible list, disk cache, and (when
-    /// online) the server via STORE \Seen — so the state survives restarts.
+    /// Starts the automatic read mark for the message just opened at \a row:
+    /// after view/markReadSeconds it is marked read, unless another message is
+    /// opened (or the folder changes) first. Does nothing when that is 0.
     void markMessageRead(int row);
+    /// Marks the message at \a row read everywhere: visible list, disk cache,
+    /// and (when online) the server via STORE \Seen — so the state survives
+    /// restarts. What the delay above ends in.
+    void applyReadMark(int row);
 
 public:
     /// Clears \Seen on the given model rows, in the model, the cache and (when
@@ -604,6 +622,10 @@ public:
     /// marked unread while open stays open and stays unread, and the ordinary
     /// rule takes over again — it is marked read the next time it is opened.
     Q_INVOKABLE void markMessagesUnread(const QVariantList &rows);
+    /// Sets \Seen on the given model rows — the counterpart to the above, and
+    /// the explicit command that still works when view/markReadSeconds is 0.
+    /// Same three places: model, cache, server when online.
+    Q_INVOKABLE void markMessagesRead(const QVariantList &rows);
     /// Marks every message of \a mailBox read — in the cache, in the list when
     /// that folder is the open one, and (when online) on the server. Acts on
     /// the whole folder, not on the page of headers the list happens to hold.
@@ -924,6 +946,15 @@ private:
     QString junkFolderName() const;
     /// Junk/spam folders get hostile-content handling in the viewer.
     bool isJunkFolder(const QString &mailBox) const;
+    /// Whether the folder on screen is the junk one — isJunkFolderKey(), the
+    /// same answer the sidebar's junk icon and the viewer's hostile-content
+    /// defaults use, decided once as the folder loads (setSelectedFolder())
+    /// and again if the server names its junk folder later.
+    ///
+    /// The context menu offers "Not spam" for everything in this folder, mark
+    /// or no mark: a message put there by a server-side rule carries no local
+    /// score to flip.
+    bool viewingJunkFolder() const { return m_selectedIsJunk; }
     /// authserv-ids whose Authentication-Results we are willing to believe for
     /// the account's IMAP host — empty when authVerification is off, which is
     /// what makes the whole SPF/DKIM/DMARC display collapse to nothing.
@@ -1004,6 +1035,14 @@ private:
     /// scratch by every folder listing, so none can outlive its account.
     QString m_trashFolder;
     QString m_junkFolder;
+    /// Whether m_selectedFolder is the junk one, decided when it is set rather
+    /// than on every ask — see viewingJunkFolder().
+    bool m_selectedIsJunk = false;
+    /// The open message's delayed read mark: the uid waiting for the timer,
+    /// and the timer itself (created on first use). Restarted by every open,
+    /// stopped by a folder change — see markMessageRead().
+    qint64 m_pendingReadUid = -1;
+    QTimer *m_markReadTimer = nullptr;
     /// Gmail's \All archive: excluded from the folder list and the backfill
     /// because it re-stores every message already held under INBOX and labels.
     QString m_allMailFolder;

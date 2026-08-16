@@ -3,6 +3,8 @@
 
 #include "publicsuffixlist.h"
 
+#include "advancedconfig.h"
+
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -24,14 +26,14 @@ namespace
 {
 Q_LOGGING_CATEGORY(logPsl, "mailove.psl")
 
-constexpr auto kRefreshInterval = std::chrono::hours(24 * 7);
+auto kRefreshInterval() { return std::chrono::hours(AdvancedConfig::i("psl/refreshHours")); }
 /// How often we wake up to notice the list has gone stale. The list changes a
 /// few times a week and nothing breaks if we are a day late, so this is a cheap
 /// tick rather than a precise schedule.
-constexpr auto kCheckInterval = std::chrono::hours(6);
+auto kCheckInterval() { return std::chrono::hours(AdvancedConfig::i("psl/checkHours")); }
 /// Deferred so it never competes with startup, like the message-id backfill and
 /// the attachment migration next to it in MailClient's constructor.
-constexpr auto kStartupDelay = std::chrono::seconds(10);
+auto kStartupDelay() { return std::chrono::seconds(AdvancedConfig::i("psl/startupDelaySeconds")); }
 /// Full jitter on top of a scheduled fetch, so clients launched together do not
 /// arrive at the server in lockstep. Breaking the tie is all it has to do —
 /// same 1 s spread the connection backoff in mailclient.cpp uses.
@@ -42,7 +44,7 @@ std::chrono::milliseconds withJitter(std::chrono::milliseconds base)
     return base + std::chrono::milliseconds(QRandomGenerator::global()->bounded(kJitterMs + 1));
 }
 
-const char kListUrl[] = "https://publicsuffix.org/list/public_suffix_list.dat";
+QString listUrl() { return AdvancedConfig::s("psl/listUrl"); }
 
 /// A download that lost its way — a captive portal's login page, an error page,
 /// a truncated transfer — must never replace a good list. The real file is
@@ -87,6 +89,12 @@ void PublicSuffixList::start()
 
     loadFromDisk();
 
+    // psl/enabled off means the cached (or built-in) list is all there is:
+    // no timer, no request. This is one of the few outbound requests that does
+    // not go to the user's own mail server, so it has an off switch.
+    if (!AdvancedConfig::b("psl/enabled"))
+        return;
+
     // Re-jittered on every tick rather than left on a fixed period, so a
     // long-running client does not settle into hitting the server at the same
     // minute each time.
@@ -94,14 +102,14 @@ void PublicSuffixList::start()
     timer->setSingleShot(true);
     QObject::connect(timer, &QTimer::timeout, m_nam, [this, timer] {
         download();
-        timer->start(withJitter(kCheckInterval));
+        timer->start(withJitter(kCheckInterval()));
     });
 
     // Not at launch: the first seconds belong to opening the window and getting
     // the mailbox on screen, and nothing here is needed until a message is
     // opened. The cached copy is already in memory by now; this only refreshes
     // it, and a week-old list is fine for another few seconds.
-    timer->start(withJitter(kStartupDelay));
+    timer->start(withJitter(kStartupDelay()));
 }
 
 void PublicSuffixList::loadFromDisk()
@@ -125,12 +133,12 @@ void PublicSuffixList::download()
     const QFileInfo cached(cachePath());
     if (cached.exists()
         && cached.lastModified().secsTo(QDateTime::currentDateTime())
-            < std::chrono::duration_cast<std::chrono::seconds>(kRefreshInterval).count()) {
+            < std::chrono::duration_cast<std::chrono::seconds>(kRefreshInterval()).count()) {
         return; // still fresh
     }
 
     m_downloading = true;
-    QNetworkRequest request{QUrl(QString::fromLatin1(kListUrl))};
+    QNetworkRequest request{QUrl(listUrl())};
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                          QNetworkRequest::NoLessSafeRedirectPolicy);
     QNetworkReply *reply = m_nam->get(request);
