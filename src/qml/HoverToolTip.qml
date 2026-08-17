@@ -29,14 +29,23 @@ QQC2.ToolTip {
         const escape = s => s.replace(/&/g, "&amp;")
                              .replace(/</g, "&lt;")
                              .replace(/>/g, "&gt;")
+        // An explainer line — "DKIM: Does …? Yes" — gets its acronym and its
+        // answer words bolded, so the eye can walk the tooltip on the bold
+        // alone: which check, what came of it. Applied to escaped text; the
+        // pattern's anchors keep it off anything sender-shaped.
+        const boldExplainer = line => line
+            .replace(/^(SPF|DKIM|DMARC|ARC|COMPAUTH):/,
+                     "<b>$1</b>:")
+            .replace(/\?( (?:Yes|No|Warning|Not checked)(?:, (?:Yes|No|Warning|Not checked))*)$/,
+                     "?<b>$1</b>")
         if (!tip.markFailures)
-            return escape(tip.text).replace(/\n/g, "<br>")
+            return escape(tip.text).split("\n").map(boldExplainer).join("<br>")
         // Bold the whole failing field, not just the verdict word: the part
         // worth reading is the "(p=none dis=none) header.from=…" that follows
         // it. Split before escaping — escaping introduces ';' via "&amp;",
         // which would otherwise chop a field in half.
         return tip.text.split("\n").map(line =>
-            tip.splitFields(line).map(field => {
+            boldExplainer(tip.splitFields(line).map(field => {
                 // Only a *leading* method=result is a verdict. Anything later in
                 // the field echoes sender-supplied data, so a sender could put
                 // "dkim=fail" in their own envelope address and pick which
@@ -49,7 +58,7 @@ QQC2.ToolTip {
                 // field separators stay evenly spaced.
                 const [, lead, body, trail] = /^(\s*)([\s\S]*?)(\s*)$/.exec(field)
                 return lead + "<b>" + escape(body) + "</b>" + trail
-            }).join(";")
+            }).join(";"))
         ).join("<br>") // StyledText ignores bare newlines
     }
 

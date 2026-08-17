@@ -82,69 +82,6 @@ static bool isThrottleError(const QString &err)
         || e.contains(QStringLiteral("TOO MANY SIMULTANEOUS CONNECTIONS"));
 }
 
-/// Drops RFC 8601 comments "(…)" and quoted strings from an
-/// Authentication-Results value. Both carry sender-supplied text — a genuine
-/// header echoes the envelope sender in smtp.mailfrom= — and both may contain
-/// ';' or the literal "dkim=pass", so they have to go before the value is
-/// split into fields or a sender could smuggle a verdict into the display.
-static QString stripAuthCommentsAndQuotes(const QString &value)
-{
-    QString out;
-    out.reserve(value.size());
-    int commentDepth = 0;
-    bool inQuotes = false;
-    for (int i = 0; i < value.size(); ++i) {
-        const QChar c = value.at(i);
-        if (c == QLatin1Char('\\') && (inQuotes || commentDepth > 0)) {
-            ++i; // skip the escaped character
-            continue;
-        }
-        if (inQuotes) {
-            if (c == QLatin1Char('"'))
-                inQuotes = false;
-            continue;
-        }
-        if (commentDepth > 0) {
-            if (c == QLatin1Char('('))
-                ++commentDepth;
-            else if (c == QLatin1Char(')'))
-                --commentDepth;
-            continue;
-        }
-        if (c == QLatin1Char('"')) {
-            inQuotes = true;
-        } else if (c == QLatin1Char('(')) {
-            ++commentDepth;
-            out.append(QLatin1Char(' '));
-        } else {
-            out.append(c);
-        }
-    }
-    return out;
-}
-
-/// The "method=result" verdicts of an Authentication-Results value, lowercased
-/// and in header order. Only the leading token of each ';'-delimited field
-/// counts: everything after it (smtp.mailfrom=, header.from=, reason=) echoes
-/// sender-supplied data, so scanning the whole value would let a sender inject
-/// a passing verdict into an otherwise genuine header.
-static QStringList authResultVerdicts(const QString &value)
-{
-    static const QRegularExpression methodRe(
-        QStringLiteral("^\\s*(spf|dkim|dmarc)\\s*=\\s*([a-z]+)"),
-        QRegularExpression::CaseInsensitiveOption);
-    QStringList out;
-    const QStringList fields =
-        stripAuthCommentsAndQuotes(value).split(QLatin1Char(';'));
-    // Field 0 is the authserv-id, never a verdict.
-    for (qsizetype i = 1; i < fields.size(); ++i) {
-        const auto m = methodRe.match(fields.at(i));
-        if (m.hasMatch())
-            out.append(m.captured(1).toLower() + QLatin1Char('=') + m.captured(2).toLower());
-    }
-    return out;
-}
-
 /// True when \a authservId is exactly one of \a trustedDomains or a host under
 /// one. Must not be a substring test: "contains" would accept an authserv-id
 /// of "gmail.com.attacker.example", which any sender can stamp on their own
@@ -171,7 +108,7 @@ static QString trustedAuthResults(const KMime::Message *msg,
         const QString value = ar->asUnicodeString();
         // authserv-id is the first field, optionally followed by a version
         // number: "purelymail.com 1; spf=pass …".
-        const QString authservId = stripAuthCommentsAndQuotes(value)
+        const QString authservId = SpamHeuristics::stripAuthCommentsAndQuotes(value)
                                        .section(QLatin1Char(';'), 0, 0)
                                        .simplified()
                                        .section(QLatin1Char(' '), 0, 0)
@@ -214,46 +151,13 @@ static MessageListModel::Header headerFromBackend(const MailBackend::HeaderInfo 
     // the list knows an encrypted message without waiting for its body.
     h.crypto = PgpMime::storedKind(PgpMime::kindFromHead(msg->head()));
     h.authInfo = trustedAuthResults(msg, trustedAuthDomains);
-    const QStringList verdicts = authResultVerdicts(h.authInfo);
-    for (const QString &verdict : verdicts) {
-        const QString result = verdict.section(QLatin1Char('='), 1);
-        // fail, softfail, hardfail, permerror — anything but pass/neutral/none
-        if (result.endsWith(QLatin1String("fail")) || result == QLatin1String("permerror"))
-            h.suspicious = true;
-    }
+    // Parsed by the same functions the spam scorer's context is built from, so
+    // the "!" marker and the score can never disagree about the same header.
+    // The marker does not grade: soft or hard, something failed to check out.
+    if (SpamHeuristics::authResultsFailed(h.authInfo)
+        || SpamHeuristics::authResultsSoftFailed(h.authInfo))
+        h.suspicious = true;
     return h;
-}
-
-/// True when a trusted Authentication-Results reported a pass for any method.
-/// Kept apart from Header::suspicious, which records the opposite: a message
-/// can carry neither (no trusted verdict at all), and "no evidence" must not be
-/// confused with either outcome.
-static bool authResultsPassed(const QString &authInfo)
-{
-    const QStringList verdicts = authResultVerdicts(authInfo);
-    for (const QString &verdict : verdicts) {
-        if (verdict.endsWith(QLatin1String("=pass")))
-            return true;
-    }
-    return false;
-}
-
-/// True when a trusted Authentication-Results reported arc=pass.
-///
-/// Read separately from authResultsPassed() because it answers a different
-/// question. A pass says the message is from where it claims; arc=pass says
-/// that a *relay* is why the other methods failed, and the message was sound
-/// before it crossed one. SpamHeuristics::Context documents what that is worth.
-static bool authResultsArcPassed(const QString &authInfo)
-{
-    const QStringList verdicts = authResultVerdicts(authInfo);
-    for (const QString &verdict : verdicts) {
-        if (verdict.trimmed().startsWith(QLatin1String("arc="))
-            && verdict.endsWith(QLatin1String("=pass"))) {
-            return true;
-        }
-    }
-    return false;
 }
 
 /// The authserv-id domains whose Authentication-Results headers we trust for a
@@ -3187,12 +3091,26 @@ QString MailClient::avatarSource(const QString &from) const
         return {};
     const QString hash = QString::fromLatin1(
         QCryptographicHash::hash(address.toUtf8(), QCryptographicHash::Sha256).toHex());
-    return QStringLiteral("image://gravatar/%1/%2").arg(avatarSize()).arg(hash);
+    // Fetched at twice the size it is shown at: avatarSize() is a logical
+    // pixel size, and a 40-logical-px image displayed on a HiDPI screen is
+    // drawn from 80 device pixels. Gravatar serves any size for the same
+    // request, so the doubling costs a few KB once per address per year.
+    return QStringLiteral("image://gravatar/%1/%2").arg(avatarSize() * 2).arg(hash);
 }
 
 int MailClient::avatarSize() const
 {
     return AdvancedConfig::i("avatars/sizePixels");
+}
+
+QStringList MailClient::trustedAuthMethods() const
+{
+    QStringList out;
+    for (const char *m : {"spf", "dkim", "dmarc", "arc", "compauth"}) {
+        if (SpamHeuristics::authMethodTrusted(QLatin1String(m)))
+            out.append(QLatin1String(m));
+    }
+    return out;
 }
 
 QStringList MailClient::ownAddresses() const
@@ -3243,7 +3161,8 @@ MailClient::spamContextFor(const QString &folder, const QString &fromValue,
                            const QByteArray &head,
                            const QSet<QString> &knownSenders,
                            const QHash<QString, MailStore::DomainHistory> &orgHistory,
-                           const QSet<QString> &knownMsgIds) const
+                           const QSet<QString> &knownMsgIds,
+                           const MailStore::SentTldProfile &tldProfile) const
 {
     SpamHeuristics::Context ctx;
     ctx.inJunkFolder = isJunkFolderKey(folder);
@@ -3252,6 +3171,8 @@ MailClient::spamContextFor(const QString &folder, const QString &fromValue,
     const auto hist = orgHistory.value(SpamHeuristics::organizationalDomainOf(fromAddr));
     ctx.seenFromOrg = hist.seen;
     ctx.daysKnownOrg = hist.days;
+    ctx.familiarTlds = tldProfile.familiar;
+    ctx.sentTldSample = tldProfile.sample;
     ctx.ownAddresses = ownAddresses();
     const QSet<QString> refs = referencedMessageIds(head);
     for (const QString &id : refs) {
@@ -3267,17 +3188,19 @@ void MailClient::scoreHeader(MessageListModel::Header &h, const QString &folder,
                              const QByteArray &head,
                              const QSet<QString> &knownSenders,
                              const QHash<QString, MailStore::DomainHistory> &orgHistory,
-                             const QSet<QString> &knownMsgIds)
+                             const QSet<QString> &knownMsgIds,
+                             const MailStore::SentTldProfile &tldProfile)
 {
-    SpamHeuristics::Context ctx =
-        spamContextFor(folder, h.from, head, knownSenders, orgHistory, knownMsgIds);
+    SpamHeuristics::Context ctx = spamContextFor(folder, h.from, head, knownSenders,
+                                                 orgHistory, knownMsgIds, tldProfile);
     ctx.authInfo = h.authInfo;
-    // headerFromImap() already reduced the trusted Authentication-Results to
-    // this; re-deriving it here would be a second chance to disagree with the
-    // "!" marker the list already shows.
-    ctx.authFailed = h.suspicious;
-    ctx.authPassed = authResultsPassed(h.authInfo);
-    ctx.arcPassed = authResultsArcPassed(h.authInfo);
+    // Re-derived rather than read off h.suspicious: the marker deliberately
+    // does not grade (soft or hard, it shows), while the scorer must — only
+    // an outright failure may revoke the known-correspondent exemption.
+    ctx.authFailed = SpamHeuristics::authResultsFailed(h.authInfo);
+    ctx.authSoftFailed = SpamHeuristics::authResultsSoftFailed(h.authInfo);
+    ctx.authPassed = SpamHeuristics::authResultsPassed(h.authInfo);
+    ctx.arcPassed = SpamHeuristics::authResultsArcPassed(h.authInfo);
     ctx.crypto = h.crypto;
     const SpamHeuristics::Score s = SpamHeuristics::score({head, {}, {}}, ctx);
     h.spamScore = s.total;
@@ -3310,19 +3233,18 @@ void MailClient::rescoreWithBody(const QString &folder, qint64 uid, KMime::Messa
         spamContextFor(folder, fromValue, m.head, m_store.knownCorrespondents({fromAddr}),
                        m_store.senderDomainHistory(org.isEmpty() ? QSet<QString>()
                                                                  : QSet<QString>{org}),
-                       m_store.knownMessageIds(referencedMessageIds(m.head)));
+                       m_store.knownMessageIds(referencedMessageIds(m.head)),
+                       m_store.sentTldProfile());
     // The authentication verdict is the one thing the body cannot improve on,
     // and re-deriving it here would need the trusted-domain list all over
     // again — so it is carried over from the header pass where there is one.
     const QString authInfo = trustedAuthResults(msg, trustedAuthDomains());
     ctx.authInfo = authInfo;
-    ctx.authPassed = authResultsPassed(authInfo);
-    ctx.arcPassed = authResultsArcPassed(authInfo);
-    for (const QString &verdict : authResultVerdicts(authInfo)) {
-        const QString result = verdict.section(QLatin1Char('='), 1);
-        if (result.endsWith(QLatin1String("fail")) || result == QLatin1String("permerror"))
-            ctx.authFailed = true;
-    }
+    ctx.authPassed = SpamHeuristics::authResultsPassed(authInfo);
+    ctx.arcPassed = SpamHeuristics::authResultsArcPassed(authInfo);
+    if (SpamHeuristics::authResultsFailed(authInfo))
+        ctx.authFailed = true;
+    ctx.authSoftFailed = SpamHeuristics::authResultsSoftFailed(authInfo);
     ctx.crypto = PgpMime::storedKind(PgpMime::kindFromHead(m.head));
 
     const SpamHeuristics::Score s = SpamHeuristics::score(m, ctx);
@@ -3484,8 +3406,9 @@ void MailClient::appendScoredHeaders(QList<MessageListModel::Header> &out,
     const QSet<QString> known = m_store.knownCorrespondents(senders);
     const auto orgHistory = m_store.senderDomainHistory(orgs);
     const QSet<QString> knownMsgIds = m_store.knownMessageIds(references);
+    const auto tldProfile = m_store.sentTldProfile();
     for (qsizetype i = 0; i < batch.size(); ++i)
-        scoreHeader(batch[i], folder, heads.at(i), known, orgHistory, knownMsgIds);
+        scoreHeader(batch[i], folder, heads.at(i), known, orgHistory, knownMsgIds, tldProfile);
     out += batch;
 }
 

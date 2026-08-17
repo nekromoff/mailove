@@ -72,6 +72,12 @@ struct Context {
     bool authFailed = false;
     /// Same provenance, reporting a pass.
     bool authPassed = false;
+    /// Same provenance, but the softer verdict: spf=softfail is the domain's
+    /// own hedge (~all), "probably not ours, but do not bounce it". Scored by
+    /// its own lower-weighted rule, and — unlike \a authFailed — it never
+    /// revokes the known-correspondent exemption: a known contact's mail
+    /// crossing a forwarder is precisely what softfail looks like.
+    bool authSoftFailed = false;
 
     /// The same trusted Authentication-Results reported arc=pass.
     ///
@@ -101,6 +107,28 @@ struct Context {
     /// suspicious: familiarity can only ever earn ham credit here.
     int seenFromOrg = 0;
     int daysKnownOrg = 0;
+
+    /// The top-level domains the user's own outgoing mail actually goes to,
+    /// each one holding at least spam/tldSharePercent of everything they have
+    /// written to. Filled from MailStore::sentTldProfile().
+    ///
+    /// A weaker, coarser cousin of \a knownCorrespondent and \a seenFromOrg,
+    /// and the only one of the three that can say anything about a sender who
+    /// is a complete stranger from a domain never seen here: someone who
+    /// corresponds within .sk and .com has no business receiving a first
+    /// contact from .top, and it is exactly the first contact that the other
+    /// two familiarity signals are structurally blind to.
+    ///
+    /// Only ever an accusation, never credit — a message from a TLD the user
+    /// does write to is not thereby any less spammy, and most spam arrives
+    /// from .com. See \a sentTldSample for why it is also weighted low.
+    QStringList familiarTlds;
+    /// How many sent-to addresses the list above was computed from. The rule
+    /// stays silent below spam/tldMinSample, because a profile built from a
+    /// handful of sent messages describes the user's last week rather than
+    /// their correspondence, and a fresh install has no Sent folder synced at
+    /// all. Zero disables the rule outright.
+    int sentTldSample = 0;
 
     /// Every address the user receives mail at, lowercased and +tag-stripped.
     /// Used only to notice that a message is addressed to nobody the user is —
@@ -181,6 +209,41 @@ struct Message {
 
 Score score(const Message &msg, const Context &ctx);
 
+/// An Authentication-Results value with its (comments) and quoted strings
+/// dropped. Both carry sender-supplied text — a genuine header echoes the
+/// envelope sender in smtp.mailfrom= — and both may contain ';' or the literal
+/// "dkim=pass", so they have to go before the value is split into fields or a
+/// sender could smuggle a verdict past the parser.
+QString stripAuthCommentsAndQuotes(const QString &value);
+/// The "method=result" verdicts of an Authentication-Results value, lowercased
+/// and in header order: spf, dkim, dmarc, arc, and compauth (Microsoft's
+/// composite verdict, stamped only by Exchange Online). Only the leading token
+/// of each ';'-delimited field counts — everything after it echoes
+/// sender-supplied data.
+QStringList authResultVerdicts(const QString &value);
+/// Whether spam/trust<Method> says this method's verdicts count — the same
+/// switch for scoring and for display, so the viewer's badge never shows a
+/// verdict the score ignored. Unknown methods are trusted (there is no key to
+/// say otherwise).
+bool authMethodTrusted(const QString &method);
+/// True when a verdict reports an outright authentication failure:
+/// spf/dkim/dmarc fail, hardfail or permerror — and compauth=fail, unless
+/// spam/trustCompauth is off. softfail is deliberately not this
+/// (authResultsSoftFailed), and arc= entries are not read here: a broken
+/// chain is not evidence of forgery, only a missing exemption.
+bool authResultsFailed(const QString &value);
+/// True when a trusted method reported softfail — the domain hedging rather
+/// than denying. Weighted apart from a failure, and never strong enough to
+/// revoke the known-correspondent exemption.
+bool authResultsSoftFailed(const QString &value);
+/// True when spf, dkim, dmarc or (when trusted) compauth reports a pass.
+/// arc=pass deliberately does not count: what it certifies is that a relay
+/// broke the others, which is authResultsArcPassed()'s question, not this one.
+bool authResultsPassed(const QString &value);
+/// True when the value carries arc=pass. See Context::arcPassed for what that
+/// is worth and why it is read apart from a plain pass.
+bool authResultsArcPassed(const QString &value);
+
 /// The bare addr-spec of a From/Reply-To style header value, lowercased and
 /// with any +tag stripped. Empty when the value carries no address.
 QString addressOf(const QString &headerValue);
@@ -189,6 +252,12 @@ QString addressOf(const QString &headerValue);
 QString normalizeAddress(const QString &address);
 /// Display name of a mailbox header value, unquoted, without the address part.
 QString displayNameOf(const QString &headerValue);
+/// Top-level domain of an address — the last label of its domain, lowercased,
+/// without a leading dot ("sk", "com"). Deliberately the bare TLD and not the
+/// public suffix: "co.uk" and "org.uk" are the same country to a reader
+/// deciding whether they know anybody there. Empty when there is no domain, and
+/// for an address literal ([192.0.2.1]), which has no TLD to speak of.
+QString tldOf(const QString &address);
 /// Registrable domain of an address, via the Public Suffix List. Falls back to
 /// the full domain when the list has not loaded, which can only ever make two
 /// domains look *less* related — the safe direction.

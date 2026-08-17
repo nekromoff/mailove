@@ -413,6 +413,9 @@ bool MailStore::open()
 void MailStore::setAccountKey(const QString &key)
 {
     m_accountKey = key;
+    // The TLD profile describes one account's outgoing mail; keeping it across
+    // a switch would score the new account's inbox against the old one's habits.
+    m_tldProfileAt = 0;
 }
 
 QString MailStore::scoped(const QString &folder) const
@@ -2265,6 +2268,7 @@ void MailStore::addRecipient(const QString &address, const QString &name)
     q.addBindValue(name.trimmed());
     q.addBindValue(QDateTime::currentSecsSinceEpoch());
     q.exec();
+    m_tldProfileAt = 0; // a new address can change where "your mail goes"
 }
 
 void MailStore::addSentRecipient(const QString &folder, qint64 uid, const QString &address,
@@ -2350,6 +2354,7 @@ void MailStore::dropRecipientRefs(const QString &where, const QString &scopedFol
         prune.addBindValue(address);
         prune.exec();
     }
+    m_tldProfileAt = 0;
 }
 
 void MailStore::addSentRecipientsOn(QSqlDatabase &db, const QString &account,
@@ -2519,6 +2524,63 @@ MailStore::senderDomainHistory(const QSet<QString> &orgs)
             out.insert(q.value(0).toString(), h);
         }
     }
+    return out;
+}
+
+MailStore::SentTldProfile MailStore::sentTldProfile()
+{
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    // Five minutes. Long enough that a whole FETCH batch is answered from one
+    // scan, short enough that a Sent folder syncing in the background is
+    // reflected while the user is still looking at the same inbox.
+    constexpr qint64 ttl = 300;
+    if (m_tldProfileAt > 0 && m_tldProfileAccount == m_accountKey
+        && now - m_tldProfileAt < ttl)
+        return m_tldProfile;
+
+    SentTldProfile out;
+    m_tldProfile = out;
+    m_tldProfileAt = now;
+    m_tldProfileAccount = m_accountKey;
+    if (!m_db.isOpen() || m_accountKey.isEmpty())
+        return out;
+
+    // One row per address, not per sighting: use_count would let a single
+    // colleague written to daily define the whole profile, which is a
+    // statement about one habit rather than about where the mail goes.
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT addr_norm FROM recipients WHERE account = ?"));
+    q.addBindValue(m_accountKey);
+    if (!q.exec())
+        return out;
+
+    QHash<QString, int> counts;
+    int sample = 0;
+    while (q.next()) {
+        const QString tld = SpamHeuristics::tldOf(q.value(0).toString());
+        if (tld.isEmpty())
+            continue;
+        ++counts[tld];
+        ++sample;
+    }
+    out.sample = sample;
+    if (sample <= 0) {
+        m_tldProfile = out;
+        return out;
+    }
+
+    // A share threshold rather than a rank one. Ranking says "the top tenth of
+    // your TLDs", which for the four or five TLDs a normal mailbox writes to
+    // means exactly one — and the second one, holding a third of the mail,
+    // would then read as unusual. What the rule needs to know is whether a TLD
+    // carries a real part of the correspondence, and that is a share.
+    const int pct = qBound(1, AdvancedConfig::i("spam/tldSharePercent"), 100);
+    for (auto it = counts.cbegin(); it != counts.cend(); ++it) {
+        if (it.value() * 100 >= sample * pct)
+            out.familiar.append(it.key());
+    }
+    out.familiar.sort();
+    m_tldProfile = out;
     return out;
 }
 

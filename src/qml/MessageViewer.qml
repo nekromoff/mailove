@@ -88,35 +88,35 @@ ColumnLayout {
         if (!context)
             return ""
         if (context.cryptoChecking)
-            return "checking signature…"
+            return "Checking signature…"
         switch (context.signatureStatus) {
         case "valid":
             if (context.signerTrusted) {
                 const who = context.signerName.length > 0 ? context.signerName
                                                           : context.signerEmail
-                return "✓ signed by " + who
+                return "✓ Signed by " + who
             }
-            return "⚠ signed by another address"
+            return "⚠ Signed by another address"
         case "modified":
             // Established against octets we know are original: the signed part
             // is not the part that arrived. After a mailing list or forwarder
             // that is ordinary, so this states what happened rather than
             // accusing anyone — the same wording rule the DKIM badge follows.
-            return "⚠ modified after signing"
+            return "⚠ Modified after OpenPGP signing"
         case "unverified":
             // We could not reproduce what was signed, so this claims nothing
             // about the message at all.
-            return "signature not verified"
+            return "Signature not verified"
         case "unknownKey":
-            return "signed with a key you do not have"
+            return "Signed with a key you do not have"
         case "expired":
-            return "⚠ signed with an expired key"
+            return "⚠ Signed with an expired key"
         case "revoked":
-            return "⚠ signed with a revoked key"
+            return "⚠ Signed with a revoked key"
         case "error":
-            return "signature not checked"
+            return "Signature not checked"
         default:
-            return "signed"
+            return "Signed"
         }
     }
 
@@ -274,6 +274,104 @@ ColumnLayout {
     // put "dkim=pass" in this badge by putting it in their own envelope
     // address. Quoted strings and (comments) are dropped first for the same
     // reason: both can carry a ';' and hide a verdict behind it.
+    // One terse line per abbreviation that actually appears, appended to the
+    // server tooltip: the badge speaks in acronyms, and a reader should not
+    // need to look one up to know what just failed.
+    // The verdict as a word, answering the question-form explainers below:
+    // pass answers Yes, a failure No, softfail and the odd results Warning.
+    function verdictWord(r) {
+        if (r === "pass")
+            return "Yes"
+        if (/(fail|permerror)$/.test(r))
+            return r === "softfail" ? "Warning" : "No"
+        if (r === "none")
+            return "Not checked"
+        return "Warning" // neutral, temperror, softpass, bestguesspass…
+    }
+
+    // One block per method: the question-form explainer with its answer as a
+    // word, and directly under it that method's own slice of the raw header —
+    // the evidence sits beneath the sentence that explains it. Blocks are
+    // blank-line separated; the authserv-id leads the whole thing.
+    function authLegend(authInfo) {
+        if (!authInfo || authInfo.length === 0)
+            return ""
+        const explain = ({
+            "spf":      "SPF: Is the sending server allowed to send for this domain?",
+            "dkim":     "DKIM: Does the domain's cryptographic signature on the message hold?",
+            "dmarc":    "DMARC: Does the visible From match what SPF or DKIM verified?",
+            "arc":      "ARC: Did the original verdict survive forwarders and mailing lists intact?",
+            "compauth": "COMPAUTH: Does Microsoft's combined sender verification pass?"
+        })
+        const trusted = Mail.trustedAuthMethods()
+        // Split the raw value, not a stripped copy — the comments are part of
+        // the evidence shown. A ';' inside a comment starts a fragment that
+        // matches no method; such fragments re-join the block above them.
+        const parts = authInfo.split(";")
+        let order = []
+        let blocks = ({})
+        let answers = ({})
+        let current = ""
+        for (let i = 1; i < parts.length; ++i) {
+            const part = parts[i].trim()
+            const m = /^(dkim|spf|dmarc|arc|compauth)\s*=\s*([a-z]+)/i.exec(part)
+            if (m) {
+                const method = m[1].toLowerCase()
+                if (trusted.indexOf(method) === -1
+                    || (method === "dkim" && dkimLabel.text.length > 0)) {
+                    // dkim moved to the big label's tooltip; see condenseAuth.
+                    current = ""
+                    continue
+                }
+                if (!blocks[method]) {
+                    blocks[method] = []
+                    answers[method] = []
+                    order.push(method)
+                }
+                blocks[method].push(part)
+                const word = viewer.verdictWord(m[2].toLowerCase())
+                if (answers[method].indexOf(word) === -1)
+                    answers[method].push(word)
+                current = method
+            } else if (current.length > 0 && part.length > 0) {
+                // A comment's severed tail: it belongs to the field above.
+                blocks[current][blocks[current].length - 1] += "; " + part
+            }
+        }
+        const rendered = order.map(method =>
+            explain[method] + " " + answers[method].join(", ") + "\n"
+            + blocks[method].join("\n"))
+        return ["Reported by " + parts[0].trim()].concat(rendered).join("\n\n")
+    }
+
+    // The server's own dkim= evidence, as one block ("Reported by mx...:"
+    // plus the raw fields) — appended to the big DKIM tooltip when the small
+    // line stops showing dkim, so the server's say-so stays findable exactly
+    // where the reader is already looking.
+    function serverDkimEvidence(authInfo) {
+        if (!authInfo || authInfo.length === 0)
+            return ""
+        if (Mail.trustedAuthMethods().indexOf("dkim") === -1)
+            return ""
+        const parts = authInfo.split(";")
+        let lines = []
+        let inDkim = false
+        for (let i = 1; i < parts.length; ++i) {
+            const part = parts[i].trim()
+            if (/^dkim\s*=/i.test(part)) {
+                lines.push(part)
+                inDkim = true
+            } else if (/^(spf|dmarc|arc|compauth)\s*=/i.test(part)) {
+                inDkim = false
+            } else if (inDkim && part.length > 0 && lines.length > 0) {
+                lines[lines.length - 1] += "; " + part // a comment's severed tail
+            }
+        }
+        if (lines.length === 0)
+            return ""
+        return "Reported by " + parts[0].trim() + ":\n" + lines.join("\n")
+    }
+
     function condenseAuth(authInfo) {
         if (!authInfo || authInfo.length === 0)
             return ""
@@ -287,13 +385,29 @@ ColumnLayout {
         // disagreement as "dkim=pass · dkim=fail" reads like a contradiction
         // rather than like two signatures. "dkim=pass, fail" says what it is.
         const fields = cleaned.split(";")
+        // A method distrusted in advanced.conf (spam/trustSpf and friends) is
+        // not shown: the badge and the score read the same switches, so what
+        // is displayed is always what was counted.
+        const trusted = Mail.trustedAuthMethods()
         let order = []      // methods in the order the server listed them
         let results = ({})  // method → its distinct results, in order
         for (let i = 1; i < fields.length; ++i) { // field 0 is the authserv-id
-            const m = /^\s*(dkim|spf|dmarc)\s*=\s*([a-z]+)/i.exec(fields[i])
+            // arc and compauth ride along when the server stamped them:
+            // arc explains why spf/dkim may say fail, and compauth is
+            // Microsoft's own composite verdict, only ever present on
+            // Microsoft 365 accounts.
+            const m = /^\s*(dkim|spf|dmarc|arc|compauth)\s*=\s*([a-z]+)/i.exec(fields[i])
             if (!m)
                 continue
             const method = m[1].toLowerCase()
+            if (trusted.indexOf(method) === -1)
+                continue
+            // Our own DKIM verdict is on the big label beside this line and is
+            // strictly better informed (it checks alignment, not just
+            // validity); showing the server's beside it read as two verdicts
+            // disagreeing. Its evidence moves to the big label's tooltip.
+            if (method === "dkim" && dkimLabel.text.length > 0)
+                continue
             const result = m[2].toLowerCase()
             if (!results[method]) {
                 results[method] = []
@@ -302,14 +416,36 @@ ColumnLayout {
             if (results[method].indexOf(result) === -1)
                 results[method].push(result)
         }
+        // The same glyph and colour language the DKIM/ARC labels above speak:
+        // ✓ green pass, ✗ red fail, ⚠ orange for anything odd, – for nothing
+        // checked. A method with several signatures keeps the comma grouping
+        // ("DKIM ✓, ✗") — the comma is what says "two signatures", so it is
+        // never collapsed to one glyph.
+        const glyph = r => {
+            if (r === "pass")
+                return "<font color='" + Kirigami.Theme.positiveTextColor + "'>✓</font>"
+            // softfail is the domain's own hedge (~all): "probably not ours,
+            // but do not bounce it". The glyph stays ✗ — something did fail —
+            // but in orange, a step below the outright fail's red. The raw
+            // wording is in the tooltip.
+            if (r === "softfail")
+                return "<font color='" + Kirigami.Theme.neutralTextColor + "'>✗</font>"
+            if (/(fail|permerror)$/.test(r))
+                return "<font color='" + Kirigami.Theme.negativeTextColor + "'>✗</font>"
+            if (r === "none")
+                return "–"
+            // neutral, temperror, softpass, bestguesspass, policy…
+            return "<font color='" + Kirigami.Theme.neutralTextColor + "'>⚠</font>"
+        }
+        // Glyph before name, matching the large badges beside this line
+        // ("✗ ARC chain broken"), so the eye parses both the same way. The
+        // non-breaking space keeps each glyph glued to its own name, and the
+        // wide gap between pairs is what says where one method ends —
+        // StyledText collapses runs of ordinary spaces, hence the entities.
         return order.map(method => {
             const list = results[method]
-            // Suffix match, so softfail and hardfail are flagged too. One
-            // failure among several signatures still earns the mark: the
-            // reader needs to know something did not check out.
-            const failed = list.some(r => /(fail|permerror)$/.test(r))
-            return method + "=" + list.join(", ") + (failed ? " ❗" : "")
-        }).join(" · ")
+            return list.map(glyph).join(", ") + " " + method.toUpperCase()
+        }).join("&nbsp;&nbsp;&nbsp;")
     }
 
     // Envelope header block above the preview
@@ -336,7 +472,11 @@ ColumnLayout {
                 Layout.preferredHeight: visible ? px : 0
                 fillMode: Image.PreserveAspectFit
                 asynchronous: true
-                sourceSize: Qt.size(px, px)
+                // Twice the displayed size, matching what avatarSource() asks
+                // Gravatar for — the surplus is what keeps it sharp on HiDPI,
+                // and mipmap is what keeps the downscale clean on 1x screens.
+                sourceSize: Qt.size(px * 2, px * 2)
+                mipmap: true
             }
             SelectableValue {
                 id: fromLabel
@@ -505,6 +645,11 @@ ColumnLayout {
 
             QQC2.Label {
                 id: cryptoLabel
+                // Baseline-aligned, not centred: the row mixes font sizes and
+                // glyphs whose fallback fonts are taller than the text, and
+                // centring made every neighbour hop when one label's height
+                // changed. Text sits still on a shared baseline.
+                Layout.alignment: Qt.AlignBaseline
                 visible: text.length > 0
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
                 color: {
@@ -640,8 +785,15 @@ ColumnLayout {
             // a key we fetched, the other is a header we chose to believe.
             QQC2.Label {
                 id: dkimLabel
+                // Baseline-aligned, not centred: the row mixes font sizes and
+                // glyphs whose fallback fonts are taller than the text, and
+                // centring made every neighbour hop when one label's height
+                // changed. Text sits still on a shared baseline.
+                Layout.alignment: Qt.AlignBaseline
                 visible: Mail.authVerification && text.length > 0
-                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                // Standard size, unlike the server line below: this is what
+                // mailove verified itself, and the type hierarchy is the
+                // reader's cue for which claim carries more weight.
                 font.bold: viewer.context && viewer.context.dkimStatus === "fail"
                 color: {
                     if (!viewer.context || viewer.context.dkimChecking)
@@ -666,7 +818,7 @@ ColumnLayout {
                     if (!viewer.context)
                         return ""
                     if (viewer.context.dkimChecking)
-                        return "checking signature…"
+                        return "Checking DKIM signature…"
                     switch (viewer.context.dkimStatus) {
                     case "pass":
                         // "verified" only when the signing domain matches the
@@ -706,8 +858,8 @@ ColumnLayout {
                         // reason the protocol exists. The sealer is on the
                         // badge beside this one, so it is not repeated here.
                         return viewer.context.arcStatus === "pass"
-                            ? "⚠ Modified after signing, per ARC"
-                            : "⚠ Modified after signing"
+                            ? "⚠ Modified after DKIM signing, per ARC"
+                            : "⚠ Modified after DKIM signing"
                     case "unverified":
                         // Body hash mismatch we cannot attribute: the copy we
                         // hashed came from the cache and may not be byte-exact,
@@ -721,7 +873,19 @@ ColumnLayout {
                 HoverToolTip {
                     hover: dkimHover
                     markFailures: true
-                    text: viewer.context ? viewer.context.dkimDetail : ""
+                    text: {
+                        if (!viewer.context || viewer.context.dkimDetail.length === 0)
+                            return ""
+                        const st = viewer.context.dkimStatus
+                        const answer = st === "pass" && viewer.context.dkimTrusted ? "Yes"
+                            : st === "fail" ? "No"
+                            : st === "temperror" || st === "unverified" ? "Not checked"
+                            : "Warning"
+                        const server = viewer.serverDkimEvidence(viewer.context.authInfo)
+                        return "DKIM: Does the domain's cryptographic signature on the "
+                            + "message hold? " + answer + "\n\n" + viewer.context.dkimDetail
+                            + (server.length ? "\n\n" + server : "")
+                    }
                 }
             }
 
@@ -732,8 +896,13 @@ ColumnLayout {
             // so the sealer is always shown rather than reduced to a tick.
             QQC2.Label {
                 id: arcLabel
+                // Baseline-aligned, not centred: the row mixes font sizes and
+                // glyphs whose fallback fonts are taller than the text, and
+                // centring made every neighbour hop when one label's height
+                // changed. Text sits still on a shared baseline.
+                Layout.alignment: Qt.AlignBaseline
                 visible: Mail.authVerification && text.length > 0
-                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                // Standard size like the DKIM label: first-hand verification.
                 font.bold: viewer.context && viewer.context.arcStatus === "fail"
                 color: {
                     if (!viewer.context)
@@ -750,14 +919,14 @@ ColumnLayout {
                     const sealer = viewer.context.arcSealer
                     switch (viewer.context.arcStatus) {
                     case "pass":
-                        return "ARC intact via " + sealer
+                        // The ✓ is the answer, not an endorsement — the colour
+                        // stays neutral (see above), unlike DKIM's green.
+                        return "✓ ARC intact via " + sealer
                     case "sealsonly":
                         // Seals held, but the sealer's own body hash does not
-                        // match our copy. Spelled out rather than shortened:
-                        // "ARC chain intact" read as *more* than the "pass"
-                        // wording above it, which is the opposite of the truth
-                        // — here nothing confirms the body we are showing.
-                        return "ARC seals valid via " + sealer + ", body unconfirmed"
+                        // match our copy — nothing confirms the body we are
+                        // showing, hence the ⚠ and no "intact".
+                        return "⚠ ARC via " + sealer + ", body unconfirmed"
                     case "fail":
                         return "✗ ARC chain broken"
                     case "error":
@@ -770,25 +939,44 @@ ColumnLayout {
                 HoverToolTip {
                     hover: arcHover
                     markFailures: true
-                    text: viewer.context && viewer.context.arcDetail.length > 0
-                        ? "Forwarding hops (ARC):\n" + viewer.context.arcDetail : ""
+                    text: {
+                        if (!viewer.context || viewer.context.arcDetail.length === 0)
+                            return ""
+                        const st = viewer.context.arcStatus
+                        const answer = st === "pass" ? "Yes"
+                            : st === "fail" ? "No"
+                            : st === "error" ? "Not checked"
+                            : "Warning" // sealsonly: seals hold, body unconfirmed
+                        return "ARC: Did the original verdict survive forwarders and "
+                            + "mailing lists intact? " + answer
+                            + "\n\nForwarding hops (ARC):\n" + viewer.context.arcDetail
+                    }
                 }
             }
 
             QQC2.Label {
                 id: serverAuthLabel
+                // Baseline-aligned, not centred: the row mixes font sizes and
+                // glyphs whose fallback fonts are taller than the text, and
+                // centring made every neighbour hop when one label's height
+                // changed. Text sits still on a shared baseline.
+                Layout.alignment: Qt.AlignBaseline
                 visible: Mail.authVerification && text.length > 0
                 Layout.fillWidth: true
                 elide: Text.ElideRight
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
+                // StyledText, for the coloured glyphs condenseAuth builds —
+                // the colours are the theme's own, so they follow it.
+                textFormat: Text.StyledText
                 text: viewer.context ? viewer.condenseAuth(viewer.context.authInfo) : ""
                 HoverHandler { id: serverAuthHover }
                 HoverToolTip {
                     hover: serverAuthHover
                     markFailures: true
-                    text: viewer.context && viewer.context.authInfo.length > 0
-                        ? "Reported by the receiving server:\n" + viewer.context.authInfo : ""
+                    // Per-method blocks: the explainer sentence with its
+                    // answer, the raw evidence for that method beneath it.
+                    text: viewer.context ? viewer.authLegend(viewer.context.authInfo) : ""
                 }
             }
         }

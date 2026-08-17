@@ -177,21 +177,63 @@ Upstream readUpstream(const QList<Field> &fields)
 
     for (qsizetype i = 0; i < fields.size(); ++i) {
         const Field &f = fields.at(i);
-        const bool spamStatus = f.name == QLatin1String("x-spam-status");
+        // Barracuda writes SpamAssassin's format under its own name, so it is
+        // parsed as x-spam-status with a different spelling.
+        const bool spamStatus = f.name == QLatin1String("x-spam-status")
+            || f.name == QLatin1String("x-barracuda-spam-status");
         const bool spamFlag = f.name == QLatin1String("x-spam-flag");
         const bool spamd = f.name == QLatin1String("x-spamd-result");
-        if (!spamStatus && !spamFlag && !spamd)
+        // Per-provider binary verdicts, each just another spelling of
+        // "the server's filter said spam / said not spam". They feed the same
+        // upstream-* rules as X-Spam-Flag, so spamrules/upstream-spam governs
+        // them all together.
+        bool vendorFlag = false;
+        bool vendorSpam = false;
+        if (f.name == QLatin1String("x-proofpoint-spam-details")) {
+            // "rule=spam policy=default score=99 ..." — iCloud and much of the
+            // Fortune 500 sit behind Proofpoint. rule=notspam is the ham case;
+            // any other rule name (quarantine policies) is left unread.
+            static const QRegularExpression ppRe(
+                QStringLiteral("\\brule=(not)?spam\\b"),
+                QRegularExpression::CaseInsensitiveOption);
+            if (const auto m = ppRe.match(f.value); m.hasMatch()) {
+                vendorFlag = true;
+                vendorSpam = m.captured(1).isEmpty();
+            }
+        } else if (f.name == QLatin1String("x-yandex-spam")
+                   || f.name == QLatin1String("x-gm-spam")
+                   || f.name == QLatin1String("x-gm-phishy")) {
+            // Bare 0/1 flags. X-Gm-* appear only on Google Workspace accounts
+            // whose admin enabled spam headers; consumer Gmail never sends them.
+            vendorFlag = true;
+            vendorSpam = f.value.trimmed() == QLatin1String("1");
+        } else if (f.name == QLatin1String("x-ui-filterresults")) {
+            // GMX / Web.de: "junk:10;..." or "notjunk:...". Only the leading
+            // token is documented enough to read; notjunk first, since "junk"
+            // is its suffix.
+            const QString v = f.value.trimmed().toLower();
+            if (v.startsWith(QLatin1String("notjunk"))) {
+                vendorFlag = true;
+                vendorSpam = false;
+            } else if (v.startsWith(QLatin1String("junk"))) {
+                vendorFlag = true;
+                vendorSpam = true;
+            }
+        }
+        if (!spamStatus && !spamFlag && !spamd && !vendorFlag)
             continue;
         if (!addedInTransit(fields, i))
             continue; // forged, or added by a relay we have no reason to trust
 
-        if (spamFlag) {
+        if (spamFlag || vendorFlag) {
             if (haveFlag)
                 continue;
             haveFlag = true;
             out.present = true;
-            out.spam = f.value.trimmed().compare(QLatin1String("yes"),
-                                                 Qt::CaseInsensitive) == 0;
+            out.spam = vendorFlag
+                ? vendorSpam
+                : f.value.trimmed().compare(QLatin1String("yes"),
+                                            Qt::CaseInsensitive) == 0;
             continue;
         }
         if (spamd) {
@@ -558,18 +600,71 @@ bool isFreemail(const QString &org)
 }
 
 /// URL shorteners. Legitimate senders use them too, which is why the rule that
-/// reads this is weighted so it can never mark anything on its own.
+/// reads this is weighted so it can never mark anything on its own. The list
+/// merges the well-known services with the long tail curated in
+/// martinschaible/rspamd-rules — obscure shorteners are the ones spam actually
+/// uses, precisely because filters only know the famous few.
 bool isShortener(const QString &host)
 {
     static const QSet<QString> set{
-        QStringLiteral("bit.ly"),     QStringLiteral("tinyurl.com"),
-        QStringLiteral("t.co"),       QStringLiteral("goo.gl"),
-        QStringLiteral("ow.ly"),      QStringLiteral("is.gd"),
-        QStringLiteral("buff.ly"),    QStringLiteral("cutt.ly"),
-        QStringLiteral("rb.gy"),      QStringLiteral("shorturl.at"),
-        QStringLiteral("rebrand.ly"), QStringLiteral("t.ly"),
-        QStringLiteral("bl.ink"),     QStringLiteral("s.id"),
-        QStringLiteral("tiny.cc"),    QStringLiteral("lnkd.in"),
+        QStringLiteral("2en.pl"), QStringLiteral("9m.no"),
+        QStringLiteral("abre.ai"), QStringLiteral("alturl.com"),
+        QStringLiteral("amz.run"), QStringLiteral("ap.lc"),
+        QStringLiteral("apif.me"), QStringLiteral("app.link"),
+        QStringLiteral("appurl.io"), QStringLiteral("b.link"),
+        QStringLiteral("bb.vg"), QStringLiteral("bit.ly"),
+        QStringLiteral("bitly.ws"), QStringLiteral("bityl.co"),
+        QStringLiteral("bl.ink"), QStringLiteral("bom.so"),
+        QStringLiteral("buff.ly"), QStringLiteral("capsu.link"),
+        QStringLiteral("capsulink.com"), QStringLiteral("clck.ru"),
+        QStringLiteral("cli.re"), QStringLiteral("clickto.cc"),
+        QStringLiteral("cutlly.com"), QStringLiteral("cutt.ly"),
+        QStringLiteral("did.li"), QStringLiteral("dub.sh"),
+        QStringLiteral("e.vg"), QStringLiteral("easyurl.me"),
+        QStringLiteral("emlnk.com"), QStringLiteral("findurls.com"),
+        QStringLiteral("free.fr"), QStringLiteral("gdy.club"),
+        QStringLiteral("geg.li"), QStringLiteral("gg.gg"),
+        QStringLiteral("gnx.gr"), QStringLiteral("goo.gl"),
+        QStringLiteral("goo.su"), QStringLiteral("han.gl"),
+        QStringLiteral("hotlinking.nl"), QStringLiteral("href.li"),
+        QStringLiteral("idm.in"), QStringLiteral("is.gd"),
+        QStringLiteral("ix.sk"), QStringLiteral("jl.mk"),
+        QStringLiteral("k4link.com"), QStringLiteral("kortlink.dk"),
+        QStringLiteral("kurl.ru"), QStringLiteral("lihi.cc"),
+        QStringLiteral("linkbun.com"), QStringLiteral("linkly.link"),
+        QStringLiteral("linklyhq.com"), QStringLiteral("linktr.ee"),
+        QStringLiteral("lit.do"), QStringLiteral("lmy.de"),
+        QStringLiteral("ln.run"), QStringLiteral("lnkd.in"),
+        QStringLiteral("lnkl.st"), QStringLiteral("m-url.eu"),
+        QStringLiteral("minilink.io"), QStringLiteral("miniurl.be"),
+        QStringLiteral("mj.am"), QStringLiteral("mjt.lu"),
+        QStringLiteral("n9.cl"), QStringLiteral("nx.tn"),
+        QStringLiteral("ok.me"), QStringLiteral("ow.ly"),
+        QStringLiteral("page.link"), QStringLiteral("pixelfy.me"),
+        QStringLiteral("qrcd.org"), QStringLiteral("rb.gy"),
+        QStringLiteral("rcl.ink"), QStringLiteral("reallylong.link"),
+        QStringLiteral("realurl04.cc"), QStringLiteral("rebrand.ly"),
+        QStringLiteral("redirectme.net"), QStringLiteral("reurl.cc"),
+        QStringLiteral("s.id"), QStringLiteral("short-link.me"),
+        QStringLiteral("short.gy"), QStringLiteral("shorten.ee"),
+        QStringLiteral("shorten.so"), QStringLiteral("shorten.tv"),
+        QStringLiteral("shorter.me"), QStringLiteral("shortler.co"),
+        QStringLiteral("shorturl.ac"), QStringLiteral("shorturl.asia"),
+        QStringLiteral("shorturl.at"), QStringLiteral("smrturl.co"),
+        QStringLiteral("snip.ly"), QStringLiteral("spoo.me"),
+        QStringLiteral("sprl.in"), QStringLiteral("srh.pn"),
+        QStringLiteral("srtx.pro"), QStringLiteral("surl.li"),
+        QStringLiteral("sw.run"), QStringLiteral("t.co"),
+        QStringLiteral("t.ly"), QStringLiteral("t2m.io"),
+        QStringLiteral("tao.bb"), QStringLiteral("tiny.cc"),
+        QStringLiteral("tinyurl.com"), QStringLiteral("tls.tc"),
+        QStringLiteral("tr.ee"), QStringLiteral("tt.vg"),
+        QStringLiteral("tyni.at"), QStringLiteral("tyny.me"),
+        QStringLiteral("u.to"), QStringLiteral("urlb.nl"),
+        QStringLiteral("urlr.me"), QStringLiteral("urly.fi"),
+        QStringLiteral("urlz.fr"), QStringLiteral("vo.la"),
+        QStringLiteral("wa.link"), QStringLiteral("xurl.es"),
+        QStringLiteral("ya.ru"), QStringLiteral("zpr.io"),
     };
     return set.contains(host);
 }
@@ -747,6 +842,43 @@ bool receivedFromUnknownHost(const QString &received)
                                                             [](QChar c) { return c.isLetter(); });
 }
 
+/// True for a .php URL whose query carries three or more parameters whose
+/// values are long tokens mixing letters and digits. Ordinary PHP shops pass
+/// words ("?page=checkout"); compromised-site spam kits pass campaign and
+/// victim tokens, which is what several digits inside every long value means.
+bool hackedPhpUrl(const QString &url)
+{
+    const qsizetype q = url.indexOf(QLatin1Char('?'));
+    if (q < 0 || !url.left(q).endsWith(QLatin1String(".php"), Qt::CaseInsensitive))
+        return false;
+    static const QRegularExpression tokenRe(
+        QStringLiteral("\\A(?=[^&]*[0-9])(?=[^&]*[A-Za-z])[A-Za-z0-9]{10,}\\z"));
+    int tokens = 0;
+    const QStringList params = url.mid(q + 1).split(QLatin1Char('&'), Qt::SkipEmptyParts);
+    for (const QString &param : params) {
+        const QString value = param.section(QLatin1Char('='), 1);
+        if (tokenRe.match(value).hasMatch() && ++tokens >= 3)
+            return true;
+    }
+    return false;
+}
+
+/// True for a link into a WordPress code tree: anything under /wp-includes/,
+/// or a script or page file inside /wp-content/. Media under wp-content
+/// (uploads, image files) is what real newsletters link constantly and is
+/// deliberately excluded — code files there are what compromises leave behind.
+bool hackedWordpressLink(const QString &url)
+{
+    const QString path = QUrl(url).path().toLower();
+    if (path.contains(QLatin1String("/wp-includes/")))
+        return true;
+    const qsizetype wc = path.indexOf(QLatin1String("/wp-content/"));
+    if (wc < 0)
+        return false;
+    return path.endsWith(QLatin1String(".php")) || path.endsWith(QLatin1String(".html"))
+        || path.endsWith(QLatin1String(".htm"));
+}
+
 /// Every http(s) URL in an HTML part, in document order. Deliberately naive:
 /// this reads what the message *contains*, and a URL a parser would reject is
 /// still a URL a mail client might render.
@@ -854,6 +986,148 @@ void splitMailbox(const QString &value, QString *name, QString *addr)
 
 } // namespace
 
+QString stripAuthCommentsAndQuotes(const QString &value)
+{
+    QString out;
+    out.reserve(value.size());
+    int commentDepth = 0;
+    bool inQuotes = false;
+    for (int i = 0; i < value.size(); ++i) {
+        const QChar c = value.at(i);
+        if (c == QLatin1Char('\\') && (inQuotes || commentDepth > 0)) {
+            ++i; // skip the escaped character
+            continue;
+        }
+        if (inQuotes) {
+            if (c == QLatin1Char('"'))
+                inQuotes = false;
+            continue;
+        }
+        if (commentDepth > 0) {
+            if (c == QLatin1Char('('))
+                ++commentDepth;
+            else if (c == QLatin1Char(')'))
+                --commentDepth;
+            continue;
+        }
+        if (c == QLatin1Char('"')) {
+            inQuotes = true;
+        } else if (c == QLatin1Char('(')) {
+            ++commentDepth;
+            out.append(QLatin1Char(' '));
+        } else {
+            out.append(c);
+        }
+    }
+    return out;
+}
+
+bool authMethodTrusted(const QString &method)
+{
+    if (method == QLatin1String("spf"))
+        return AdvancedConfig::b("spam/trustSpf");
+    if (method == QLatin1String("dkim"))
+        return AdvancedConfig::b("spam/trustDkim");
+    if (method == QLatin1String("dmarc"))
+        return AdvancedConfig::b("spam/trustDmarc");
+    if (method == QLatin1String("arc"))
+        return AdvancedConfig::b("spam/trustArc");
+    if (method == QLatin1String("compauth"))
+        return AdvancedConfig::b("spam/trustCompauth");
+    return true;
+}
+
+QStringList authResultVerdicts(const QString &value)
+{
+    // compauth is Microsoft's composite verdict: their own combination of
+    // SPF/DKIM/DMARC with signals only they hold (sending history, "implicit
+    // authentication" for domains that publish no DMARC policy). Stamped only
+    // by Exchange Online, and trusted here on exactly the basis every other
+    // method is — this value came from a header whose authserv-id our own
+    // receiving server vouched for.
+    static const QRegularExpression methodRe(
+        QStringLiteral("^\\s*(spf|dkim|dmarc|arc|compauth)\\s*=\\s*([a-z]+)"),
+        QRegularExpression::CaseInsensitiveOption);
+    QStringList out;
+    const QStringList fields = stripAuthCommentsAndQuotes(value).split(QLatin1Char(';'));
+    // Field 0 is the authserv-id, never a verdict.
+    for (qsizetype i = 1; i < fields.size(); ++i) {
+        const auto m = methodRe.match(fields.at(i));
+        if (m.hasMatch())
+            out.append(m.captured(1).toLower() + QLatin1Char('=') + m.captured(2).toLower());
+    }
+    return out;
+}
+
+bool authResultsFailed(const QString &value)
+{
+    // The account's authVerification checkbox is the master switch: behind it
+    // the caller reads no Authentication-Results at all, and every method goes
+    // silent together. The spam/trust* keys are the finer grain on top,
+    // dropping one method's verdicts without giving up the rest.
+    const QStringList verdicts = authResultVerdicts(value);
+    for (const QString &verdict : verdicts) {
+        const QString method = verdict.section(QLatin1Char('='), 0, 0);
+        const QString result = verdict.section(QLatin1Char('='), 1);
+        // A broken ARC chain is not a forgery — arc only ever *excuses*
+        // failures (authResultsArcPassed), it never accuses.
+        if (method == QLatin1String("arc"))
+            continue;
+        if (!authMethodTrusted(method))
+            continue;
+        if (method == QLatin1String("compauth")) {
+            if (result == QLatin1String("fail"))
+                return true;
+            continue; // softpass and none say nothing
+        }
+        // The domain hedging is not the domain denying: softfail has its own
+        // function and its own, softer rule.
+        if (result == QLatin1String("softfail"))
+            continue;
+        // fail, hardfail, permerror — anything but pass/neutral/none
+        if (result.endsWith(QLatin1String("fail")) || result == QLatin1String("permerror"))
+            return true;
+    }
+    return false;
+}
+
+bool authResultsSoftFailed(const QString &value)
+{
+    const QStringList verdicts = authResultVerdicts(value);
+    for (const QString &verdict : verdicts) {
+        const QString method = verdict.section(QLatin1Char('='), 0, 0);
+        if (method == QLatin1String("arc"))
+            continue;
+        if (!authMethodTrusted(method))
+            continue;
+        if (verdict.endsWith(QLatin1String("=softfail")))
+            return true;
+    }
+    return false;
+}
+
+bool authResultsPassed(const QString &value)
+{
+    const QStringList verdicts = authResultVerdicts(value);
+    for (const QString &verdict : verdicts) {
+        const QString method = verdict.section(QLatin1Char('='), 0, 0);
+        if (method == QLatin1String("arc"))
+            continue; // arc=pass answers a different question
+        if (!authMethodTrusted(method))
+            continue;
+        if (verdict.endsWith(QLatin1String("=pass")))
+            return true;
+    }
+    return false;
+}
+
+bool authResultsArcPassed(const QString &value)
+{
+    if (!authMethodTrusted(QStringLiteral("arc")))
+        return false;
+    return authResultVerdicts(value).contains(QLatin1String("arc=pass"));
+}
+
 QString addressOf(const QString &headerValue)
 {
     QString name;
@@ -868,6 +1142,23 @@ QString displayNameOf(const QString &headerValue)
     QString addr;
     splitMailbox(headerValue, &name, &addr);
     return name;
+}
+
+QString tldOf(const QString &address)
+{
+    const int at = address.lastIndexOf(QLatin1Char('@'));
+    const QString domain = (at < 0 ? address : address.mid(at + 1)).toLower();
+    // An address literal is a domain with no name: [192.0.2.1] would otherwise
+    // yield "1]" and be compared against real TLDs as if it were one.
+    if (domain.isEmpty() || domain.startsWith(QLatin1Char('[')))
+        return {};
+    const QString last = domain.section(QLatin1Char('.'), -1);
+    // Digits mean a bare IP address, same case as above by another spelling.
+    for (const QChar c : last) {
+        if (!c.isLetter())
+            return {};
+    }
+    return last;
 }
 
 QString organizationalDomainOf(const QString &address)
@@ -945,9 +1236,23 @@ Score score(const Message &msg, const Context &ctx)
     // filter is capable of.
     const bool authFailed = ctx.authFailed && !ctx.arcPassed;
 
+    // Every weight passes through here, so the number written at the call site
+    // is a default rather than a constant: spamrules/<id> overrides it, and a
+    // rule set to 0 stops appearing in the tooltip at all — which is what
+    // "turn this rule off" has to mean for a reader looking at the message it
+    // used to misfire on.
+    //
+    // Only mail scored from now on is affected. A stored verdict keeps both its
+    // number and the explanation it was given, and nothing here goes back to
+    // rewrite either; see MailClient::rescoreWithBody for the one path that
+    // does re-score, and only because the body had not arrived yet.
     auto hit = [&out](const char *id, int weight, const QString &detail) {
-        out.hits.append({QString::fromLatin1(id), weight, detail});
-        out.total += weight;
+        const QString ruleId = QString::fromLatin1(id);
+        const int w = AdvancedConfig::intOr(QLatin1String("spamrules/") + ruleId, weight);
+        if (w == 0)
+            return;
+        out.hits.append({ruleId, w, detail});
+        out.total += w;
     };
 
     // ------------------------------------------------------------------
@@ -990,6 +1295,14 @@ Score score(const Message &msg, const Context &ctx)
     } else if (authFailed) {
         hit("auth-fail", 35,
             QStringLiteral("Receiving server reported an SPF/DKIM/DMARC failure"));
+    } else if (ctx.authSoftFailed && !ctx.arcPassed) {
+        // The domain's own hedge, not its denial — and the classic shape of
+        // legitimately forwarded mail, which is why this is weighted below
+        // auth-fail, never revokes Rule 0, and yields to arc=pass like the
+        // failures do.
+        hit("auth-softfail", 20,
+            QStringLiteral("Receiving server reported a soft authentication failure "
+                           "(the sending domain itself hedges its answer)"));
     }
     // --- Familiarity ---------------------------------------------------
     // "We have had mail from this domain for a long time" — the signal that
@@ -1033,6 +1346,38 @@ Score score(const Message &msg, const Context &ctx)
         hit("familiar-domain-spoofed", 25,
             QStringLiteral("Claims to be %1, which you do have a history with, but "
                            "sender authentication failed").arg(fromOrg));
+    }
+
+    // --- Where the user's own mail goes ---------------------------------
+    // The country the message came from, judged against the countries the user
+    // writes to. Somebody whose sent mail is .sk and .com is not expecting a
+    // first contact from .hr, and unlike every other familiarity signal here
+    // this one has an answer for a sender who is a total stranger from a domain
+    // the cache has never seen — which is precisely the case seenFromOrg and
+    // knownCorrespondent are both blind to.
+    //
+    // Weighted at 15, which is well under the threshold and under
+    // UnsureThreshold too: on its own it does nothing at all, and it takes
+    // another two or three rules alongside it to mark anything. That is
+    // deliberate. Plenty of legitimate mail arrives from a TLD its recipient
+    // has never written to — a hotel booking abroad, a conference, a foreign
+    // shop — and a signal this coarse must never be able to decide a message
+    // by itself. It corroborates; it does not accuse.
+    //
+    // Silent for a domain with a real history here: familiar-domain has
+    // already said the opposite about the same message, and letting both fire
+    // is one rule arguing with another over the same fact.
+    const int tldMinSample = AdvancedConfig::i("spam/tldMinSample");
+    const QString fromTld = tldOf(fromAddr);
+    if (!familiarOrg && !fromTld.isEmpty() && !ctx.familiarTlds.isEmpty()
+        && ctx.sentTldSample >= tldMinSample && !ctx.familiarTlds.contains(fromTld)) {
+        QStringList dotted;
+        dotted.reserve(ctx.familiarTlds.size());
+        for (const QString &t : ctx.familiarTlds)
+            dotted.append(QLatin1Char('.') + t);
+        hit("unfamiliar-tld", 15,
+            QStringLiteral("You do not write to .%1 — your own mail goes to %2")
+                .arg(fromTld, dotted.join(QStringLiteral(", "))));
     }
 
     // --- Conversation --------------------------------------------------
@@ -1303,6 +1648,66 @@ Score score(const Message &msg, const Context &ctx)
         }
     }
 
+    // --- Sending software ------------------------------------------------
+    // Headers the sending server stamps onto script-generated mail (cPanel and
+    // Exim write all of these). Sender-side and so forgeable — but only in the
+    // harmless direction: nothing is gained by *adding* the marks of a hacked
+    // website to mail that did not come from one. Adapted from the hacked-PHP
+    // rules in kawaiipantsu/spamassassin-rules and the CMS markers in jult's
+    // jbt-rules.cf, reweighted to this scorer's ordering.
+    const QString phpScript =
+        firstValue(fields, QLatin1String("x-php-originating-script"))
+        + QLatin1Char(' ') + firstValue(fields, QLatin1String("x-php-script"));
+    const QString sourceArgs = firstValue(fields, QLatin1String("x-source-args"));
+    const QString sourcePath = phpScript + QLatin1Char(' ')
+        + firstValue(fields, QLatin1String("x-source-dir")) + QLatin1Char(' ') + sourceArgs;
+    const bool scriptSent = !phpScript.trimmed().isEmpty()
+        || sourceArgs.contains(QLatin1String("/usr/bin/php"), Qt::CaseInsensitive);
+    if (scriptSent) {
+        if (phpScript.contains(QLatin1String("eval()'d code"), Qt::CaseInsensitive)) {
+            // A script that exists only as eval()'d code is not a script the
+            // site's owner wrote: this is the signature of injected malware
+            // sending mail, and nothing legitimate produces it.
+            hit("php-eval-source", 40,
+                QStringLiteral("Sent by PHP code that exists only in memory — the mark of "
+                               "a hacked website"));
+        } else if (sourcePath.contains(QLatin1String("wp-content"), Qt::CaseInsensitive)
+                   || sourcePath.contains(QLatin1String("wp-includes"), Qt::CaseInsensitive)
+                   || sourcePath.contains(QLatin1String("components/com_"))
+                   || sourcePath.contains(QLatin1String("/joomla/"), Qt::CaseInsensitive)
+                   // The ACME challenge directory and the PHPUnit RCE path
+                   // (CVE-2017-9841): scripts have no business mailing from
+                   // either, and both are classic marks of a compromised
+                   // webroot. From mailbaby's compromised-PHP header map.
+                   || sourcePath.contains(QLatin1String("/.well-known/"))
+                   || sourcePath.contains(QLatin1String("vendor/phpunit"), Qt::CaseInsensitive)) {
+            // Inside a CMS's own tree — WordPress content/includes, a Joomla
+            // component — where nothing that legitimately sends mail lives. A
+            // real WordPress notification comes from core, not from uploads.
+            hit("php-cms-origin", 25,
+                QStringLiteral("Sent by a script inside a website's content directory, "
+                               "where mail-sending code does not belong"));
+        } else {
+            // A PHP script as such proves little: every small shop's order
+            // confirmation is one. Low, and only ever corroborating.
+            hit("php-script-origin", 10,
+                QStringLiteral("Sent by a PHP script on a web server rather than by a "
+                               "mail program"));
+        }
+    }
+    // PHPMailer 5.x went unmaintained in 2018 with known remote-execution
+    // holes. Mail claiming it in 2026 is either a compromised relic server or
+    // a spam kit that never updated its fake header — both worth a nudge,
+    // neither worth more.
+    const QString mailer = firstValue(fields, QLatin1String("x-mailer"));
+    static const QRegularExpression oldPhpMailerRe(
+        QStringLiteral("\\bPHPMailer\\s+[1-5]\\."), QRegularExpression::CaseInsensitiveOption);
+    if (oldPhpMailerRe.match(mailer).hasMatch()) {
+        hit("vulnerable-mailer", 12,
+            QStringLiteral("Sent with a version of PHPMailer that has been unmaintained "
+                           "and exploitable for years"));
+    }
+
     // --- Subject -------------------------------------------------------
     // The raw value is kept alongside the decoded one for exactly one reader:
     // charset-mismatch needs the encoded-word's declared charset, and decoding
@@ -1570,12 +1975,19 @@ Score score(const Message &msg, const Context &ctx)
         // accumulate freely would make any large newsletter reachable.
         QList<Hit> linkHits;
         QSet<QString> seenIds;
+        // Overridable through [spamrules] exactly as hit() is — these ids are
+        // printed in the tooltip like any other, so they have to answer to the
+        // same keys. The override lands here, before the sort below, so a
+        // reweighted rule also takes its new place in the strongest-first cut.
         auto linkHit = [&linkHits, &seenIds](const char *id, int weight, const QString &detail) {
             const QString key = QString::fromLatin1(id);
             if (seenIds.contains(key))
                 return; // one instance of each kind is the whole evidence
             seenIds.insert(key);
-            linkHits.append({key, weight, detail});
+            const int w = AdvancedConfig::intOr(QLatin1String("spamrules/") + key, weight);
+            if (w == 0)
+                return;
+            linkHits.append({key, w, detail});
         };
 
         // An anchor whose *text* names a domain different from where it goes.
@@ -1660,6 +2072,32 @@ Score score(const Message &msg, const Context &ctx)
                             QStringLiteral("A link spells \"%1\" in its address but actually "
                                            "goes to %2").arg(QString(b->token), linkOrg));
                 }
+            }
+            // A .php endpoint fed several long random-token parameters: the
+            // link shape of spam sent through a compromised website, where the
+            // tokens tell the kit which campaign and victim clicked. Each value
+            // must mix letters and digits — "shop.php?utm_source=newsletter"
+            // is an ordinary shop, and words never trip the mix test. Not in
+            // list mail, whose click trackers legitimately mint exactly this
+            // kind of token.
+            if (!listMail && hackedPhpUrl(url)) {
+                linkHit("hacked-php-url", 15,
+                        QStringLiteral("A link calls a PHP script with several long random "
+                                       "codes, the shape of mail sent through a hacked "
+                                       "website"));
+            }
+            // A link *into* a WordPress code directory. wp-includes is
+            // WordPress's own library tree and wp-content/plugins holds code,
+            // not pages: no legitimate mail sends a reader there. Media links
+            // (wp-content/uploads/...jpg) are everywhere in real newsletters
+            // and are deliberately not matched — only script-and-page files
+            // inside the code tree count. From the WordPress-path map in
+            // martinschaible/rspamd-rules, reduced to its generic invariant.
+            if (hackedWordpressLink(url)) {
+                linkHit("hacked-wordpress-link", 15,
+                        QStringLiteral("A link leads into a WordPress code directory, where "
+                                       "web pages do not live — the shape of a hacked "
+                                       "website's landing page"));
             }
         }
 

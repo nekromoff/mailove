@@ -16,18 +16,23 @@
 /// exists to exercise exactly one rule, and having the header that triggers it
 /// three lines above the assertion is what keeps the pair honest.
 ///
-/// Self-contained: no cache, no network, no keyring. The Public Suffix List is
+/// Self-contained: no cache, no network, no keyring, and a throwaway config
+/// location — every weight is overridable through advanced.conf now, so a
+/// reader's own file would otherwise decide what this test measures. The
+/// Public Suffix List is
 /// loaded from a handful of rules written into this file rather than the real
 /// one, so the domain-alignment rules are exercised the same way on every
 /// machine and a stale download cannot change what a check means.
 ///
 /// Exit 0 = all checks passed.
 
+#include "advancedconfig.h"
 #include "publicsuffixlist.h"
 #include "spamheuristics.h"
 
 #include <QByteArray>
 #include <QCoreApplication>
+#include <QDir>
 #include <QStringList>
 #include <QTextStream>
 
@@ -901,9 +906,419 @@ void testExplanationRows()
 
 } // namespace
 
+void testUnfamiliarTld()
+{
+    // A mailbox that writes to .sk and .com and nowhere else.
+    SpamHeuristics::Context ctx;
+    ctx.familiarTlds = {QStringLiteral("sk"), QStringLiteral("com")};
+    ctx.sentTldSample = 400;
+
+    const char *fromHr =
+        "Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+        " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+        "From: Marko <marko@shop.hr>\r\n"
+        "To: You <you@example.org>\r\n"
+        "Subject: Offer\r\n"
+        "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+        "Message-ID: <u1@shop.hr>\r\n";
+    const SpamHeuristics::Score foreign = SpamHeuristics::score(headOnly(fromHr), ctx);
+    check(fired(foreign, "unfamiliar-tld"),
+          QStringLiteral("unfamiliar-tld fires on a TLD you never write to (%1)")
+              .arg(hitList(foreign)));
+    // And on its own it decides nothing: not marked, not even shown as unsure.
+    check(foreign.total < SpamHeuristics::UnsureThreshold,
+          QStringLiteral("unfamiliar-tld cannot mark a message by itself (total %1)")
+              .arg(foreign.total));
+
+    // A TLD the user does write to says nothing at all.
+    const SpamHeuristics::Score home = SpamHeuristics::score(
+        headOnly("Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+                 " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+                 "From: Jano <jano@firma.sk>\r\n"
+                 "To: You <you@example.org>\r\n"
+                 "Subject: Offer\r\n"
+                 "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+                 "Message-ID: <u2@firma.sk>\r\n"),
+        ctx);
+    check(!fired(home, "unfamiliar-tld"),
+          QStringLiteral("unfamiliar-tld silent on a TLD you write to (%1)").arg(hitList(home)));
+
+    // Too little sent mail to have a profile: the rule disables itself rather
+    // than describe a fresh install's first week as the user's habits.
+    SpamHeuristics::Context thin = ctx;
+    thin.sentTldSample = 3;
+    check(!fired(SpamHeuristics::score(headOnly(fromHr), thin), "unfamiliar-tld"),
+          QStringLiteral("unfamiliar-tld silent without enough sent mail behind it"));
+
+    // No profile at all — the caller filled nothing in — is the same.
+    check(!fired(SpamHeuristics::score(headOnly(fromHr), {}), "unfamiliar-tld"),
+          QStringLiteral("unfamiliar-tld silent with no profile"));
+
+    // A domain with a real history here outranks the country it is in: the
+    // familiarity rule has already answered the same question with evidence.
+    SpamHeuristics::Context familiar = ctx;
+    familiar.seenFromOrg = 40;
+    familiar.daysKnownOrg = 200;
+    const SpamHeuristics::Score old = SpamHeuristics::score(headOnly(fromHr), familiar);
+    check(!fired(old, "unfamiliar-tld"),
+          QStringLiteral("unfamiliar-tld silent on a domain you hear from (%1)")
+              .arg(hitList(old)));
+
+    // Rule 0 still comes first: someone the user has written to is not judged
+    // on which country they are in.
+    SpamHeuristics::Context correspondent = ctx;
+    correspondent.knownCorrespondent = true;
+    check(SpamHeuristics::score(headOnly(fromHr), correspondent).exempt,
+          QStringLiteral("a known correspondent in an unusual TLD stays exempt"));
+}
+
+/// The weights are defaults, not constants: spamrules/<id> overrides one, and
+/// 0 removes the rule from the score and from the tooltip alike.
+void testRuleWeightOverrides()
+{
+    const char *shouting =
+        "Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+        " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+        "From: Shop <news@shop.test>\r\n"
+        "To: You <you@example.org>\r\n"
+        "Subject: BUY NOW ONLY TODAY\r\n"
+        "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+        "Message-ID: <w1@shop.test>\r\n";
+    AdvancedConfig &cfg = AdvancedConfig::instance();
+
+    const SpamHeuristics::Score stock = SpamHeuristics::score(headOnly(shouting), {});
+    check(fired(stock, "subject-shouting") && stock.total == 6,
+          QStringLiteral("subject-shouting is worth its schema default (%1)").arg(stock.total));
+
+    check(cfg.save(QStringLiteral("[spamrules]\nsubject-shouting = 40\n")).isEmpty(),
+          QStringLiteral("a rule weight saves"));
+    const SpamHeuristics::Score raised = SpamHeuristics::score(headOnly(shouting), {});
+    check(raised.total == 40,
+          QStringLiteral("the configured weight is the one scored (%1)").arg(raised.total));
+
+    check(cfg.save(QStringLiteral("[spamrules]\nsubject-shouting = 0\n")).isEmpty(),
+          QStringLiteral("a rule turned off saves"));
+    const SpamHeuristics::Score off = SpamHeuristics::score(headOnly(shouting), {});
+    check(!fired(off, "subject-shouting") && off.total == 0,
+          QStringLiteral("a rule set to 0 leaves the tooltip as well as the score (%1)")
+              .arg(hitList(off)));
+
+    // Back to stock, so nothing below inherits an edited weight.
+    check(cfg.save(QString()).isEmpty(), QStringLiteral("the overrides clear again"));
+    check(SpamHeuristics::score(headOnly(shouting), {}).total == 6,
+          QStringLiteral("clearing the file restores the schema defaults"));
+}
+
+/// The hacked-website rules adapted from kawaiipantsu/spamassassin-rules:
+/// script-origin headers, an ancient PHPMailer, and the random-token .php link.
+void testHackedPhpShapes()
+{
+    const char *base =
+        "Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+        " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+        "From: Shop <info@shop.test>\r\n"
+        "To: You <you@example.org>\r\n"
+        "Subject: Order\r\n"
+        "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+        "Message-ID: <p1@shop.test>\r\n";
+
+    const SpamHeuristics::Score evald = SpamHeuristics::score(
+        headOnly(QByteArray(base)
+                 + "X-PHP-Originating-Script: 33:eval()'d code\r\n"),
+        {});
+    check(fired(evald, "php-eval-source"),
+          QStringLiteral("php-eval-source fires on eval()'d code (%1)").arg(hitList(evald)));
+
+    const SpamHeuristics::Score wp = SpamHeuristics::score(
+        headOnly(QByteArray(base)
+                 + "X-PHP-Originating-Script: 1001:mailer.php\r\n"
+                 + "X-Source-Dir: victim.test/public_html/wp-content/uploads\r\n"),
+        {});
+    check(fired(wp, "php-cms-origin") && !fired(wp, "php-script-origin"),
+          QStringLiteral("a script in wp-content is the CMS rule, not the plain one "
+                         "(%1)").arg(hitList(wp)));
+
+    // Joomla spells its compromise differently: the path arrives in
+    // X-Source-Args, and no X-PHP-Originating-Script need be present.
+    const SpamHeuristics::Score joomla = SpamHeuristics::score(
+        headOnly(QByteArray(base)
+                 + "X-Source-Args: /usr/bin/php /home/victim/public_html/"
+                   "components/com_contact/helpers/files.php\r\n"),
+        {});
+    check(fired(joomla, "php-cms-origin"),
+          QStringLiteral("a Joomla component path is the CMS rule too (%1)")
+              .arg(hitList(joomla)));
+
+    const SpamHeuristics::Score plain = SpamHeuristics::score(
+        headOnly(QByteArray(base) + "X-PHP-Originating-Script: 12:order.php\r\n"), {});
+    check(fired(plain, "php-script-origin"),
+          QStringLiteral("a bare PHP script origin fires the low rule (%1)")
+              .arg(hitList(plain)));
+    // The whole point of the low weight: a shop's PHP-sent receipt must stay ham.
+    check(plain.total < SpamHeuristics::UnsureThreshold,
+          QStringLiteral("a PHP-sent order mail alone stays unmarked (total %1)")
+              .arg(plain.total));
+
+    const SpamHeuristics::Score relic = SpamHeuristics::score(
+        headOnly(QByteArray(base) + "X-Mailer: PHPMailer 5.2.9 (https://example.test)\r\n"),
+        {});
+    check(fired(relic, "vulnerable-mailer"),
+          QStringLiteral("vulnerable-mailer fires on PHPMailer 5.x (%1)").arg(hitList(relic)));
+    check(!fired(SpamHeuristics::score(
+                     headOnly(QByteArray(base) + "X-Mailer: PHPMailer 6.9.1\r\n"), {}),
+                 "vulnerable-mailer"),
+          QStringLiteral("a current PHPMailer does not"));
+
+    // The link: a .php endpoint fed three long letter-and-digit tokens.
+    SpamHeuristics::Message hacked;
+    hacked.head = QByteArray(base);
+    hacked.html = QStringLiteral(
+        "<p><a href=\"http://victim.test/wp/go.php?u=a1B2c3D4e5F6&c=9zY8xW7vU6t5&t=Qq1Ww2Ee3Rr4\">"
+        "offer</a></p>");
+    const SpamHeuristics::Score badLink = SpamHeuristics::score(hacked, {});
+    check(fired(badLink, "hacked-php-url"),
+          QStringLiteral("hacked-php-url fires on random-token .php links (%1)")
+              .arg(hitList(badLink)));
+
+    // Words are not tokens: an ordinary PHP shop link stays silent.
+    SpamHeuristics::Message shop = hacked;
+    shop.html = QStringLiteral(
+        "<p><a href=\"http://shop.test/cart.php?utm_source=newsletter&utm_medium=email"
+        "&utm_campaign=augustsale\">cart</a></p>");
+    check(!fired(SpamHeuristics::score(shop, {}), "hacked-php-url"),
+          QStringLiteral("hacked-php-url silent on word-valued parameters"));
+
+    // And list mail is exempt wholesale, like the other link rules: click
+    // trackers mint exactly these tokens.
+    SpamHeuristics::Message list = hacked;
+    list.head = QByteArray(base) + "List-Id: <deals.shop.test>\r\n"
+        + "List-Unsubscribe: <mailto:leave@shop.test>\r\n";
+    check(!fired(SpamHeuristics::score(list, {}), "hacked-php-url"),
+          QStringLiteral("hacked-php-url silent in list mail"));
+
+    // A compromised webroot mailing from the ACME challenge directory.
+    const SpamHeuristics::Score acme = SpamHeuristics::score(
+        headOnly(QByteArray(base)
+                 + "X-Source-Args: /usr/bin/php /home/victim/public_html/"
+                   ".well-known/pki-validation/m.php\r\n"),
+        {});
+    check(fired(acme, "php-cms-origin"),
+          QStringLiteral("a script under /.well-known/ is a compromised webroot (%1)")
+              .arg(hitList(acme)));
+
+    // A link into WordPress's code tree, where no page for a reader lives.
+    SpamHeuristics::Message wpLink;
+    wpLink.head = QByteArray(base);
+    wpLink.html = QStringLiteral(
+        "<p><a href=\"http://victim.test/wp-includes/js/tmp/offer.html\">see</a></p>");
+    check(fired(SpamHeuristics::score(wpLink, {}), "hacked-wordpress-link"),
+          QStringLiteral("hacked-wordpress-link fires on a wp-includes link"));
+
+    SpamHeuristics::Message wpPlugin = wpLink;
+    wpPlugin.html = QStringLiteral(
+        "<p><a href=\"http://victim.test/wp-content/plugins/seo/landing.php\">go</a></p>");
+    check(fired(SpamHeuristics::score(wpPlugin, {}), "hacked-wordpress-link"),
+          QStringLiteral("hacked-wordpress-link fires on a script under wp-content"));
+
+    // The everyday case that must stay silent: a newsletter's image hosted
+    // under wp-content/uploads.
+    SpamHeuristics::Message wpMedia = wpLink;
+    wpMedia.html = QStringLiteral(
+        "<p><img src=\"http://shop.test/wp-content/uploads/2026/08/banner.jpg\"></p>");
+    check(!fired(SpamHeuristics::score(wpMedia, {}), "hacked-wordpress-link"),
+          QStringLiteral("hacked-wordpress-link silent on wp-content media"));
+}
+
+/// The Authentication-Results parsing the client feeds the scorer from. Lives
+/// here since the compauth work moved it into spamheuristics.cpp — the ARC
+/// exemption spent months dead because the old parser in mailclient.cpp never
+/// extracted arc= and no test could see it.
+void testAuthResultParsing()
+{
+    using namespace SpamHeuristics;
+
+    // The M365 spoof shape: explicit methods inconclusive, compauth=fail.
+    const QString spoofed = QStringLiteral(
+        "mx.microsoft.com 1; spf=none (sender IP is 203.0.113.9)"
+        " smtp.mailfrom=victim.test; dkim=none; dmarc=none action=none"
+        " header.from=victim.test; compauth=fail reason=601");
+    check(authResultsFailed(spoofed),
+          QStringLiteral("compauth=fail counts as an authentication failure"));
+    check(!authResultsPassed(spoofed),
+          QStringLiteral("...and certainly not as a pass"));
+
+    const QString implicit = QStringLiteral(
+        "mx.microsoft.com 1; spf=pass smtp.mailfrom=shop.test; dkim=none;"
+        " dmarc=bestguesspass; compauth=pass reason=109");
+    check(authResultsPassed(implicit) && !authResultsFailed(implicit),
+          QStringLiteral("compauth=pass counts as a pass"));
+
+    // The mailing-list shape: dkim broke in transit, arc carries the verdict.
+    const QString relayed = QStringLiteral(
+        "mx.example.org; spf=fail smtp.mailfrom=list.test; dkim=fail"
+        " header.d=member.test; arc=pass (as.1.list.test=pass)");
+    check(authResultsFailed(relayed),
+          QStringLiteral("the relay's dkim failure is still reported"));
+    check(authResultsArcPassed(relayed),
+          QStringLiteral("...and arc=pass is extracted alongside it (the bug this "
+                         "test exists for)"));
+    check(!authResultsPassed(relayed),
+          QStringLiteral("arc=pass alone is not an authentication pass"));
+
+    // A broken chain accuses nobody.
+    check(!authResultsFailed(QStringLiteral("mx.example.org; arc=fail; spf=pass")),
+          QStringLiteral("arc=fail is not an authentication failure"));
+
+    // Sender-supplied text must not smuggle a verdict past the parser.
+    const QString smuggled = QStringLiteral(
+        "mx.example.org; spf=fail smtp.mailfrom=\"x; dkim=pass\" (comment; "
+        "compauth=pass); dmarc=fail");
+    check(authResultsFailed(smuggled) && !authResultsPassed(smuggled),
+          QStringLiteral("verdicts inside quotes and comments are ignored"));
+
+    // Per-method trust switches in advanced.conf. The badge in the viewer
+    // filters by the same authMethodTrusted(), so distrusted is invisible too.
+    AdvancedConfig &cfg = AdvancedConfig::instance();
+    check(cfg.save(QStringLiteral("[spam]\ntrustCompauth = 0\n")).isEmpty(),
+          QStringLiteral("trustCompauth saves"));
+    const QString compauthOnlyPass = QStringLiteral(
+        "mx.microsoft.com 1; spf=none; dkim=none; dmarc=none;"
+        " compauth=pass reason=109");
+    check(!authResultsFailed(spoofed) && !authResultsPassed(compauthOnlyPass),
+          QStringLiteral("with trustCompauth off, compauth says nothing either way"));
+    check(authResultsFailed(relayed),
+          QStringLiteral("...while a dkim failure still counts"));
+
+    check(cfg.save(QStringLiteral("[spam]\ntrustSpf = 0\n")).isEmpty(),
+          QStringLiteral("trustSpf saves"));
+    check(!authResultsFailed(QStringLiteral("mx.example.org; spf=fail; dkim=none")),
+          QStringLiteral("with trustSpf off an SPF failure says nothing"));
+    check(authResultsFailed(QStringLiteral("mx.example.org; spf=fail; dkim=fail")),
+          QStringLiteral("...while DKIM keeps counting"));
+    check(!authMethodTrusted(QStringLiteral("spf"))
+              && authMethodTrusted(QStringLiteral("dkim")),
+          QStringLiteral("the badge filter sees the same switches"));
+
+    check(cfg.save(QStringLiteral("[spam]\ntrustArc = 0\n")).isEmpty(),
+          QStringLiteral("trustArc saves"));
+    check(!authResultsArcPassed(relayed),
+          QStringLiteral("with trustArc off, arc=pass excuses nothing"));
+    check(cfg.save(QString()).isEmpty(), QStringLiteral("...and the overrides clear"));
+
+    // softfail is the domain hedging, not denying: its own function, never
+    // authResultsFailed's business.
+    const QString hedged = QStringLiteral("mx.example.org; spf=softfail; dkim=none");
+    check(!authResultsFailed(hedged) && authResultsSoftFailed(hedged),
+          QStringLiteral("softfail is soft, not a failure"));
+    check(authResultsFailed(QStringLiteral("mx.example.org; spf=softfail; dmarc=fail")),
+          QStringLiteral("...but a hard failure beside it still counts"));
+}
+
+/// The softfail rule: weaker than auth-fail, exempt-preserving, arc-suppressed.
+void testSoftfailRule()
+{
+    const char *ordinary =
+        "Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+        " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+        "From: Colleague <c@partner.test>\r\n"
+        "To: You <you@example.org>\r\n"
+        "Subject: Notes\r\n"
+        "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+        "Message-ID: <sf1@partner.test>\r\n";
+
+    SpamHeuristics::Context soft;
+    soft.authSoftFailed = true;
+    const SpamHeuristics::Score s = SpamHeuristics::score(headOnly(ordinary), soft);
+    check(fired(s, "auth-softfail") && !fired(s, "auth-fail"),
+          QStringLiteral("softfail scores its own rule, not auth-fail (%1)").arg(hitList(s)));
+    check(s.total < SpamHeuristics::spamThreshold(),
+          QStringLiteral("softfail alone cannot mark (total %1)").arg(s.total));
+
+    // A known contact whose forwarded mail softfails stays exempt — the case
+    // the split exists for.
+    SpamHeuristics::Context knownSoft = soft;
+    knownSoft.knownCorrespondent = true;
+    const SpamHeuristics::Score known = SpamHeuristics::score(headOnly(ordinary), knownSoft);
+    check(known.exempt,
+          QStringLiteral("a known contact's softfail keeps the exemption (total %1)")
+              .arg(known.total));
+
+    // And arc=pass explains a softfail exactly as it explains a failure.
+    SpamHeuristics::Context relayedSoft = soft;
+    relayedSoft.arcPassed = true;
+    check(!fired(SpamHeuristics::score(headOnly(ordinary), relayedSoft), "auth-softfail"),
+          QStringLiteral("arc=pass silences the softfail rule"));
+}
+
+/// Provider-specific upstream verdict headers, each another spelling of "the
+/// server's filter decided". All feed the same upstream-* rules, so one
+/// spamrules key governs the lot. The Received line below each header is what
+/// lets addedInTransit() accept it as transit-added rather than sender-forged.
+void testProviderUpstreamHeaders()
+{
+    const char *tail =
+        "Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+        " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+        "From: Shop <news@shop.test>\r\n"
+        "To: You <you@example.org>\r\n"
+        "Subject: Offer\r\n"
+        "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+        "Message-ID: <up1@shop.test>\r\n";
+
+    const auto scored = [&](const char *header) {
+        return SpamHeuristics::score(headOnly(QByteArray(header) + tail), {});
+    };
+
+    // Barracuda is SpamAssassin's format under its own name: score/required
+    // read the same, including the decisive doubled-threshold case.
+    const SpamHeuristics::Score barracuda =
+        scored("X-Barracuda-Spam-Status: Yes, score=15.00 tests=MANY required=7.00\r\n");
+    check(fired(barracuda, "upstream-spam-high"),
+          QStringLiteral("Barracuda's status header scores like X-Spam-Status (%1)")
+              .arg(hitList(barracuda)));
+
+    const SpamHeuristics::Score proofpoint =
+        scored("X-Proofpoint-Spam-Details: rule=spam policy=default score=99\r\n");
+    check(fired(proofpoint, "upstream-spam"),
+          QStringLiteral("Proofpoint's rule=spam is an upstream verdict (%1)")
+              .arg(hitList(proofpoint)));
+    check(!fired(scored("X-Proofpoint-Spam-Details: rule=notspam policy=default"
+                        " score=30\r\n"),
+                 "upstream-spam"),
+          QStringLiteral("...and rule=notspam accuses nobody"));
+
+    check(fired(scored("X-Yandex-Spam: 1\r\n"), "upstream-spam"),
+          QStringLiteral("Yandex's flag counts"));
+    check(fired(scored("X-Gm-Phishy: 1\r\n"), "upstream-spam"),
+          QStringLiteral("Google Workspace's phishing flag counts"));
+    check(!fired(scored("X-Gm-Spam: 0\r\n"), "upstream-spam"),
+          QStringLiteral("a 0 flag accuses nobody"));
+
+    check(fired(scored("X-UI-Filterresults: junk:10;V03:K0:abc\r\n"), "upstream-spam"),
+          QStringLiteral("GMX's junk verdict counts"));
+    check(!fired(scored("X-UI-Filterresults: notjunk:1;V03:K0:abc\r\n"), "upstream-spam"),
+          QStringLiteral("...and notjunk accuses nobody"));
+
+    // Forgery gate unchanged: the same header below every Received line — the
+    // position only the sender writes into — is ignored.
+    const SpamHeuristics::Score forged = SpamHeuristics::score(
+        headOnly(QByteArray(tail) + "X-Yandex-Spam: 1\r\n"), {});
+    check(!fired(forged, "upstream-spam"),
+          QStringLiteral("a sender-written provider flag is ignored (%1)")
+              .arg(hitList(forged)));
+}
+
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
+    // A throwaway config location: testRuleWeightOverrides() writes
+    // advanced.conf, and it must never be the one the user is running with.
+    const QString sandbox = QDir::tempPath() + QStringLiteral("/mailove-spamheuristicstest");
+    QDir(sandbox).removeRecursively();
+    QDir().mkpath(sandbox);
+    qputenv("XDG_CONFIG_HOME", sandbox.toUtf8());
+    QCoreApplication::setOrganizationName(QStringLiteral("mailove"));
+    QCoreApplication::setApplicationName(QStringLiteral("mailove"));
 
     // Enough of the list for every domain used below. Without it
     // organizationalDomain() returns the name unchanged, and every rule that
@@ -916,6 +1331,7 @@ int main(int argc, char **argv)
     testEnvelopeAndRouting();
     testSubjectTricks();
     testThreadReplyIsHam();
+    testUnfamiliarTld();
     testMeasuredFalsePositives();
     testPlatformMailStaysQuiet();
     testJunkFolderIsDecisive();
@@ -926,6 +1342,11 @@ int main(int argc, char **argv)
     testHamStaysUnmarked();
     testKnownCorrespondentExemption();
     testExplanationRows();
+    testRuleWeightOverrides();
+    testHackedPhpShapes();
+    testAuthResultParsing();
+    testSoftfailRule();
+    testProviderUpstreamHeaders();
 
     out << (failures == 0 ? "\nall checks passed\n"
                           : QStringLiteral("\n%1 check(s) failed\n").arg(failures));

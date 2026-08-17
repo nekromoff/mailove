@@ -34,7 +34,68 @@ AdvancedConfig::SecretSink gSecretSink;
 
 /// Bumped whenever a key is added, removed or its default changes, so a
 /// template seeded by an older build can be spotted and offered a refresh.
-constexpr int kSchemaVersion = 1;
+constexpr int kSchemaVersion = 2;
+
+/// One [group] in the file, with the heading the Settings page shows above it.
+///
+/// Same reason the per-key \a doc exists: a section named "psl" or "dkim" says
+/// nothing to anyone who does not already know what it is, and a reader who
+/// has to guess which group a knob lives in reads them all. Every group in
+/// kSchema must appear here — groupTitleOf() falls back to the bare name, which
+/// is the old behaviour and easy to miss, so the assertion in reference()
+/// catches a group added without a heading.
+struct GroupDoc {
+    const char *name;
+    const char *title;
+    const char *doc;
+};
+
+/// Alphabetical, like kSchema itself: the file, this list and the reference
+/// beside the editor are all read in the same order, so a key seen in one is
+/// found in the others without scanning.
+const GroupDoc kGroups[] = {
+    {"attachments", "Attachments",
+     "Where attachments are kept and how hard they are squeezed: the size at which "
+     "a file moves out of the database into its own file, and what compression pays."},
+    {"avatars", "Sender pictures",
+     "Whether gravatar.com is asked what a sender looks like. Off by default, "
+     "because asking tells gravatar.com that you have this message."},
+    {"compose", "Composing",
+     "Limits on what a message being written may carry — pasted images, and the "
+     "remote pictures fetched once you allow them."},
+    {"db", "Database",
+     "How the local cache database behaves when something else is writing to it."},
+    {"dkim", "DKIM / DNS",
+     "How long the DNS records used to verify a DKIM signature are remembered, "
+     "including the lookups that found nothing."},
+    {"imap", "IMAP",
+     "How this client talks to an IMAP server: how often an idle connection is "
+     "kept alive, and how many connections may fetch bodies at once."},
+    {"jmap", "JMAP",
+     "Timeouts, size limits and push-stream behaviour for JMAP accounts. "
+     "Nothing here is read for an IMAP account."},
+    {"oauth", "OAuth 2 sign-in",
+     "Endpoints and client credentials for signing in to Google and Microsoft. "
+     "Your own app registration goes here; secrets move to the system wallet."},
+    {"psl", "Public suffix list",
+     "The list that tells where one organization's domain ends — what makes "
+     "example.co.uk one name and not two. Turning it off keeps the built-in copy."},
+    {"spam", "Spam scoring",
+     "The numbers the spam scorer works to: what score marks a message, and how "
+     "much history a sender needs before it is treated as familiar."},
+    {"spamrules", "Spam rules",
+     "What each rule is worth when it fires — positive accuses, negative excuses, "
+     "0 turns the rule off. A change applies to mail scored from now on; messages "
+     "already in the mailbox keep the verdict and the explanation they were given."},
+    {"sync", "Sync pacing",
+     "How fast mail is fetched and how the client backs off when a server says "
+     "no. Raise the pauses for a provider that rate-limits."},
+    {"view", "Reading",
+     "What happens while a message is open: when it counts as read, and how much "
+     "of a very large body is rendered."},
+};
+
+constexpr int kGroupCount = int(std::size(kGroups));
 
 /// The one place a default, a range and a description are written down.
 ///
@@ -44,33 +105,64 @@ constexpr int kSchemaVersion = 1;
 /// while something is being built — a timer's interval, a connection — where
 /// saving cannot reach the object that already exists.
 const AdvancedConfig::Knob kSchema[] = {
-    // --- sync pacing ---------------------------------------------------
-    {"sync/headerWindow", Type::Int, 200, 10, 1000, Reload::Live,
-     "Headers fetched per request in the folder on screen."},
-    {"sync/backfillFolderWindow", Type::Int, 250, 10, 1000, Reload::Live,
-     "Headers per request for folders nobody is looking at."},
-    {"sync/headerPauseMs", Type::Int, 400, 0, 60000, Reload::Live,
-     "Pause between header windows. Raise it for a server that rate-limits."},
-    {"sync/bodyPauseMs", Type::Int, 600, 0, 60000, Reload::Live,
-     "Pause between body-fetch batches."},
-    {"sync/backfillIdleMs", Type::Int, 4000, 100, 600000, Reload::Restart,
-     "How long the backfill waits after going idle before resuming."},
-    {"sync/backoffBaseMs", Type::Int, 1000, 100, 60000, Reload::Live,
-     "First wait after the server throttles; doubles per attempt."},
-    {"sync/backoffCapMs", Type::Int, 64000, 1000, 600000, Reload::Live,
-     "Ceiling for one backoff wait."},
-    {"sync/backoffJitterMs", Type::Int, 1000, 0, 60000, Reload::Live,
-     "Random spread added to each backoff wait."},
-    {"sync/backoffMaxAttempts", Type::Int, 8, 1, 100, Reload::Live,
-     "Throttled attempts before the backfill pauses until the next connect."},
+    // --- attachments ---------------------------------------------------------
+    {"attachments/externalizeThresholdBytes", Type::Int, 32768, 0, 1073741824, Reload::Live,
+     "Attachments at least this big are stored outside the database."},
+    {"attachments/zstdLevel", Type::Int, 3, 1, 19, Reload::Live,
+     "zstd compression level for stored attachments."},
+    {"attachments/compressionSampleBytes", Type::Int, 65536, 1024, 16777216, Reload::Live,
+     "Sample compressed first to decide whether compressing the whole file pays."},
+    {"attachments/worthwhileRatio", Type::Double, 0.90, 0.10, 1.0, Reload::Live,
+     "Compress only when the sample shrinks below this fraction of its size."},
+    {"attachments/maxPayloadBytes", Type::Int, 1073741824, 1048576, 2000000000, Reload::Live,
+     "Largest attachment payload decompressed into memory."},
 
-    // --- IMAP ------------------------------------------------------------
+    // --- avatars -------------------------------------------------------------
+    // Off by default and deliberately so: asking gravatar.com for a picture
+    // tells gravatar.com that this address was seen by this reader, which is
+    // not a request anyone should make on the reader's behalf without being
+    // asked. Nothing is fetched, cached or shown until this is turned on.
+    {"avatars/enabled", Type::Bool, false, {}, {}, Reload::Restart,
+     "Show sender pictures from gravatar.com. Off means no request is ever made."},
+    {"avatars/cacheDays", Type::Int, 365, 1, 3650, Reload::Live,
+     "How long a fetched picture is reused before it is asked for again."},
+    {"avatars/missCacheDays", Type::Int, 30, 1, 3650, Reload::Live,
+     "How long 'this address has no picture' is remembered."},
+    {"avatars/sizePixels", Type::Int, 40, 8, 512, Reload::Live,
+     "Size a picture is shown at. Fetched at twice this, so it stays sharp on "
+     "HiDPI screens."},
+
+    // --- compose -------------------------------------------------------------
+    {"compose/maxPastedImageBytes", Type::Int, 20971520, 65536, 268435456, Reload::Live,
+     "Largest image accepted from a paste or drop."},
+    {"compose/pastedImageDisplayWidth", Type::Int, 640, 64, 4096, Reload::Live,
+     "Width a pasted image is displayed at; the sent file keeps its own size."},
+    {"compose/remoteImagePrefetch", Type::Int, 40, 0, 1000, Reload::Live,
+     "Remote images fetched per message once remote content is allowed."},
+    {"compose/maxRemoteImageBytes", Type::Int, 10485760, 65536, 268435456, Reload::Live,
+     "Largest single remote image accepted."},
+
+    // --- db ------------------------------------------------------------------
+    {"db/busyTimeoutMs", Type::Int, 15000, 1000, 300000, Reload::Restart,
+     "How long a query waits for another writer before failing."},
+    {"db/rebuildBusyTimeoutMs", Type::Int, 30000, 1000, 600000, Reload::Restart,
+     "The same, on the index-rebuild connection, which waits behind the GUI."},
+
+    // --- dkim ----------------------------------------------------------------
+    {"dkim/dnsCacheMinTtl", Type::Int, 1800, 0, 86400, Reload::Live,
+     "Shortest time a DKIM key record is cached, whatever its TTL says."},
+    {"dkim/dnsCacheMaxTtl", Type::Int, 86400, 60, 604800, Reload::Live,
+     "Longest time a DKIM key record is cached."},
+    {"dkim/dnsNegativeTtl", Type::Int, 600, 0, 86400, Reload::Live,
+     "How long a failed DKIM key lookup is remembered."},
+
+    // --- imap ----------------------------------------------------------------
     {"imap/keepAliveSeconds", Type::Int, 180, 30, 3600, Reload::Restart,
      "How often an idle connection sends CAPABILITY so the server keeps it."},
     {"imap/bodyPoolSize", Type::Int, 2, 0, 8, Reload::Restart,
      "Extra connections for body fetches. Gmail caps ~15; some servers throttle at 3."},
 
-    // --- JMAP ------------------------------------------------------------
+    // --- jmap ----------------------------------------------------------------
     {"jmap/maxConcurrentBodies", Type::Int, 4, 1, 16, Reload::Live,
      "Blob downloads in flight. Capped by the server's maxConcurrentRequests."},
     {"jmap/maxBodyBytes", Type::Int, 134217728, 1048576, 2000000000, Reload::Live,
@@ -98,7 +190,7 @@ const AdvancedConfig::Knob kSchema[] = {
     {"jmap/pushMaxRetryMs", Type::Int, 300000, 1000, 3600000, Reload::Live,
      "Ceiling for the push reconnect wait."},
 
-    // --- OAuth 2 ---------------------------------------------------------
+    // --- oauth ---------------------------------------------------------------
     {"oauth/googleClientId", Type::String, QString(), {}, {}, Reload::Live,
      "Your own Google client ID. Empty uses the one shipped with Mailove."},
     {"oauth/googleClientSecret", Type::Secret, QString(), {}, {}, Reload::Live,
@@ -134,70 +226,7 @@ const AdvancedConfig::Knob kSchema[] = {
     {"oauth/defaultExpiresIn", Type::Int, 3600, 60, 86400, Reload::Live,
      "Assumed token lifetime when the server does not state one."},
 
-    // --- spam --------------------------------------------------------------
-    {"spam/threshold", Type::Int, 50, 0, 1000, Reload::Live,
-     "Score at which a message is marked spam. Lower catches more and errs more."},
-    {"spam/familiarCount", Type::Int, 20, 1, 10000, Reload::Live,
-     "Messages from a domain before it counts as familiar and is trusted more."},
-    {"spam/familiarDays", Type::Int, 60, 1, 3650, Reload::Live,
-     "How far back the familiarity count looks."},
-    {"spam/linkGroupCap", Type::Int, 40, 1, 10000, Reload::Live,
-     "Links examined per message by the link rules."},
-
-    // --- sender pictures ---------------------------------------------------
-    // Off by default and deliberately so: asking gravatar.com for a picture
-    // tells gravatar.com that this address was seen by this reader, which is
-    // not a request anyone should make on the reader's behalf without being
-    // asked. Nothing is fetched, cached or shown until this is turned on.
-    {"avatars/enabled", Type::Bool, false, {}, {}, Reload::Restart,
-     "Show sender pictures from gravatar.com. Off means no request is ever made."},
-    {"avatars/cacheDays", Type::Int, 365, 1, 3650, Reload::Live,
-     "How long a fetched picture is reused before it is asked for again."},
-    {"avatars/missCacheDays", Type::Int, 30, 1, 3650, Reload::Live,
-     "How long 'this address has no picture' is remembered."},
-    {"avatars/sizePixels", Type::Int, 40, 8, 512, Reload::Live,
-     "Pixel size a picture is fetched and shown at."},
-
-    // --- reading -----------------------------------------------------------
-    {"view/markReadSeconds", Type::Double, 0.1, 0.0, 86400.0, Reload::Live,
-     "Seconds an open message stays unread before it is marked read; decimals "
-     "fine. 0 leaves it unread until marked read by hand."},
-    {"view/maxHtmlPreviewChars", Type::Int, 500000, 1000, 10000000, Reload::Live,
-     "HTML taken for the text preview before it is truncated."},
-    {"view/maxTextBodyBytes", Type::Int, 1048576, 4096, 67108864, Reload::Live,
-     "Largest plain-text body rendered whole."},
-
-    // --- composing ---------------------------------------------------------
-    {"compose/maxPastedImageBytes", Type::Int, 20971520, 65536, 268435456, Reload::Live,
-     "Largest image accepted from a paste or drop."},
-    {"compose/pastedImageDisplayWidth", Type::Int, 640, 64, 4096, Reload::Live,
-     "Width a pasted image is displayed at; the sent file keeps its own size."},
-    {"compose/remoteImagePrefetch", Type::Int, 40, 0, 1000, Reload::Live,
-     "Remote images fetched per message once remote content is allowed."},
-    {"compose/maxRemoteImageBytes", Type::Int, 10485760, 65536, 268435456, Reload::Live,
-     "Largest single remote image accepted."},
-
-    // --- attachments -------------------------------------------------------
-    {"attachments/externalizeThresholdBytes", Type::Int, 32768, 0, 1073741824, Reload::Live,
-     "Attachments at least this big are stored outside the database."},
-    {"attachments/zstdLevel", Type::Int, 3, 1, 19, Reload::Live,
-     "zstd compression level for stored attachments."},
-    {"attachments/compressionSampleBytes", Type::Int, 65536, 1024, 16777216, Reload::Live,
-     "Sample compressed first to decide whether compressing the whole file pays."},
-    {"attachments/worthwhileRatio", Type::Double, 0.90, 0.10, 1.0, Reload::Live,
-     "Compress only when the sample shrinks below this fraction of its size."},
-    {"attachments/maxPayloadBytes", Type::Int, 1073741824, 1048576, 2000000000, Reload::Live,
-     "Largest attachment payload decompressed into memory."},
-
-    // --- DKIM / DNS --------------------------------------------------------
-    {"dkim/dnsCacheMinTtl", Type::Int, 1800, 0, 86400, Reload::Live,
-     "Shortest time a DKIM key record is cached, whatever its TTL says."},
-    {"dkim/dnsCacheMaxTtl", Type::Int, 86400, 60, 604800, Reload::Live,
-     "Longest time a DKIM key record is cached."},
-    {"dkim/dnsNegativeTtl", Type::Int, 600, 0, 86400, Reload::Live,
-     "How long a failed DKIM key lookup is remembered."},
-
-    // --- public suffix list ------------------------------------------------
+    // --- psl -----------------------------------------------------------------
     {"psl/enabled", Type::Bool, true, {}, {}, Reload::Restart,
      "Fetch the public suffix list. 0 keeps the built-in copy and makes no request."},
     {"psl/listUrl", Type::String,
@@ -210,11 +239,213 @@ const AdvancedConfig::Knob kSchema[] = {
     {"psl/startupDelaySeconds", Type::Int, 10, 0, 3600, Reload::Restart,
      "Delay before the first check, so it never competes with startup."},
 
-    // --- database ----------------------------------------------------------
-    {"db/busyTimeoutMs", Type::Int, 15000, 1000, 300000, Reload::Restart,
-     "How long a query waits for another writer before failing."},
-    {"db/rebuildBusyTimeoutMs", Type::Int, 30000, 1000, 600000, Reload::Restart,
-     "The same, on the index-rebuild connection, which waits behind the GUI."},
+    // --- spam ----------------------------------------------------------------
+    // The floor is 1, not 0: the verdict is "total >= threshold" and a message
+    // no rule fired on totals exactly 0, so a threshold of 0 would not mean
+    // "very strict" — it would mark every message in the mailbox.
+    {"spam/threshold", Type::Int, 50, 1, 1000, Reload::Live,
+     "Score at which a message is marked spam. Lower catches more and errs more."},
+    {"spam/familiarCount", Type::Int, 20, 1, 10000, Reload::Live,
+     "Messages from a domain before it counts as familiar and is trusted more."},
+    {"spam/familiarDays", Type::Int, 60, 1, 3650, Reload::Live,
+     "How far back the familiarity count looks."},
+    {"spam/tldSharePercent", Type::Int, 10, 1, 100, Reload::Live,
+     "Share of your sent mail a top-level domain needs before mail from it "
+     "stops looking unusual. Higher trusts fewer countries."},
+    {"spam/tldMinSample", Type::Int, 50, 1, 100000, Reload::Live,
+     "Sent addresses needed before the top-level domain rule says anything."},
+    {"spam/linkGroupCap", Type::Int, 40, 1, 10000, Reload::Live,
+     "Links examined per message by the link rules."},
+    // One switch per authentication method the trusted Authentication-Results
+    // header can carry. The account's own "verify authentication" checkbox is
+    // the master: off, no header is read and none of these matter. These are
+    // the finer grain — a server whose SPF answers are wrong (a forwarding
+    // setup, say) can be disbelieved method by method without giving up DKIM.
+    // Distrusted is invisible too: the message viewer's badge drops a method
+    // whose key is 0, so nothing is shown that is not also scored.
+    {"spam/trustArc", Type::Bool, true, {}, {}, Reload::Live,
+     "Honour arc=pass as proof a relay (mailing list, forwarder) broke SPF/DKIM "
+     "legitimately. 0 scores such failures like any other."},
+    {"spam/trustCompauth", Type::Bool, true, {}, {}, Reload::Live,
+     "Count Microsoft's compauth verdict with the others. Only ever present on "
+     "Microsoft 365 accounts; 0 ignores it for a tenant whose verdicts are noisy."},
+    {"spam/trustDkim", Type::Bool, true, {}, {}, Reload::Live,
+     "Count the server's DKIM verdicts. 0 ignores them both ways."},
+    {"spam/trustDmarc", Type::Bool, true, {}, {}, Reload::Live,
+     "Count the server's DMARC verdicts. 0 ignores them both ways."},
+    {"spam/trustSpf", Type::Bool, true, {}, {}, Reload::Live,
+     "Count the server's SPF verdicts. 0 ignores them both ways — useful when "
+     "forwarding makes SPF fail on legitimate mail."},
+
+    // --- spamrules --------------------------------------------------------------
+    // Every rule the scorer can fire, and what it is worth. Ids are the ones
+    // printed in the "Why?" tooltip, so a rule that misfires on your mail can be
+    // found by reading the message it misfired on and turned down or off here.
+    //
+    // Nothing is rescored: a verdict is stored with the explanation it was given,
+    // and a weight changed today would otherwise silently contradict a tooltip
+    // written last week. New mail is scored with the new numbers.
+    {"spamrules/attachment-double-extension", Type::Int, 50, -999, 999, Reload::Live,
+     "An attachment named to look like a document but is a program (invoice.pdf.exe)."},
+    {"spamrules/attachment-executable", Type::Int, 45, -999, 999, Reload::Live,
+     "An attached program or disk image rather than a document."},
+    {"spamrules/attachment-macro", Type::Int, 15, -999, 999, Reload::Live,
+     "An attached Office file of a kind that can carry macros."},
+    {"spamrules/auth-fail", Type::Int, 35, -999, 999, Reload::Live,
+     "Your receiving server reported an SPF, DKIM or DMARC failure."},
+    {"spamrules/auth-pass", Type::Int, -8, -999, 999, Reload::Live,
+     "Authentication passed, but for a domain with no history here — worth little on its "
+     "own, since a spammer can publish SPF in an afternoon."},
+    {"spamrules/auth-pass-familiar", Type::Int, -25, -999, 999, Reload::Live,
+     "Authentication passed for a domain you have heard from for a long time."},
+    {"spamrules/auth-softfail", Type::Int, 20, -999, 999, Reload::Live,
+     "The receiving server reported a soft failure (spf=softfail): the sending "
+     "domain hedges rather than denies. Never revokes the known-correspondent "
+     "exemption."},
+    {"spamrules/brand-impersonation", Type::Int, 30, -999, 999, Reload::Live,
+     "Calls itself a well-known brand from a domain that brand does not send from."},
+    {"spamrules/charset-mismatch", Type::Int, 8, -999, 999, Reload::Live,
+     "The subject was needlessly encoded, which hides it from simple filters."},
+    {"spamrules/date-skew", Type::Int, 15, -999, 999, Reload::Live,
+     "The Date header is hours away from when the message actually arrived."},
+    {"spamrules/display-name-address", Type::Int, 30, -999, 999, Reload::Live,
+     "The sender's name shows one address while the message comes from another."},
+    {"spamrules/display-name-confusable", Type::Int, 30, -999, 999, Reload::Live,
+     "The sender's name mixes alphabets inside one word, imitating a name you know."},
+    {"spamrules/encrypted-archive", Type::Int, 50, -999, 999, Reload::Live,
+     "An attached archive needs a password, so no virus scanner can look inside it."},
+    {"spamrules/familiar-domain", Type::Int, -15, -999, 999, Reload::Live,
+     "You have had mail from this domain for a long time."},
+    {"spamrules/familiar-domain-spoofed", Type::Int, 25, -999, 999, Reload::Live,
+     "Claims a domain you really do hear from, while failing authentication."},
+    {"spamrules/freemail-brand-name", Type::Int, 25, -999, 999, Reload::Live,
+     "Presents as a company but writes from a personal Gmail-style mailbox."},
+    {"spamrules/freemail-reply-to", Type::Int, 20, -999, 999, Reload::Live,
+     "Presents as a company but replies would go to a personal mailbox."},
+    {"spamrules/from-domain-confusable", Type::Int, 30, -999, 999, Reload::Live,
+     "The sender's domain mixes alphabets inside one name — a lookalike domain."},
+    {"spamrules/from-ip-literal", Type::Int, 25, -999, 999, Reload::Live,
+     "The sender's address is a bare IP address instead of a domain name."},
+    {"spamrules/hacked-php-url", Type::Int, 15, -999, 999, Reload::Live,
+     "A link calls a PHP script with several long random codes — the shape of mail sent "
+     "through a hacked website. Capped with the other link rules."},
+    {"spamrules/hacked-wordpress-link", Type::Int, 15, -999, 999, Reload::Live,
+     "A link leads into a WordPress code directory (wp-includes, script files under "
+     "wp-content) — a hacked site's landing page. Media links are not matched."},
+    {"spamrules/html-attachment", Type::Int, 30, -999, 999, Reload::Live,
+     "A web page sent as a file, which is how a fake sign-in form dodges link checks."},
+    {"spamrules/html-password-form", Type::Int, 40, -999, 999, Reload::Live,
+     "The message body contains a password box. A real sign-in page never is one."},
+    {"spamrules/image-only", Type::Int, 12, -999, 999, Reload::Live,
+     "Nearly the whole message is one image, with no text a filter could read."},
+    {"spamrules/junk-folder", Type::Int, 999, -999, 999, Reload::Live,
+     "The message is already in a junk folder. Far above the threshold on purpose: it is "
+     "a decision you or your server made, not a guess. 0 makes junk folders score like "
+     "any other."},
+    {"spamrules/known-contact-spoofed", Type::Int, 60, -999, 999, Reload::Live,
+     "Claims to be somebody you have written to, while failing authentication. Decisive "
+     "on its own — forging an address you correspond with is targeted."},
+    {"spamrules/link-text-mismatch", Type::Int, 25, -999, 999, Reload::Live,
+     "A link's visible text names one domain while it goes to another. Not read in list "
+     "mail, whose click trackers do this legitimately."},
+    {"spamrules/msgid-local", Type::Int, 15, -999, 999, Reload::Live,
+     "The Message-ID was issued by 'localhost' rather than a real domain."},
+    {"spamrules/msgid-malformed", Type::Int, 15, -999, 999, Reload::Live,
+     "The Message-ID has no domain part, which no normal mail software produces."},
+    {"spamrules/no-date", Type::Int, 15, -999, 999, Reload::Live,
+     "No Date header, which every mail client writes."},
+    {"spamrules/no-message-id", Type::Int, 18, -999, 999, Reload::Live,
+     "No Message-ID, which normal mail software always writes."},
+    {"spamrules/no-received", Type::Int, 20, -999, 999, Reload::Live,
+     "No Received headers: the message went through no server we can see."},
+    {"spamrules/not-addressed-to-you", Type::Int, 8, -999, 999, Reload::Live,
+     "None of your addresses appear in To or Cc. Low, because ordinary bcc looks the "
+     "same."},
+    {"spamrules/pgp-encrypted", Type::Int, -40, -999, 999, Reload::Live,
+     "The message is OpenPGP encrypted. Spam is not."},
+    {"spamrules/pgp-signed", Type::Int, -50, -999, 999, Reload::Live,
+     "The message is OpenPGP signed. Spam is not."},
+    {"spamrules/php-cms-origin", Type::Int, 25, -999, 999, Reload::Live,
+     "Sent by a script inside a CMS content directory (WordPress uploads, a Joomla "
+     "component), where mail-sending code does not belong."},
+    {"spamrules/php-eval-source", Type::Int, 40, -999, 999, Reload::Live,
+     "Sent by PHP code that exists only in memory (eval), the signature of malware on a "
+     "hacked website."},
+    {"spamrules/php-script-origin", Type::Int, 10, -999, 999, Reload::Live,
+     "Sent by a PHP script on a web server. Low: every small shop's order mail is one."},
+    {"spamrules/reply-to-mismatch", Type::Int, 8, -999, 999, Reload::Live,
+     "Replies would leave the sender's own domain."},
+    {"spamrules/single-hop-unknown", Type::Int, 12, -999, 999, Reload::Live,
+     "Delivered in one hop from a machine with no host name, not through a mail server."},
+    {"spamrules/subject-bidi-override", Type::Int, 30, -999, 999, Reload::Live,
+     "The subject carries a text-direction override, so it reads differently than it is."},
+    {"spamrules/subject-confusable", Type::Int, 25, -999, 999, Reload::Live,
+     "The subject mixes alphabets inside a word, a common way to imitate a brand."},
+    {"spamrules/subject-shouting", Type::Int, 6, -999, 999, Reload::Live,
+     "The subject is almost entirely capitals."},
+    {"spamrules/text-html-divergence", Type::Int, 10, -999, 999, Reload::Live,
+     "The plain-text copy is nearly empty while the formatted one is not."},
+    {"spamrules/thread-reply", Type::Int, -30, -999, 999, Reload::Live,
+     "A reply inside a conversation already in your mailbox — which a stranger cannot "
+     "fake, since it needs a Message-ID you received."},
+    {"spamrules/undisclosed-recipients", Type::Int, 6, -999, 999, Reload::Live,
+     "The message names no recipient at all."},
+    {"spamrules/unfamiliar-tld", Type::Int, 15, -999, 999, Reload::Live,
+     "The sender is in a top-level domain your own mail never goes to. Deliberately too "
+     "low to mark anything by itself."},
+    {"spamrules/upstream-ham", Type::Int, -15, -999, 999, Reload::Live,
+     "Your mail server's own filter scored this well below its threshold."},
+    {"spamrules/upstream-near-threshold", Type::Int, 12, -999, 999, Reload::Live,
+     "Your mail server's own filter came close to its threshold without calling it."},
+    {"spamrules/upstream-spam", Type::Int, 40, -999, 999, Reload::Live,
+     "Your mail server's own filter marked this as spam."},
+    {"spamrules/upstream-spam-high", Type::Int, 50, -999, 999, Reload::Live,
+     "Your mail server's own filter scored this at twice its own threshold."},
+    {"spamrules/url-brand-subdomain", Type::Int, 25, -999, 999, Reload::Live,
+     "A link spells a brand's name in the part of its address anyone can choose."},
+    {"spamrules/url-credential-trick", Type::Int, 30, -999, 999, Reload::Live,
+     "A link written so it appears to go somewhere other than where it goes."},
+    {"spamrules/url-ip-host", Type::Int, 20, -999, 999, Reload::Live,
+     "A link points at a bare IP address rather than a named site."},
+    {"spamrules/url-punycode-brand", Type::Int, 25, -999, 999, Reload::Live,
+     "A link's name is built from two alphabets to look like one you trust."},
+    {"spamrules/url-shortener", Type::Int, 8, -999, 999, Reload::Live,
+     "A link hides behind a URL shortener. Only read outside list mail, and can never "
+     "mark alone."},
+    {"spamrules/vulnerable-mailer", Type::Int, 12, -999, 999, Reload::Live,
+     "Sent with a PHPMailer version unmaintained and exploitable for years — a relic "
+     "server or a spam kit's fake header."},
+    {"spamrules/zero-width-obfuscation", Type::Int, 25, -999, 999, Reload::Live,
+     "Invisible characters hidden inside a word, which is only ever done to disguise it."},
+
+    // --- sync ----------------------------------------------------------------
+    {"sync/headerWindow", Type::Int, 200, 10, 1000, Reload::Live,
+     "Headers fetched per request in the folder on screen."},
+    {"sync/backfillFolderWindow", Type::Int, 250, 10, 1000, Reload::Live,
+     "Headers per request for folders nobody is looking at."},
+    {"sync/headerPauseMs", Type::Int, 400, 0, 60000, Reload::Live,
+     "Pause between header windows. Raise it for a server that rate-limits."},
+    {"sync/bodyPauseMs", Type::Int, 600, 0, 60000, Reload::Live,
+     "Pause between body-fetch batches."},
+    {"sync/backfillIdleMs", Type::Int, 4000, 100, 600000, Reload::Restart,
+     "How long the backfill waits after going idle before resuming."},
+    {"sync/backoffBaseMs", Type::Int, 1000, 100, 60000, Reload::Live,
+     "First wait after the server throttles; doubles per attempt."},
+    {"sync/backoffCapMs", Type::Int, 64000, 1000, 600000, Reload::Live,
+     "Ceiling for one backoff wait."},
+    {"sync/backoffJitterMs", Type::Int, 1000, 0, 60000, Reload::Live,
+     "Random spread added to each backoff wait."},
+    {"sync/backoffMaxAttempts", Type::Int, 8, 1, 100, Reload::Live,
+     "Throttled attempts before the backfill pauses until the next connect."},
+
+    // --- view ----------------------------------------------------------------
+    {"view/markReadSeconds", Type::Double, 0.1, 0.0, 86400.0, Reload::Live,
+     "Seconds an open message stays unread before it is marked read; decimals "
+     "fine. 0 leaves it unread until marked read by hand."},
+    {"view/maxHtmlPreviewChars", Type::Int, 500000, 1000, 10000000, Reload::Live,
+     "HTML taken for the text preview before it is truncated."},
+    {"view/maxTextBodyBytes", Type::Int, 1048576, 4096, 67108864, Reload::Live,
+     "Largest plain-text body rendered whole."},
 };
 
 constexpr int kSchemaCount = int(std::size(kSchema));
@@ -224,6 +455,16 @@ QString groupOf(const QString &key)
 {
     const qsizetype slash = key.indexOf(u'/');
     return slash < 0 ? QString() : key.left(slash);
+}
+
+/// The heading for a group, or nullptr when the schema has no entry for it.
+const GroupDoc *groupDoc(const QString &group)
+{
+    for (int n = 0; n < kGroupCount; ++n) {
+        if (group == QLatin1String(kGroups[n].name))
+            return &kGroups[n];
+    }
+    return nullptr;
 }
 
 QString nameOf(const QString &key)
@@ -244,6 +485,26 @@ QString trimBlankEnds(const QString &text)
     while (!lines.isEmpty() && lines.last().trimmed().isEmpty())
         lines.removeLast();
     return lines.isEmpty() ? QString() : lines.join(u'\n') + u'\n';
+}
+
+/// \a text as "# " comment lines of at most 78 columns. Only used for the
+/// group explainers, which are the only multi-sentence strings written into
+/// the file; a per-key doc is one line by construction.
+QStringList wrapComment(const QString &text)
+{
+    QStringList out;
+    QString line;
+    const QStringList words = text.split(u' ', Qt::SkipEmptyParts);
+    for (const QString &word : words) {
+        if (!line.isEmpty() && line.size() + word.size() + 1 > 76) {
+            out.append(QStringLiteral("# %1\n").arg(line));
+            line.clear();
+        }
+        line += line.isEmpty() ? word : u' ' + word;
+    }
+    if (!line.isEmpty())
+        out.append(QStringLiteral("# %1\n").arg(line));
+    return out;
 }
 
 QString asText(const QVariant &v, Type type)
@@ -270,6 +531,31 @@ AdvancedConfig &AdvancedConfig::instance()
 {
     static AdvancedConfig config;
     return config;
+}
+
+int AdvancedConfig::intOr(const QString &key, int fallback)
+{
+    // Indexed rather than scanned: i() memoises per string literal, which a
+    // built key cannot do, and this is called once per spam rule that fires —
+    // per message, on the path that also has to keep the list scrolling.
+    static const QHash<QString, int> index = [] {
+        QHash<QString, int> out;
+        out.reserve(kSchemaCount);
+        for (int n = 0; n < kSchemaCount; ++n) {
+            if (kSchema[n].type == Type::Int)
+                out.insert(QString::fromLatin1(kSchema[n].key), n);
+        }
+        return out;
+    }();
+    // Deliberately not asserting on an unknown key the way i() does: the whole
+    // point is a caller whose keys are built at runtime, where "no such knob"
+    // is an ordinary answer and means "use what the code says".
+    const auto it = index.constFind(key);
+    if (it == index.cend())
+        return fallback;
+    const AdvancedConfig &self = instance();
+    const QReadLocker locked(&self.m_lock);
+    return self.m_effective.at(*it).toInt();
 }
 
 QString AdvancedConfig::filePath()
@@ -836,9 +1122,15 @@ QVariantList AdvancedConfig::reference() const
         } else if (k.type == Type::Secret) {
             range = QStringLiteral("kept in the system wallet");
         }
+        const QString group = groupOf(key);
+        const GroupDoc *gd = groupDoc(group);
+        Q_ASSERT_X(gd, "AdvancedConfig::reference", "schema group with no heading in kGroups");
         out.append(QVariantMap{
             {QStringLiteral("key"), key},
-            {QStringLiteral("group"), groupOf(key)},
+            {QStringLiteral("group"), group},
+            {QStringLiteral("groupTitle"),
+             gd ? QString::fromUtf8(gd->title) : group},
+            {QStringLiteral("groupDoc"), gd ? QString::fromUtf8(gd->doc) : QString()},
             {QStringLiteral("name"), nameOf(key)},
             {QStringLiteral("def"), asText(k.def, k.type)},
             {QStringLiteral("range"), range},
@@ -879,6 +1171,14 @@ QString AdvancedConfig::defaultTemplate() const
         const QString key = QString::fromLatin1(k.key);
         if (groupOf(key) != group) {
             group = groupOf(key);
+            // The section's own explainer, in the file as well as in the UI: a
+            // reader who opens advanced.conf in an editor is exactly the reader
+            // who cannot see the Settings page while reading it.
+            if (const GroupDoc *gd = groupDoc(group)) {
+                out += QStringLiteral("\n# --- %1 ---\n").arg(QString::fromUtf8(gd->title));
+                for (const QString &line : wrapComment(QString::fromUtf8(gd->doc)))
+                    out += line;
+            }
             out += QStringLiteral("\n[%1]\n").arg(group);
         }
         out += QStringLiteral("# %1\n").arg(QString::fromUtf8(k.doc));

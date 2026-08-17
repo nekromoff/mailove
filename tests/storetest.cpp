@@ -268,6 +268,33 @@ int main(int argc, char **argv)
     check(known("frank@"),
           QStringLiteral("invalidating the folder cache keeps its recipients"));
 
+    out() << "sent-to TLD profile" << Qt::endl;
+
+    // Ten addresses: seven .com, two .sk, one .hr. At the 10% default the first
+    // two are where this mailbox writes and .hr is the tail — which is the
+    // whole point, since one letter to Croatia is not a correspondence.
+    for (int i = 0; i < 7; ++i)
+        store.addRecipient(QStringLiteral("p%1@shop.com").arg(i));
+    store.addRecipient(QStringLiteral("jano@firma.sk"));
+    store.addRecipient(QStringLiteral("eva@urad.sk"));
+    store.addRecipient(QStringLiteral("marko@shop.hr"));
+    const MailStore::SentTldProfile profile = store.sentTldProfile();
+    check(profile.familiar.contains(QLatin1String("com"))
+              && profile.familiar.contains(QLatin1String("sk")),
+          QStringLiteral("the TLDs most of the sent mail goes to are familiar (%1)")
+              .arg(profile.familiar.join(QLatin1Char(' '))));
+    check(!profile.familiar.contains(QLatin1String("hr")),
+          QStringLiteral("a TLD written to once is not (%1)")
+              .arg(profile.familiar.join(QLatin1Char(' '))));
+    check(profile.sample >= 10,
+          QStringLiteral("the sample counts every sent-to address (%1)").arg(profile.sample));
+
+    // Adding an address must not be answered from the cache computed above.
+    for (int i = 0; i < 20; ++i)
+        store.addRecipient(QStringLiteral("h%1@shop.hr").arg(i));
+    check(store.sentTldProfile().familiar.contains(QLatin1String("hr")),
+          QStringLiteral("writing to a new country invalidates the cached profile"));
+
     out() << "another account's rows" << Qt::endl;
 
     // What the background account poll writes through: the scope stays on the

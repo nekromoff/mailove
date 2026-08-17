@@ -865,9 +865,10 @@ void DkimVerifier::verify(quint64 requestId, const QByteArray &rawMessageCrlf,
                     ? tr("signed by %1").arg(r.domain)
                     // Valid but unaligned: the signer is not the From: domain,
                     // which is exactly what a forger's own valid signature
-                    // looks like. Say so rather than showing a bare "pass".
-                    : tr("signed by %1, which does not match the sender address")
-                          .arg(r.domain);
+                    // looks like. Both domains are named so the mismatch can
+                    // be seen, not taken on faith.
+                    : tr("signed by %1, which does not match the sender %2")
+                          .arg(r.domain, fromDomain);
             }
             if (r.aligned) {
                 Q_EMIT finished(requestId, r);

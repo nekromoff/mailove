@@ -487,6 +487,25 @@ public:
     /// table, which has no index that could answer this.
     QHash<QString, DomainHistory> senderDomainHistory(const QSet<QString> &orgs);
 
+    /// Which top-level domains the user's own outgoing mail goes to.
+    struct SentTldProfile {
+        QStringList familiar; ///< each holding >= spam/tldSharePercent of \a sample
+        int sample = 0;       ///< distinct sent-to addresses behind it
+    };
+    /// The profile for the open account, computed over the recipients table.
+    ///
+    /// Per-account, unlike isKnownCorrespondent(): "who you have written to" is
+    /// a fact about a person and holds across mailboxes, but "where your mail
+    /// goes" is a fact about a mailbox — a work account writing to one country
+    /// and a personal one writing to another are two different profiles, and
+    /// merging them would describe neither.
+    ///
+    /// Cached, because the spam scorer asks per message and this is a scan of
+    /// every recipient row. Invalidated whenever a recipient is added or
+    /// dropped, and expiring on its own after a few minutes so that rows a
+    /// worker connection wrote behind our back cannot be missed forever.
+    SentTldProfile sentTldProfile();
+
     /// Attachment heuristic on a raw RFC-2822 head: top-level multipart/mixed.
     /// Works on the raw bytes because KMime downgrades multipart/* to
     /// text/plain when parsing a header-only (body-less) message shell.
@@ -517,6 +536,9 @@ private:
 
     QSqlDatabase m_db;
     QString m_accountKey;
+    SentTldProfile m_tldProfile;      ///< sentTldProfile() cache
+    qint64 m_tldProfileAt = 0;        ///< when it was computed, 0 = never
+    QString m_tldProfileAccount;      ///< which account it describes
     bool m_ftsAvailable = false;
     bool m_ftsRebuildNeeded = false; ///< index predates diacritic folding
 };

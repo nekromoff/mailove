@@ -49,7 +49,12 @@ import Mailove.Core
             for (let i = 0; i < rows.length; ++i) {
                 if (rows[i].group !== group) {
                     group = rows[i].group
-                    out.push({ "header": true, "group": group })
+                    // The heading carries the section's own explainer, for the
+                    // same reason each key does: "psl" and "dkim" name nothing
+                    // to a reader who does not already know what they are.
+                    out.push({ "header": true, "group": group,
+                               "groupTitle": rows[i].groupTitle,
+                               "groupDoc": rows[i].groupDoc })
                 }
                 out.push(rows[i])
             }
@@ -94,8 +99,20 @@ import Mailove.Core
                     implicitHeight: Kirigami.Units.smallSpacing
                 }
                 Kirigami.Heading {
-                    level: 5
+                    level: 4
+                    text: groupHeading.entry ? groupHeading.entry.groupTitle : ""
+                }
+                QQC2.Label {
+                    Layout.fillWidth: true
+                    text: groupHeading.entry ? groupHeading.entry.groupDoc : ""
+                    wrapMode: Text.Wrap
+                    opacity: 0.8
+                }
+                QQC2.Label {
                     text: groupHeading.entry ? "[" + groupHeading.entry.group + "]" : ""
+                    font.family: "monospace"
+                    opacity: 0.6
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
                 }
                 Kirigami.Separator {
                     Layout.fillWidth: true

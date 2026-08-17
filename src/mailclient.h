@@ -397,6 +397,12 @@ public:
     Q_INVOKABLE QString avatarSource(const QString &from) const;
     /// Pixel size avatarSource() asks for, for the QML that lays it out.
     Q_INVOKABLE int avatarSize() const;
+    /// The authentication methods spam/trust* currently believes, lowercased
+    /// ("spf", "dkim", ...). The viewer's badge filters against this so a
+    /// method distrusted in advanced.conf is not displayed either — showing
+    /// spf=pass while the score ignores SPF would be the badge arguing with
+    /// the tooltip.
+    Q_INVOKABLE QStringList trustedAuthMethods() const;
     Q_INVOKABLE void connectAccount();
     Q_INVOKABLE void openFolder(const QString &mailBox);
     Q_INVOKABLE void fetchMessage(int row);
@@ -876,7 +882,8 @@ private:
                      const QByteArray &head,
                      const QSet<QString> &knownSenders,
                      const QHash<QString, MailStore::DomainHistory> &orgHistory,
-                     const QSet<QString> &knownMsgIds);
+                     const QSet<QString> &knownMsgIds,
+                     const MailStore::SentTldProfile &tldProfile);
     /// Scores a message again now that its body is in hand, and stores the
     /// result as verdict state 2.
     ///
@@ -892,7 +899,8 @@ private:
                                            const QByteArray &head,
                                            const QSet<QString> &knownSenders,
                                            const QHash<QString, MailStore::DomainHistory> &orgHistory,
-                                           const QSet<QString> &knownMsgIds) const;
+                                           const QSet<QString> &knownMsgIds,
+                                           const MailStore::SentTldProfile &tldProfile) const;
     /// Every address this account receives at, normalized. Read by the
     /// "addressed to nobody you are" rule, which stays silent when it is empty.
     QStringList ownAddresses() const;

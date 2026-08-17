@@ -1,3 +1,70 @@
+mailove (2.8) unstable; urgency=medium
+
+  * A new spam rule: mail from a top-level domain your own sent mail never
+    goes to scores slightly higher. The profile is built from the recipients
+    of your own Sent mail, per account — someone writing to .sk and .com is
+    not expecting first contact from .top — and it only ever corroborates:
+    on its own it cannot mark anything, and a domain you already have a
+    history with is never judged by the country it is in. Silent until
+    enough sent mail exists to describe a habit (spam/tldMinSample).
+  * Every spam rule's weight is now a setting, [spamrules] in advanced.conf:
+    one key per rule id as printed in the "Why?" tooltip, so a rule that
+    misfires on your mail can be found from the message it misfired on and
+    turned down, or off with 0 — which removes it from the tooltip too.
+    Changes apply to mail scored from now on; stored verdicts keep the score
+    and the explanation they were given.
+  * The advanced-settings groups are ordered alphabetically and each carries
+    a heading and a plain-language explainer — in the reference beside the
+    editor and as comments in the seeded file alike.
+  * The spam threshold can no longer be set to 0, which would have marked
+    every message in the mailbox: a message no rule fires on scores exactly 0.
+  * Sender pictures are fetched at twice the size they are shown at, so they
+    stay sharp on HiDPI screens. A few KB more, once per address per year.
+  * New spam rules for mail sent through hacked websites, adapted from
+    kawaiipantsu/spamassassin-rules: PHP code existing only in memory
+    (php-eval-source), scripts mailing out of a CMS tree —
+    WordPress or Joomla (php-cms-origin), a years-unmaintained PHPMailer
+    (vulnerable-mailer), and .php links fed random tokens (hacked-php-url).
+    An ordinary shop's PHP-sent receipt stays well below the threshold.
+  * The link rules (link-text-mismatch, url-*) now answer to [spamrules]
+    like every other rule; previously their weights were fixed.
+  * Microsoft's compauth verdict (composite authentication, stamped by
+    Microsoft 365) now counts: compauth=fail scores like any other
+    authentication failure — including revoking the known-correspondent
+    exemption for the spoofs of DMARC-less domains it exists to catch — and
+    compauth=pass like a pass. The account's authentication checkbox
+    remains the master switch; per-method spam/trustSpf, trustDkim,
+    trustDmarc, trustArc and trustCompauth keys in advanced.conf drop one
+    method's verdicts without giving up the rest (SPF broken by forwarding,
+    a noisy Microsoft tenant). A distrusted method disappears from the
+    message's authentication badge too, so what is shown is always what
+    was counted; compauth appears there alongside the others.
+  * The server-verdict rules read more providers' headers: Barracuda
+    (X-Barracuda-Spam-Status), Proofpoint incl. iCloud
+    (X-Proofpoint-Spam-Details), Yandex, Google Workspace (X-Gm-Spam,
+    X-Gm-Phishy) and GMX/Web.de (X-UI-Filterresults). All feed the existing
+    upstream rules and their [spamrules] weights; the forgery check (header
+    must be added in transit) applies unchanged.
+  * spf=softfail is scored apart from an outright failure: its own
+    lower-weighted rule (auth-softfail), never revoking the known-sender
+    exemption — forwarded mail is what softfail looks like — and shown in
+    orange rather than red in the authentication badge.
+  * The message viewer's authentication badges speak one language: the
+    server's verdicts appear as SPF / DKIM / DMARC / COMPAUTH with coloured
+    check marks, mailove's own DKIM and ARC verification stands larger above
+    them, and each tooltip ends with a one-line explainer of the acronym.
+  * Fixed: the ARC exemption never actually applied — arc=pass was not
+    extracted from Authentication-Results, so mailing-list mail whose
+    SPF/DKIM broke in transit could be wrongly marked. The parsing now
+    lives in spamheuristics.cpp under test.
+  * More hacked-website coverage: links into WordPress code directories
+    (hacked-wordpress-link, from martinschaible/rspamd-rules), scripts
+    mailing from /.well-known/ or the PHPUnit RCE path, and a URL-shortener
+    list grown from 16 to 116 services. Newsletter media links under
+    wp-content/uploads are deliberately not matched.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Mon, 17 Aug 2026 12:00:00 +0200
+
 mailove (2.7) unstable; urgency=medium
 
   * Advanced settings, under Settings -> Advanced: everything with no widget of

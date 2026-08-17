@@ -52,6 +52,24 @@ int main(int argc, char **argv)
     check(tpl.contains(QLatin1String("# markReadSeconds = 0.1")),
           "template documents markReadSeconds");
     check(tpl.contains(QLatin1String("[oauth]")), "template has groups");
+    // Each section explains itself in the file too: whoever opens advanced.conf
+    // in an editor is exactly the reader who cannot see the Settings page.
+    check(tpl.contains(QLatin1String("# --- Public suffix list ---")),
+          "template titles its groups");
+    check(tpl.indexOf(QLatin1String("[attachments]")) < tpl.indexOf(QLatin1String("[spam]"))
+              && tpl.indexOf(QLatin1String("[spam]")) < tpl.indexOf(QLatin1String("[spamrules]"))
+              && tpl.indexOf(QLatin1String("[spamrules]")) < tpl.indexOf(QLatin1String("[sync]")),
+          "groups are in alphabetical order");
+    check(tpl.indexOf(QLatin1String("# auth-fail = 35"))
+              < tpl.indexOf(QLatin1String("# thread-reply = -30")),
+          "spam rules are in alphabetical order");
+    // A rule weight is an ordinary key, dashes and all.
+    check(cfg.problems(QStringLiteral("[spamrules]\nknown-contact-spoofed = 0\n")).isEmpty(),
+          "a rule id parses as a key name");
+    check(AdvancedConfig::intOr(QStringLiteral("spamrules/auth-fail"), 7) == 35,
+          "intOr reads a rule weight");
+    check(AdvancedConfig::intOr(QStringLiteral("spamrules/no-such-rule"), 7) == 7,
+          "intOr falls back for a key the schema does not have");
 
     // A real edit.
     const QString good = QStringLiteral(

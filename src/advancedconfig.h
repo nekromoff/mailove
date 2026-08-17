@@ -86,6 +86,13 @@ public:
     static bool b(const char *key);
     static QString s(const char *key);
 
+    /// The value of \a key when the schema has it, \a fallback when it does
+    /// not. For key spaces a call site cannot name with a literal — the
+    /// per-rule spam weights, whose ids live in spamheuristics.cpp and whose
+    /// schema entries are generated from the same list. Everything else should
+    /// use i(), which is checked at the call site.
+    static int intOr(const QString &key, int fallback);
+
     static QString filePath();
     QString text() const;
 

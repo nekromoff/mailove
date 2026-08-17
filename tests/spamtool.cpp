@@ -12,6 +12,7 @@
 //   ./spamtool --arc-pass msg.eml           ...or failed only because of a relay (ARC)
 //   ./spamtool --junk msg.eml               score as if it sat in the Junk folder
 //   ./spamtool --crypto 2 msg.eml           score as OpenPGP signed (1 enc, 2 sig, 3 both)
+//   ./spamtool --familiar-tld sk            score as if your own mail goes to .sk
 //   ./spamtool --quiet ...                  totals only, no per-message lines
 //   ./spamtool --cache                      score your own cached inbox, no export
 //   ./spamtool --cache --folder Junk        ...some other folder instead
@@ -40,6 +41,7 @@
 // differently here and in the message list, which only ever sees headers.
 #include "../src/mimeutils.h"
 #include "../src/publicsuffixlist.h"
+#include "../src/advancedconfig.h"
 #include "../src/spamheuristics.h"
 
 #include <KMime/Message>
@@ -209,6 +211,38 @@ QSqlDatabase openCacheReadOnly(const QString &explicitPath)
 /// depends on which authserv-id this account's server stamps, which lives in
 /// the account settings rather than the cache, and reading a message's own
 /// Authentication-Results here would be trusting a header the sender wrote.
+/// Where the user's own mail goes, as MailStore::sentTldProfile() computes it:
+/// one row per sent-to address, TLDs holding at least spam/tldSharePercent of
+/// them counted as familiar. Not scoped to an account — the sweep is pointed at
+/// a cache, not at a mailbox, and a profile per account would need an account
+/// key the corpus does not carry.
+SpamHeuristics::Context tldProfileFrom(QSqlDatabase &db, const SpamHeuristics::Context &base)
+{
+    SpamHeuristics::Context ctx = base;
+    QSqlQuery q(db);
+    if (!q.exec(QStringLiteral("SELECT addr_norm FROM recipients")))
+        return ctx;
+    QHash<QString, int> counts;
+    int sample = 0;
+    while (q.next()) {
+        const QString tld = SpamHeuristics::tldOf(q.value(0).toString());
+        if (tld.isEmpty())
+            continue;
+        ++counts[tld];
+        ++sample;
+    }
+    if (sample <= 0)
+        return ctx;
+    const int pct = qBound(1, AdvancedConfig::i("spam/tldSharePercent"), 100);
+    for (auto it = counts.cbegin(); it != counts.cend(); ++it) {
+        if (it.value() * 100 >= sample * pct)
+            ctx.familiarTlds.append(it.key());
+    }
+    ctx.familiarTlds.sort();
+    ctx.sentTldSample = sample;
+    return ctx;
+}
+
 SpamHeuristics::Context cacheContext(QSqlDatabase &db, const SpamHeuristics::Context &base,
                                      const QString &fromValue)
 {
@@ -280,6 +314,10 @@ int scoreCache(QSqlDatabase &db, const QString &folderLike, int limit,
         return 0;
     }
 
+    // Once for the whole sweep rather than per message: it is a scan of every
+    // recipient row, and it cannot change while the sweep runs.
+    const SpamHeuristics::Context withTlds = tldProfileFrom(db, base);
+
     int scored = 0;
     while (q.next()) {
         const QByteArray raw = q.value(3).toByteArray();
@@ -288,7 +326,7 @@ int scoreCache(QSqlDatabase &db, const QString &folderLike, int limit,
         QString where = q.value(0).toString();
         where.replace(QChar(0x1f), QLatin1String(" / "));
         where += QStringLiteral(":%1").arg(q.value(1).toLongLong());
-        SpamHeuristics::Context ctx = cacheContext(db, base, q.value(2).toString());
+        SpamHeuristics::Context ctx = cacheContext(db, withTlds, q.value(2).toString());
         // Same rule the client applies: everything in a junk folder is spam by
         // definition. Named by the same generous test MailClient::isJunkFolder
         // uses, reduced to the few names that matter for a diagnostic.
@@ -434,6 +472,8 @@ int main(int argc, char **argv)
             base.alwaysScore = true;
         else if (arg == QLatin1String("--auth-fail"))
             base.authFailed = true;
+        else if (arg == QLatin1String("--auth-softfail"))
+            base.authSoftFailed = true;
         else if (arg == QLatin1String("--auth-pass"))
             base.authPassed = true;
         else if (arg == QLatin1String("--arc-pass"))
@@ -448,6 +488,18 @@ int main(int argc, char **argv)
             base.seenFromOrg = next().toInt();
         else if (arg == QLatin1String("--days-known-org"))
             base.daysKnownOrg = next().toInt();
+        // Simulated sent-to TLD profile, for a corpus with no cache behind it:
+        // --familiar-tld sk --familiar-tld com, and a sample big enough that
+        // the rule is not disabled by spam/tldMinSample.
+        else if (arg == QLatin1String("--familiar-tld")) {
+            const QString tld = next().toLower().remove(QLatin1Char('.'));
+            if (!tld.isEmpty()) {
+                base.familiarTlds.append(tld);
+                if (base.sentTldSample <= 0)
+                    base.sentTldSample = AdvancedConfig::i("spam/tldMinSample");
+            }
+        } else if (arg == QLatin1String("--sent-tld-sample"))
+            base.sentTldSample = next().toInt();
         else if (arg == QLatin1String("--msgid"))
             msgids.append(next());
         else if (arg == QLatin1String("--cache"))
@@ -473,6 +525,7 @@ int main(int argc, char **argv)
         std::fprintf(stderr,
                      "usage: spamtool [--quiet] [--always-score] [--known ADDR]...\n"
                      "                [--auth-fail|--auth-pass] [--crypto 0|1|2|3]\n"
+                     "                [--familiar-tld TLD]... [--sent-tld-sample N]\n"
                      "                [--cache] [--folder NAME] [--limit N]\n"
                      "                [--msgid MESSAGE-ID]... [--db PATH]\n"
                      "                [--dir DIR] [--ham DIR] [--spam DIR] [FILE...]\n");

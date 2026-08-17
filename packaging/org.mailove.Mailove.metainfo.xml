@@ -33,6 +33,28 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="2.8" date="2026-08-17" type="stable">
+      <description>
+        <ul>
+          <li>New spam rule: mail from a top-level domain your own sent mail
+              never goes to scores slightly higher. Built from your Sent
+              recipients per account; it only corroborates and cannot mark a
+              message on its own.</li>
+          <li>Every spam rule's weight is now a setting ([spamrules] in
+              advanced.conf), keyed by the rule ids the "Why?" tooltip prints;
+              0 turns a rule off. Applies to newly scored mail only.</li>
+          <li>Advanced settings groups are alphabetical, each with a heading
+              and a plain-language explainer.</li>
+          <li>The spam threshold can no longer be set to 0, which would have
+              marked every message.</li>
+          <li>Sender pictures are fetched at twice their displayed size, so
+              they stay sharp on HiDPI screens.</li>
+          <li>New spam rules for mail sent through hacked websites: eval'd
+              PHP, CMS script origins (WordPress, Joomla), ancient PHPMailer versions and
+              random-token .php links.</li>
+        </ul>
+      </description>
+    </release>
     <release version="2.7" date="2026-08-16" type="stable">
       <description>
         <ul>
