@@ -49,10 +49,30 @@ mailove (2.8) unstable; urgency=medium
     lower-weighted rule (auth-softfail), never revoking the known-sender
     exemption — forwarded mail is what softfail looks like — and shown in
     orange rather than red in the authentication badge.
-  * The message viewer's authentication badges speak one language: the
-    server's verdicts appear as SPF / DKIM / DMARC / COMPAUTH with coloured
-    check marks, mailove's own DKIM and ARC verification stands larger above
-    them, and each tooltip ends with a one-line explainer of the acronym.
+  * The message viewer's authentication badges speak one language. The
+    server's verdicts read as glyph-first pairs — SPF / DKIM / DMARC / ARC /
+    COMPAUTH with green, orange or red check marks, a softfail orange rather
+    than red, and several signatures for one method kept as "✓, ✗" so the
+    comma still says there were two. Mailove's own DKIM and ARC verification
+    stands at full size above them, likewise glyph-first.
+  * Those badges explain themselves on hover: each tooltip is one block per
+    method — the acronym in bold, a plain question ("SPF: Is the sending
+    server allowed to send for this domain?"), the answer as a bold word
+    (Yes / No / Warning / Not checked), and directly beneath it that
+    method's own slice of the raw header as evidence.
+  * The server's DKIM verdict is no longer shown beside mailove's own: two
+    DKIM answers side by side read as a contradiction when they are really
+    one check knowing more than the other (alignment, not just validity).
+    The server's DKIM evidence moved into the tooltip of the badge that
+    stays.
+  * Authentication wording, tidied: every badge names the check it speaks
+    for ("Modified after DKIM signing", "Modified after OpenPGP signing"),
+    a signature from the wrong domain names both domains rather than saying
+    only that they differ, and every string in the row starts with a
+    capital.
+  * The badge row no longer shifts as messages change: its labels share a
+    baseline, so a taller glyph in one of them cannot nudge its neighbours
+    up or down.
   * Fixed: the ARC exemption never actually applied — arc=pass was not
     extracted from Authentication-Results, so mailing-list mail whose
     SPF/DKIM broke in transit could be wrongly marked. The parsing now

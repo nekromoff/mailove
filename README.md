@@ -34,7 +34,7 @@ Security-minded KDE-first IMAP and JMAP mail client, blazing fast.
 ### Security & safety
 - **Secure credential storage** - passwords and OAuth tokens in KWallet via Qt6Keychain. OAuth client secrets in Advanced settings are moved to the wallet and scrubbed.
 - **Sandboxed message viewing** - HTML renders with JavaScript, plugins and local-file access off, off-the-record, and every remote request blocked until the per-message opt-in. Links open in the system browser.
-- **Sender authentication verdicts** - DKIM verified, ARC chains validated, server SPF/DKIM/DMARC alongside, shown per message in the viewer and fed into the spam score. A signature that covers only a stated length of the body (`l=`) reads as *partial*. ARC is what keeps mailing lists - which break SPF and DKIM by design - from being marked.
+- **Sender authentication verdicts** - DKIM, SPF, DMARC, COMPUAUTH verified, ARC chains validated, badges shown in the viewer and fed into the spam score. Explainer tooltips, easy to understand.
 
 ### Imports (MBOX)
 - **Imported mail** - point it at a folder of mbox files and it imports as an offline account (Thunderbird, Evolution, KMail etc.). Subfolders become folder hierarchy, and Thunderbird's .sbd naming is understood. Add servers later to promote it to a live account.

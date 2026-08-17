@@ -50,8 +50,18 @@
           <li>Sender pictures are fetched at twice their displayed size, so
               they stay sharp on HiDPI screens.</li>
           <li>New spam rules for mail sent through hacked websites: eval'd
-              PHP, CMS script origins (WordPress, Joomla), ancient PHPMailer versions and
-              random-token .php links.</li>
+              PHP, CMS script origins (WordPress, Joomla), ancient PHPMailer
+              versions, random-token .php links and links into WordPress code
+              directories.</li>
+          <li>Microsoft 365's compauth verdict now counts toward spam
+              scoring, spf=softfail is scored apart from an outright failure,
+              and the server-verdict rules read Barracuda, Proofpoint,
+              Yandex, Google Workspace and GMX headers.</li>
+          <li>Fixed: the ARC exemption never applied, which could wrongly
+              mark mailing-list mail whose SPF or DKIM broke in transit.</li>
+          <li>The authentication badges speak one glyph-first language, and
+              each tooltip explains its acronym as a question with a Yes / No
+              / Warning answer above the raw header it came from.</li>
         </ul>
       </description>
     </release>
