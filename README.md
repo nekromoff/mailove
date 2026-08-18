@@ -47,9 +47,21 @@ Security-minded KDE-first IMAP and JMAP mail client, blazing fast.
 <img width="1920" height="1038" alt="04-settings-look" src="https://github.com/user-attachments/assets/cfa9486b-bdb6-41e1-8db1-28fcaffc104e" />
 <img width="1920" height="1038" alt="05-settings-shortcuts" src="https://github.com/user-attachments/assets/a01aa48d-3a70-40ea-ac71-47e5afd9e115" />
 <img width="1920" height="1038" alt="06-settings-about" src="https://github.com/user-attachments/assets/14543538-9c8d-4f1b-8b94-5bb9c9296783" />
-<img width="571" height="112" alt="Screenshot_20260813_115049" src="https://github.com/user-attachments/assets/ac41c815-df3d-4e70-a791-5d152238cc6a" />
-<img width="802" height="112" alt="Screenshot_20260813_115137" src="https://github.com/user-attachments/assets/1c07d657-731d-476c-aa20-6de2f05eb0b9" />
-<img width="802" height="136" alt="Screenshot_20260813_115219" src="https://github.com/user-attachments/assets/7f8dbf7e-ae4a-4b5a-9348-8459de23ef19" />
+
+### Various states of email sender verification
+
+Every email is validated using DKIM, SPF, DMARC, ARC (and COMPAUTH)
+
+<img width="102" height="27" alt="encrypted" src="https://github.com/user-attachments/assets/cec80a7f-4427-40ba-9345-7ebac7cbced4" />
+<img width="200" height="26" alt="dkim-wrong" src="https://github.com/user-attachments/assets/b332ff23-d715-4709-888e-aac250338927" />
+<img width="255" height="27" alt="dkim-warn" src="https://github.com/user-attachments/assets/d1892e2b-5324-478a-b690-96896a53584e" />
+<img width="289" height="24" alt="dkim-not" src="https://github.com/user-attachments/assets/dc654be7-f5c5-4be5-9cb6-825989114f23" />
+<img width="258" height="31" alt="dkim-modified" src="https://github.com/user-attachments/assets/7cdd50eb-070c-4afa-88a3-dd7f5c0daadc" />
+<img width="480" height="33" alt="arc2" src="https://github.com/user-attachments/assets/aed8c7b3-be6f-42b9-8820-ba1eb134a83f" />
+<img width="332" height="34" alt="arc" src="https://github.com/user-attachments/assets/de5870bf-1165-4032-9f1d-0078c22304e3" />
+<img width="514" height="29" alt="another" src="https://github.com/user-attachments/assets/04c61029-be4c-4be2-9be9-33e9f806f9ce" />
+<img width="217" height="26" alt="all" src="https://github.com/user-attachments/assets/4cea9b5b-7131-4b75-a791-157c0b8ac52a" />
+
 
 ## Installation
 
