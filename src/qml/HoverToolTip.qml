@@ -91,6 +91,19 @@ QQC2.ToolTip {
         return fields
     }
 
+    // Shown the moment the pointer is over the item, with no delay — which
+    // is what the rest of the app does, whether or not it looks deliberate:
+    // the spam and authentication marks in the message list are attached
+    // QQC2.ToolTips whose `visible` is bound to a HoverHandler, and a bound
+    // `visible` bypasses ToolTip's own `delay`. So every tooltip in mailove
+    // that answers "what is this mark" appears at once, and these have to as
+    // well or the two feel like different applications.
+    // Explicitly zero. org.kde.desktop gives ToolTip a default delay, and it
+    // applies to this instance's own `visible` too — so binding visibility to
+    // the hover handler still waited it out. The attached ToolTips on the spam
+    // and authentication marks in the list do not go through it, which is why
+    // those appear at once and these did not.
+    delay: 0
     visible: tip.hover.hovered && tip.text.length > 0
 
     // Place the popup ourselves rather than letting Popup's own margin handling

@@ -113,6 +113,12 @@ void SyncEngine::openSelectedFolder(const QString &folder)
 void SyncEngine::refreshSelectedFolder(const QString &folder)
 {
     m_selectedFolder = folder;
+    // Not while this folder still owes the server a change. The cache is
+    // already showing what the user did; refreshing now would merge the
+    // server's older answer over it. MailClient calls back here as soon as the
+    // queue drains, which is normally within a second of connecting.
+    if (pendingOps(folder))
+        return;
     m_folderOpenIntent = FolderOpenIntent::Refresh;
     m_backend->openFolder(folder, m_store.syncState(folder));
 }
@@ -124,6 +130,7 @@ void SyncEngine::teardown()
     m_bodyBackfill = false;
     resetBackfillBackoff();
     m_folderBackfillQueue.clear();
+    m_folderPassPrimed = false;
     m_backfillFolder.clear();
     m_backfillOpenPending = false;
     m_folderBackfillPassDone = false;
@@ -144,6 +151,7 @@ bool SyncEngine::restartFolderPass()
     if (!m_folderBackfillPassDone || m_syncPaused)
         return false;
     m_folderBackfillPassDone = false;
+    m_folderPassPrimed = false;
     scheduleBackfill(500);
     return true;
 }
@@ -153,6 +161,7 @@ void SyncEngine::restartFolderQueue()
     m_folderBackfillPassDone = false;
     m_folderSyncAnnounced = false;
     m_folderBackfillQueue.clear();
+    m_folderPassPrimed = false;
 }
 
 void SyncEngine::handleThrottled()
@@ -448,6 +457,13 @@ void SyncEngine::applyMessagesVanished(const QString &folder, const QStringList 
 {
     if (remoteIds.isEmpty())
         return;
+    // Not while the folder still owes the server a change. A message the user
+    // has just moved *into* here is genuinely absent from the server until the
+    // push lands, and purging it would erase what they did. The other paths
+    // wait for the drain too (see setPendingOpsProvider); this one is pushed
+    // rather than asked for, so it has to check for itself.
+    if (pendingOps(folder))
+        return;
     QList<qint64> uids;
     uids.reserve(remoteIds.size());
     for (const QString &remoteId : remoteIds)
@@ -505,10 +521,25 @@ void SyncEngine::continueFolderBackfill()
     if (!connected() || !m_backend->ensureBackgroundReady() || m_folderBackfillPassDone)
         return; // background work waits for its own capacity — never the UI's
     if (m_backfillFolder.isEmpty()) {
-        if (m_folderBackfillQueue.isEmpty())
+        // Filled once per pass, and only at its start. Refilling whenever the
+        // queue happened to be empty made the two states indistinguishable —
+        // "not started yet" and "just finished the last folder" are both an
+        // empty queue — so the moment the pass drained it was immediately
+        // refilled with every mailbox and started over. The exhaustion branch
+        // below was then unreachable in the normal case, the latch never
+        // caught, and the client re-SELECTed every folder on the account, end
+        // to end, for as long as it stayed connected.
+        if (m_folderBackfillQueue.isEmpty() && !m_folderPassPrimed) {
             m_folderBackfillQueue = m_folders.selectableMailBoxes();
+            m_folderPassPrimed = true;
+        }
         while (!m_folderBackfillQueue.isEmpty()) {
             const QString next = m_folderBackfillQueue.takeFirst();
+            // Same rule as above, and here it can simply be skipped: the pass
+            // restarts on the next connect or folder-list refresh, and
+            // MailClient restarts it outright when the queue drains.
+            if (pendingOps(next))
+                continue;
             if (next != m_selectedFolder) {
                 m_backfillFolder = next;
                 m_backfillFolderCount = -1; // size unknown until the open below
@@ -518,8 +549,9 @@ void SyncEngine::continueFolderBackfill()
         }
         if (m_backfillFolder.isEmpty()) {
             // Every folder visited; a new pass starts on the next (re)connect
-            // or folder-list refresh.
+            // or folder-list refresh, each of which unprimes the queue.
             m_folderBackfillPassDone = true;
+            m_folderPassPrimed = false;
             if (!m_folderSyncAnnounced) {
                 m_folderSyncAnnounced = true;
                 Q_EMIT statusMessage(tr("All folders synced"));

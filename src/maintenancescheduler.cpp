@@ -5,7 +5,9 @@
 
 #include "mimeutils.h"
 
+#include <QFile>
 #include <QLocale>
+#include <QLoggingCategory>
 #include <QSqlQuery>
 #include <QThread>
 #include <QTimer>
@@ -15,11 +17,24 @@
 
 #include <utility>
 
+/// Defined in mailstore.cpp — the migration trail, on by default.
+Q_DECLARE_LOGGING_CATEGORY(logMigrate)
+
+/// The long maintenance jobs. On by default for the same reason as the
+/// migration trail: a compaction runs for minutes, holds the user's attention
+/// the whole time, happens once in a blue moon, and leaves nothing behind to
+/// inspect — so "it froze while reclaiming space" has to be answerable from
+/// what is already in the log, not from asking for a repeat of the one thing
+/// nobody wants to sit through twice. A handful of lines per run.
+Q_LOGGING_CATEGORY(logMaintenance, "mailove.maintenance")
+
 namespace
 {
 /// Below this, rebuilding the file costs minutes to hand back nothing anyone
 /// would notice.
 constexpr qint64 kReclaimWorthwhile = 16 * 1024 * 1024;
+/// Records that the To-column backfill has nothing left to do, ever.
+const QString kRecipientBackfillFlag = QStringLiteral("recipients_backfilled1");
 }
 
 MaintenanceScheduler::MaintenanceScheduler(MailStore &store,
@@ -198,6 +213,10 @@ void MaintenanceScheduler::reclaimDiskSpace()
         m_bodyWriterStop.storeRelaxed(1);
         m_bodyWriteWake.wakeAll();
     }
+    qCInfo(logMaintenance) << "reclaim: requested," << m_store.databaseBytes()
+                           << "bytes on disk," << m_store.reclaimableBytes()
+                           << "reclaimable";
+    m_reclaimTimer.start();
     Q_EMIT statusMessage(tr("Reclaiming disk space — this can take several minutes"));
     startVacuumWhenWritersIdle();
 }
@@ -219,23 +238,48 @@ void MaintenanceScheduler::startVacuumWhenWritersIdle()
         return;
     }
     stopBodyWriter(); // already finished: joins and deletes immediately
+    qCInfo(logMaintenance) << "reclaim: writers idle after" << m_reclaimTimer.elapsed()
+                           << "ms, compacting";
 
     const qint64 before = m_store.databaseBytes();
-    m_vacuumThread = QThread::create([this, before] {
+    // Beside the cache, so the rename that puts it in place stays within one
+    // filesystem — across one it would be a copy, and not atomic.
+    const QString compacted = MailStore::databaseFilePath() + QStringLiteral(".compacting");
+    m_vacuumThread = QThread::create([this, before, compacted] {
+        QElapsedTimer timer;
+        timer.start();
         QString error;
-        const bool ok = MailStore::vacuum(&error);
-        // Back to the GUI thread before touching any state it owns.
-        QMetaObject::invokeMethod(this, [this, ok, error, before] {
+        // Reads the live cache into a new file rather than rewriting it in
+        // place. The old VACUUM held the write lock for its whole run, and
+        // every statement the GUI thread issued in the meantime sat on
+        // busy_timeout — 15 seconds each — which is what "the whole app is
+        // frozen" was. Nothing waits on this one.
+        const bool ok = MailStore::vacuumInto(compacted, &error);
+        const qint64 ms = timer.elapsed();
+        // Back to the GUI thread before touching any state it owns — and the
+        // swap itself must happen there, because it closes and reopens the
+        // connection the GUI thread reads through.
+        QMetaObject::invokeMethod(this, [this, ok, error, before, ms, compacted] {
+            QString swapError = error;
+            bool done = ok;
+            if (ok) {
+                qCInfo(logMaintenance) << "reclaim: compacted in" << ms << "ms, swapping in";
+                done = m_store.swapInCompacted(compacted, &swapError);
+            }
+            QFile::remove(compacted); // a no-op once the rename has moved it
             m_reclaiming = false;
             Q_EMIT reclaimingChanged();
             m_reindexTimer.start();
             Q_EMIT syncResumeRequested();
             startAttachmentMigration();
-            if (!ok) {
-                Q_EMIT errorOccurred(tr("Reclaiming disk space failed: %1").arg(error));
+            if (!done) {
+                qCWarning(logMaintenance) << "reclaim: failed:" << swapError;
+                Q_EMIT errorOccurred(tr("Reclaiming disk space failed: %1").arg(swapError));
                 return;
             }
             const qint64 freed = before - m_store.databaseBytes();
+            qCInfo(logMaintenance) << "reclaim: done in" << m_reclaimTimer.elapsed()
+                                   << "ms, freed" << freed << "bytes";
             const QLocale loc;
             Q_EMIT statusMessage(freed > 0
                                      ? tr("Reclaimed %1").arg(loc.formattedDataSize(freed))
@@ -520,11 +564,34 @@ void MaintenanceScheduler::reindexPendingBodies()
 
 // --- one-time migrations ---------------------------------------------------
 
-void MaintenanceScheduler::beginMigration(const QString &label)
+namespace
+{
+/// "about 3 minutes left", from milliseconds. Deliberately coarse: the estimate
+/// is a measured rate extrapolated over work that is not uniform — bodies vary
+/// in size, folders in length — so a figure to the second would be claiming a
+/// precision it does not have, and would visibly jitter while it did.
+QString etaText(qint64 msLeft)
+{
+    const qint64 secs = msLeft / 1000;
+    if (secs < 60)
+        return MaintenanceScheduler::tr("less than a minute left");
+    const qint64 mins = (secs + 59) / 60; // round up: better long than short
+    if (mins < 60)
+        return MaintenanceScheduler::tr("about %n minute(s) left", nullptr, int(mins));
+    const qint64 hours = (mins + 59) / 60;
+    return MaintenanceScheduler::tr("about %n hour(s) left", nullptr, int(hours));
+}
+}
+
+void MaintenanceScheduler::beginMigration(const QString &label, int step, int stepCount)
 {
     m_migrationRunning = true;
     m_migrationLabel = label;
     m_migrationPercent = -1; // indeterminate until the first slice reports
+    m_migrationEta.clear();
+    m_migrationStep = step;
+    m_migrationSteps = stepCount;
+    m_migrationClock.start();
     Q_EMIT migrationChanged();
 }
 
@@ -533,6 +600,15 @@ void MaintenanceScheduler::reportMigration(int percent)
     if (percent == m_migrationPercent)
         return;
     m_migrationPercent = percent;
+
+    // Elapsed against the fraction done. Held back until 2% and a second of
+    // work: before that the divisor is small enough that the first slice's
+    // start-up cost — a cold page cache, the count query — is most of what is
+    // being extrapolated, and the figure swings by minutes between updates.
+    if (percent >= 2 && m_migrationClock.isValid() && m_migrationClock.elapsed() > 1000) {
+        const qint64 elapsed = m_migrationClock.elapsed();
+        m_migrationEta = etaText(elapsed * (100 - percent) / percent);
+    }
     Q_EMIT migrationChanged();
 }
 
@@ -542,96 +618,214 @@ void MaintenanceScheduler::endMigration()
         return;
     m_migrationRunning = false;
     m_migrationPercent = 100;
+    m_migrationEta.clear();
+    m_migrationStep = 0;
+    m_migrationSteps = 0;
+    m_migrationClock.invalidate();
     Q_EMIT migrationChanged();
 }
 
-void MaintenanceScheduler::startRecipientBackfill(std::function<bool(const QString &)> isOutgoing)
+int MaintenanceScheduler::runRecipientBackfill(
+    QSqlDatabase &db, const std::function<bool(const QString &)> &isOutgoing)
 {
-    if (m_migrationThread || !isOutgoing)
+    if (!isOutgoing)
+        return 0;
+    // Latched, like every other one-time job. Without this the count below ran
+    // on every launch and every account switch — listing all cached folders and
+    // counting the missing column in each — to arrive at zero every time. New
+    // mail is written with its recipients, so once there is nothing left to
+    // backfill there never will be again.
+    if (MailStore::workDoneOn(db, kRecipientBackfillFlag))
+        return 0;
+
+    // Every account's folders, read from the cache rather than from the folder
+    // model: the model holds the open account only, and a migration that runs
+    // for one account and silently skips the rest is worse than one that does
+    // not run at all — nothing later would notice.
+    QStringList scopedFolders;
+    const QStringList all = MailStore::allCachedFolderKeysOn(db);
+    for (const QString &key : all) {
+        if (isOutgoing(key))
+            scopedFolders.append(key);
+    }
+    if (scopedFolders.isEmpty())
+        return 0;
+
+    // Counted first so the bar means something. Cheap next to the work itself,
+    // and zero is the answer on every run after the first — which is what keeps
+    // this from being a startup cost forever.
+    int total = 0;
+    for (const QString &folder : std::as_const(scopedFolders))
+        total += MailStore::missingRecipientCountOn(db, folder);
+    if (total == 0) {
+        MailStore::markWorkDoneOn(db, kRecipientBackfillFlag);
+        return 0;
+    }
+
+    QMetaObject::invokeMethod(this, [this] {
+        beginMigration(tr("Reading recipients from cached mail"));
+    }, Qt::QueuedConnection);
+
+    int done = 0;
+    for (const QString &folder : std::as_const(scopedFolders)) {
+        while (!m_migrationCancel.loadRelaxed()) {
+            const auto rows = MailStore::rawsMissingRecipientsOn(db, folder, 200);
+            if (rows.isEmpty())
+                break;
+            QHash<qint64, QString> byUid;
+            byUid.reserve(rows.size());
+            for (const auto &row : rows) {
+                // Only the head is parsed. A cached body can be megabytes, and
+                // every byte after the blank line is irrelevant here — handing
+                // the lot to KMime would turn a header read into a full MIME
+                // parse tens of thousands of times over.
+                QByteArray raw = KMime::CRLFtoLF(row.raw);
+                const int blank = raw.indexOf("\n\n");
+                if (blank > 0)
+                    raw.truncate(blank + 1);
+                KMime::Message msg;
+                msg.setContent(raw);
+                msg.parse();
+                byUid.insert(row.uid, msg.to() ? msg.to()->asUnicodeString() : QString());
+            }
+            MailStore::setRecipientsBatchOn(db, folder, byUid);
+            done += rows.size();
+            const int percent = int(qMin<qint64>(99, qint64(done) * 100 / total));
+            QMetaObject::invokeMethod(this, [this, percent] {
+                reportMigration(percent);
+            }, Qt::QueuedConnection);
+            // The same courtesy every other worker here pays: the user's own
+            // writes must not queue behind a migration.
+            QThread::msleep(15);
+        }
+    }
+    return done;
+}
+
+void MaintenanceScheduler::startCacheMigrations(const QString &account,
+                                                std::function<bool(const QString &)> isOutgoing)
+{
+    if (m_migrationThread)
         return;
+    // Asked on the GUI thread, off the store's own connection, before the
+    // worker exists: it is a handful of indexed lookups in meta_flags, and the
+    // answer decides whether there is any reason to start a thread at all.
+    const QList<MailStore::Migration> steps = m_store.pendingMigrations(account);
+    // Nothing to migrate and the recipient backfill already latched: no thread,
+    // no worker connection, no log line. This is the state every launch after
+    // the first upgrade is in, and it was costing ~80 ms of the GUI thread's
+    // startup plus a full "migrations pending / finished" trail saying that
+    // nothing had happened.
+    if (steps.isEmpty() && (!isOutgoing || m_store.workDone(kRecipientBackfillFlag))) {
+        Q_EMIT cacheMigrationsFinished();
+        return;
+    }
     m_migrationCancel.storeRelaxed(0);
 
-    m_migrationThread = QThread::create([this, isOutgoing = std::move(isOutgoing)] {
-        const QString connection = QStringLiteral("mailstore-recipients");
+    QStringList flags;
+    flags.reserve(steps.size());
+    for (const MailStore::Migration &step : steps)
+        flags.append(step.flag);
+    qCInfo(logMigrate) << "cache migrations pending:" << flags;
+
+    // Every background writer pauses for the duration, exactly as it does for a
+    // VACUUM and for the same reason: the fts_rowid step holds one write
+    // transaction for its whole run — it swaps the search index out, which
+    // cannot be done a chunk at a time — so a body write landing mid-migration
+    // would sit on busy_timeout and, if that expired, lose a fetched body
+    // outright. The others commit per chunk and would only be slowed, but there
+    // is no reason to have them competing for the write lock during the one
+    // part of the run the user is sitting and watching.
+    //
+    // Only for the store's steps, though. The To-column backfill below runs on
+    // every launch until it is done, holds the lock for one small batch at a
+    // time, and is the whole of the work on all but the first launch after an
+    // upgrade — pausing the sync for it would be a permanent tax paid for
+    // nothing.
+    const bool quietWriters = !steps.isEmpty();
+    if (quietWriters) {
+        Q_EMIT syncPauseRequested();
+        m_reindexTimer.stop();
+        if (m_bodyWriterThread) {
+            // Ask it to stop — which flushes what it holds — but do not join
+            // here: a batch mid-statement can run for seconds, and the GUI
+            // thread must keep serving the event loop or the modal never
+            // paints. It restarts itself on the next queueBodyWrite().
+            m_bodyWriterStop.storeRelaxed(1);
+            m_bodyWriteWake.wakeAll();
+        }
+    }
+
+    m_migrationThread = QThread::create([this, steps, account, quietWriters,
+                                         isOutgoing = std::move(isOutgoing)] {
+        QElapsedTimer runClock;
+        runClock.start();
+        const QString connection = QStringLiteral("mailstore-migrations");
         QSqlDatabase db = MailStore::openWorkerConnection(connection);
-        if (!db.isOpen())
-            return;
-
-        // Every account's folders, read from the cache rather than from the
-        // folder model: the model holds the open account only, and a migration
-        // that runs for one account and silently skips the rest is worse than
-        // one that does not run at all — nothing later would notice.
-        QStringList scopedFolders;
-        const QStringList all = MailStore::allCachedFolderKeysOn(db);
-        for (const QString &key : all) {
-            if (isOutgoing(key))
-                scopedFolders.append(key);
-        }
-        if (scopedFolders.isEmpty()) {
-            db.close();
-            db = QSqlDatabase(); // drop the handle before removeDatabase warns
-            QSqlDatabase::removeDatabase(connection);
-            return;
-        }
-
-        // Counted first so the bar means something. Cheap next to the work
-        // itself, and zero is the answer on every run after the first — which
-        // is what keeps this from being a startup cost forever.
-        int total = 0;
-        for (const QString &folder : scopedFolders)
-            total += MailStore::missingRecipientCountOn(db, folder);
-        if (total == 0) {
-            db.close();
-            db = QSqlDatabase(); // drop the handle before removeDatabase warns
-            QSqlDatabase::removeDatabase(connection);
-            return;
-        }
-        QMetaObject::invokeMethod(this, [this] {
-            beginMigration(tr("Reading recipients from cached mail"));
-        }, Qt::QueuedConnection);
-
-        int done = 0;
-        for (const QString &folder : scopedFolders) {
-            while (!m_migrationCancel.loadRelaxed()) {
-                const auto rows = MailStore::rawsMissingRecipientsOn(db, folder, 200);
-                if (rows.isEmpty())
-                    break;
-                QHash<qint64, QString> byUid;
-                byUid.reserve(rows.size());
-                for (const auto &row : rows) {
-                    // Only the head is parsed. A cached body can be megabytes,
-                    // and every byte after the blank line is irrelevant here —
-                    // handing the lot to KMime would turn a header read into a
-                    // full MIME parse tens of thousands of times over.
-                    QByteArray raw = KMime::CRLFtoLF(row.raw);
-                    const int blank = raw.indexOf("\n\n");
-                    if (blank > 0)
-                        raw.truncate(blank + 1);
-                    KMime::Message msg;
-                    msg.setContent(raw);
-                    msg.parse();
-                    byUid.insert(row.uid,
-                                 msg.to() ? msg.to()->asUnicodeString() : QString());
+        if (!db.isOpen()) {
+            qCWarning(logMigrate) << "cache migrations skipped: no worker connection";
+            QMetaObject::invokeMethod(this, [this, quietWriters] {
+                if (quietWriters) {
+                    m_reindexTimer.start();
+                    Q_EMIT syncResumeRequested();
                 }
-                MailStore::setRecipientsBatchOn(db, folder, byUid);
-                done += rows.size();
-                const int percent = int(qMin<qint64>(99, qint64(done) * 100 / total));
+                Q_EMIT cacheMigrationsFinished();
+            }, Qt::QueuedConnection);
+            return;
+        }
+
+        const auto cancelled = [this] { return m_migrationCancel.loadRelaxed() != 0; };
+        // The To-column backfill is the last step, but whether it has anything
+        // to do is only known once its folders are counted — which is its own
+        // first slice. Counting it in the total up front would be wrong
+        // whenever it turns out to be a no-op, so the run is numbered over the
+        // store's steps and the backfill relabels the modal without a number.
+        const int stepCount = int(steps.size());
+        int stepIndex = 0;
+        for (const MailStore::Migration &step : steps) {
+            if (cancelled())
+                break;
+            ++stepIndex;
+            // One modal for the lot, relabelled per step: what changes between
+            // them is the sentence, not the fact that the cache is busy.
+            QMetaObject::invokeMethod(this, [this, label = step.label, stepIndex, stepCount] {
+                beginMigration(label, stepIndex, stepCount);
+            }, Qt::QueuedConnection);
+            MailStore::runMigration(db, step, account, [this](int percent) {
                 QMetaObject::invokeMethod(this, [this, percent] {
                     reportMigration(percent);
                 }, Qt::QueuedConnection);
-                // The same courtesy every other worker here pays: the user's
-                // own writes must not queue behind a migration.
-                QThread::msleep(15);
-            }
+            }, cancelled);
         }
+
+        int recipients = 0;
+        if (!cancelled())
+            recipients = runRecipientBackfill(db, isOutgoing);
+
         db.close();
         db = QSqlDatabase(); // drop the handle before removeDatabase warns
         QSqlDatabase::removeDatabase(connection);
-        QMetaObject::invokeMethod(this, [this, done] {
+        qCInfo(logMigrate).nospace()
+            << "cache migrations " << (cancelled() ? "cancelled after " : "finished in ")
+            << runClock.elapsed() << " ms, " << recipients << " recipients read";
+        QMetaObject::invokeMethod(this, [this, recipients, quietWriters] {
             endMigration();
-            Q_EMIT statusMessage(tr("Recipients read for %1 cached messages").arg(done));
-            // The open folder is showing rows read before any of this landed.
-            Q_EMIT migrationChanged();
+            // Let the writers back in before anything else: syncing has been
+            // held off since before the first step, and the body writer revives
+            // on its own once there is something to write.
+            if (quietWriters) {
+                m_reindexTimer.start();
+                Q_EMIT syncResumeRequested();
+            }
+            if (recipients > 0)
+                Q_EMIT statusMessage(tr("Recipients read for %1 cached messages").arg(recipients));
+            // No migrationChanged() of its own here: endMigration() above
+            // already announced the close when anything had opened the modal,
+            // and that announcement is what reloads the list. When nothing ran
+            // at all it stays silent — an unconditional emit re-read the
+            // folder model and the open folder a few seconds into every
+            // launch, to show what it was already showing.
+            Q_EMIT cacheMigrationsFinished();
         }, Qt::QueuedConnection);
     });
     connect(m_migrationThread, &QThread::finished, this, [this] {

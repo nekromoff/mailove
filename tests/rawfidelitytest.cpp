@@ -64,6 +64,49 @@ static QByteArray realistic()
     return m;
 }
 
+/// The two halves as a server hands them over: BODY[HEADER] ends with the
+/// blank line that closes the header (RFC 9051 §7.5.2), BODY[TEXT] is
+/// everything after it. Joined, they are tightBoundary().
+static QByteArray tightHead()
+{
+    QByteArray m;
+    m += "From: A <a@x.example>\r\n";
+    m += "To: B <b@y.example>\r\n";
+    m += "Subject: tight\r\n";
+    m += "MIME-Version: 1.0\r\n";
+    m += "Content-Type: multipart/mixed; boundary=\"OUTER\"\r\n";
+    m += "\r\n";
+    return m;
+}
+
+static QByteArray tightText()
+{
+    QByteArray m;
+    m += "--OUTER\r\n";
+    m += "Content-Type: multipart/alternative; boundary=\"INNER\"\r\n";
+    m += "\r\n";
+    m += "--INNER\r\n";
+    m += "Content-Type: text/plain; charset=utf-8\r\n";
+    m += "\r\n";
+    m += "hello\r\n";
+    m += "--INNER\r\n";
+    m += "Content-Type: text/html; charset=utf-8\r\n";
+    m += "\r\n";
+    m += "<p>hi</p>\r\n";
+    m += "--INNER--\r\n"; // tight: no blank line before the parent's boundary
+    m += "--OUTER\r\n";
+    m += "Content-Type: text/plain; name=note.txt\r\n";
+    m += "\r\n";
+    m += "attached\r\n";
+    m += "--OUTER--\r\n";
+    return m;
+}
+
+static QByteArray tightBoundary()
+{
+    return tightHead() + tightText();
+}
+
 static int failures = 0;
 
 static bool report(const char *label, const QByteArray &got, const QByteArray &want)
@@ -122,6 +165,67 @@ int main(int argc, char **argv)
     // verification path may call assemble() before hashing.
     msg->assemble();
     report("assemble() + encodedContent()", KMime::LFtoCRLF(msg->encodedContent()), original);
+
+    // The shape KMime gets wrong, and the two things that get it right.
+    //
+    // A nested multipart whose closing delimiter sits tight against the parent
+    // boundary — no blank line between --INNER-- and --OUTER, which is what
+    // Gmail emits for a reply with attachments — comes back from
+    // encodedContent() one byte longer than it went in, because assembly
+    // unconditionally writes the delimiter with a trailing newline and the
+    // parent prepends its own ([KDE bug 523826]). ImapBackend no longer takes
+    // that path, and these assert both halves of why.
+    printf("\n-- tight nested boundary (KDE bug 523826)\n");
+    const QByteArray tight = tightBoundary();
+
+    // Asserted so a KMime that fixes the bug is noticed here rather than
+    // silently making the workaround redundant: if this ever reads SAME,
+    // ImapBackend can go back to a plain BODY.PEEK[] fetch.
+    KMime::Message loose;
+    loose.setContent(KMime::CRLFtoLF(tight));
+    loose.parse();
+    if (report("unfrozen (documents the bug)",
+               KMime::LFtoCRLF(loose.encodedContent()), tight)) {
+        printf("NOTE: KMime now round-trips a tight nested boundary. The section\n"
+               "      fetch in ImapBackend::startBodyFetchJob() is no longer needed.\n");
+    }
+
+    // What ImapBackend::buildMessage() does. Asserted: this is the invariant
+    // the whole section-fetch path exists to provide.
+    KMime::Message frozen;
+    frozen.setContent(KMime::CRLFtoLF(tight));
+    frozen.setFrozen(true);
+    frozen.parse();
+    if (!report("setFrozen(true) before parse()",
+                KMime::LFtoCRLF(frozen.encodedContent()), tight)) {
+        printf("FAIL: freezing no longer preserves the source octets — every\n"
+               "      message with a tight nested boundary will report as\n"
+               "      modified after signing.\n");
+        ++failures;
+    }
+    // Freezing must not cost the parse: the viewer, the attachment store and
+    // the spam rules all read this tree.
+    if (frozen.contents().size() != 2 || frozen.contents().at(0)->contents().size() != 2) {
+        printf("FAIL: frozen message did not parse into its parts (%lld children)\n",
+               (long long)frozen.contents().size());
+        ++failures;
+    }
+
+    // And the fetch itself: BODY[HEADER] reaches KMime as setHead() and
+    // BODY[TEXT] as setBody(), neither of which re-encodes, so joining them is
+    // the message as it travelled. Simulated here — the live version needs a
+    // server, which is what tests/fidelitytool is for.
+    KMime::Content headPart;
+    headPart.setHead(tightHead());
+    headPart.parse();
+    KMime::Content textPart;
+    textPart.setBody(tightText());
+    textPart.parse();
+    if (!report("BODY[HEADER] + BODY[TEXT]", headPart.head() + textPart.body(), tight)) {
+        printf("FAIL: a section fetch no longer preserves its octets — the IMAP\n"
+               "      body path in ImapBackend has lost its reason to exist.\n");
+        ++failures;
+    }
 
     if (failures == 0)
         printf("all fidelity invariants hold\n");

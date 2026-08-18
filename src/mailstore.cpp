@@ -11,13 +11,28 @@
 #include <QDateTime>
 #include <QHash>
 #include <QDir>
+#include <QLoggingCategory>
 #include <QElapsedTimer>
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QStandardPaths>
+
+#include <cstdio>
 #include <QThread>
+
+/// Cache migrations, on the console. Deliberately its own category and
+/// deliberately exempt from the quiet-by-default filter rules (see
+/// MailClient::applyLogFilterRules): a migration runs once on one machine, can
+/// take minutes, and holds the user in a modal while it does — when someone
+/// reports "it hung on start" this trail is the only record of which step,
+/// over how many rows, and how far it got. A handful of lines per launch, and
+/// none after the last migration is done, so it cannot drown anything.
+///
+/// Row counts and durations only. Never a folder name, an address or an
+/// account key: what is being migrated is the user's mail.
+Q_LOGGING_CATEGORY(logMigrate, "mailove.migrate")
 
 /// The store runs on the GUI thread: any call here directly delays input
 /// handling and rendering. The UI budget is 20 ms — make violations loud.
@@ -57,6 +72,88 @@ void markMigrationDone(const QSqlDatabase &db, const QString &flag)
     q.addBindValue(flag);
     q.exec();
 }
+
+/// Whether \a name is a table in the cache. Only the migration worker needs
+/// this: it runs on a connection of its own and so cannot ask the instance
+/// whether FTS5 was available when the cache was opened.
+bool tableExists(const QSqlDatabase &db, const QString &name)
+{
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?"));
+    q.addBindValue(name);
+    return q.exec() && q.next();
+}
+
+/// Rows a migration changes per slice. Small enough that the write lock is
+/// handed back several times a second on a slow disk, large enough that the
+/// per-statement overhead stays in the noise.
+constexpr int kMigrationChunk = 500;
+
+/// First column of \a sql as a number, 0 if it does not run. Used to size a
+/// migration's work before it starts, which is the whole basis of the estimate
+/// the modal shows.
+qint64 countOf(const QSqlDatabase &db, const QString &sql)
+{
+    QSqlQuery q(db);
+    return (q.exec(sql) && q.next()) ? q.value(0).toLongLong() : 0;
+}
+
+/// Repeats \a slice until it reports nothing left to do, adding what each pass
+/// changed to \a done and reporting the fraction of \a total finished. \a slice
+/// returns the rows it changed, 0 when finished, or -1 on failure. Returns
+/// false if it failed or \a cancelled turned true — in both cases the caller
+/// must leave the migration's flag unset so the next launch resumes it.
+///
+/// \a yield is for the one caller whose slices all run inside a single
+/// transaction (the fts re-key): the pause below exists to hand the write lock
+/// to whoever is waiting on busy_timeout, and a slice that never releases the
+/// lock has nothing to hand over — sleeping would only stretch the exclusive
+/// window. Everyone else leaves it on.
+bool runInChunks(const std::function<int()> &slice, qint64 total, qint64 &done,
+                 const std::function<void(int)> &progress,
+                 const std::function<bool()> &cancelled, bool yield = true)
+{
+    while (!cancelled()) {
+        const int n = slice();
+        if (n < 0)
+            return false;
+        if (n == 0)
+            return true;
+        done += n;
+        if (total > 0)
+            progress(int(qMin<qint64>(99, done * 100 / total)));
+        // Yield the write lock between slices: the user's own writes must never
+        // queue behind a migration. The sync workers are paused for the run,
+        // but GUI-thread writes (the spam sweep on connect, and whatever else
+        // is not enumerated anywhere) are not — without this gap they lose the
+        // lock race every retry and stall the event loop on busy_timeout.
+        if (yield)
+            QThread::msleep(10);
+    }
+    return false;
+}
+
+/// One slice of a chunked DELETE: removes up to kMigrationChunk rows of
+/// \a table matching \a whereClause (which must begin with " WHERE"), and
+/// returns how many went. Addressed by rowid because SQLite only accepts
+/// LIMIT on DELETE itself in builds compiled to allow it.
+int deleteChunk(QSqlDatabase &db, const QString &table, const QString &whereClause)
+{
+    QSqlQuery del(db);
+    del.prepare(QStringLiteral("DELETE FROM %1 WHERE rowid IN"
+                               " (SELECT rowid FROM %1%2 LIMIT ?)")
+                    .arg(table, whereClause));
+    del.addBindValue(kMigrationChunk);
+    if (!del.exec())
+        return -1;
+    return del.numRowsAffected();
+}
+}
+
+QString MailStore::databaseFilePath()
+{
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+        + QStringLiteral("/mailove.db");
 }
 
 bool MailStore::open()
@@ -101,18 +198,6 @@ bool MailStore::open()
         "CREATE TABLE IF NOT EXISTS bodies ("
         " folder TEXT NOT NULL, uid INTEGER NOT NULL, raw BLOB,"
         " PRIMARY KEY(folder, uid))"));
-
-    // Sweep ghost rows cached by earlier versions: entries without a uid or
-    // with no content at all ("(no subject), 1970") can never be opened.
-    // Neither predicate is indexable, so this is a full pass over messages and
-    // bodies — once, not on every start, since no current code writes them.
-    if (!migrationDone(m_db, QStringLiteral("ghost_sweep1"))) {
-        q.exec(QStringLiteral("DELETE FROM messages WHERE uid <= 0"
-                              " OR (IFNULL(subject,'') = '' AND IFNULL(sender,'') = ''"
-                              "     AND IFNULL(date,0) <= 0)"));
-        q.exec(QStringLiteral("DELETE FROM bodies WHERE uid <= 0"));
-        markMigrationDone(m_db, QStringLiteral("ghost_sweep1"));
-    }
 
     q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS folders ("
                           " mailbox TEXT PRIMARY KEY, sortkey INTEGER)"));
@@ -230,6 +315,13 @@ bool MailStore::open()
     // written for those folders — see MailClient::listsRecipients().
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN recipients TEXT DEFAULT ''"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN arc_detail TEXT DEFAULT ''"));
+    // Deleted or moved away, but not yet on the server. Nothing is destroyed
+    // locally until the server agrees it is gone, which is what makes rolling
+    // a failed change back possible at all — the row, its body and its
+    // attachments are all still here. Every read above filters these out; only
+    // confirmation purges them. See doc/OFFLINE_FIRST_ROADMAP.md.
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN soft_deleted INTEGER DEFAULT 0"));
+
     // OpenPGP shape of the message (doc/openpgp.md §8): 0 none, 1 encrypted,
     // 2 signed, 3 both. Set from the raw head at header-store time and refined
     // once the body arrives, exactly like attach.
@@ -243,6 +335,26 @@ bool MailStore::open()
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN spam_score INTEGER DEFAULT 0"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN spam_state INTEGER DEFAULT 0"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN spam_detail TEXT DEFAULT ''"));
+    // 2.9: the body fetch became octet-faithful (see ImapBackend::buildMessage
+    // — before it, every cached body was KMime's re-assembly of the message
+    // rather than the message, and on a tight nested boundary the two differ
+    // by the byte that fails the DKIM body hash, KDE bug 523826). A verdict is
+    // recorded once and never re-checked, so without this sweep the fix would
+    // reach only mail fetched from now on. Recent bodies are dropped — the
+    // backfill re-fetches them through the faithful path — and everything
+    // derived from them is cleared so it re-derives on open: the DKIM/ARC
+    // verdict against octets that are finally what the sender signed, the
+    // spam score from a body that is really the message. A month is the
+    // horizon where a wrong badge still changes what the reader does; older
+    // mail keeps its verdict and costs nothing.
+    //
+    // Imported archives are left alone: their bodies came off disk, not
+    // through the fetch, and there is no server to re-fetch from — deleting
+    // one would destroy the only copy. spam_state 3 survives because it is
+    // the user's own answer, not a derivation.
+    //
+    // Deferred: see pendingMigrations().
+    //
     // The allowlist asks "have I ever written to this address", across every
     // account and ignoring any +tag. Neither half of the (account, address)
     // primary key can answer that, hence a normalized column of its own.
@@ -292,14 +404,22 @@ bool MailStore::open()
         markMigrationDone(m_db, QStringLiteral("color_index2"));
     }
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_color"
-                          " ON messages(folder, color, date DESC, uid DESC)"));
+                          " ON messages(folder, color, date DESC, uid DESC)"
+                          " WHERE soft_deleted = 0"));
     // Every list query is "newest first within a folder". Without this the
     // only usable index is the (folder, uid) primary key, which yields uid
     // order — so SQLite read the whole folder into a temp B-tree and sorted it
     // before applying LIMIT. On a 200k-message folder that is a full sort to
     // show 1000 rows, on the GUI thread, on every open, scroll and search.
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_date"
-                          " ON messages(folder, date DESC, uid DESC)"));
+                          " ON messages(folder, date DESC, uid DESC)"
+                          " WHERE soft_deleted = 0"));
+    // The other direction, and deliberately tiny: rollback and the startup
+    // reconcile both ask "which rows of this folder are provisionally gone",
+    // and the answer is almost always none. A full index would be the whole
+    // cache over again to serve a query that usually returns nothing.
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_deleted"
+                          " ON messages(folder, uid) WHERE soft_deleted = 1"));
 
     // remove_diacritics 2 folds accents in both the index and the query, so
     // "ave" finds "ávé" — the default (1) leaves several Latin ranges alone.
@@ -313,101 +433,550 @@ bool MailStore::open()
     // An index built before that option folds nothing, and there is no way to
     // change a tokenizer in place — it has to be rebuilt. Only noted here;
     // doing it costs a pass over the whole index and belongs on a worker.
+    refreshFtsRebuildNeeded();
+
+    // fts_rowid, fts_rebuild1 and attach_backfill used to run here. All three
+    // walk the whole index or the whole body table; they are deferred, see
+    // pendingMigrations().
+    //
+    // fts_pending is created here rather than by the migration that fills it:
+    // the drip-feed reindexer reads it from the first tick, which is long
+    // before a migration queued behind the modal can have created it.
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS fts_pending ("
+                          " folder TEXT NOT NULL, uid INTEGER NOT NULL,"
+                          " PRIMARY KEY(folder, uid))"));
+
+    // The journal: every change the server has still to be told about. Created
+    // here rather than deferred behind the modal because it is two cheap
+    // statements and everything else has to be able to read it — the first
+    // mutation may happen before a migration queued behind the modal has run.
+    //
+    // AUTOINCREMENT, not a bare rowid. SQLite reuses rowids after a delete, so
+    // a plain INTEGER PRIMARY KEY could hand a newly appended op an id lower
+    // than one already waiting, silently reordering the queue. Replay order is
+    // the correctness property of the whole design.
+    //
+    // The lists are \x1f-joined rather than JSON: the cache already joins an
+    // account key to a mailbox with the unit separator (scopedIn), no mailbox
+    // or backend id can contain it, and it does not make the cache depend on
+    // SQLite's JSON1 extension being compiled in.
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS journal ("
+                          " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                          " account TEXT NOT NULL,"
+                          " op TEXT NOT NULL,"
+                          " folder TEXT NOT NULL,"
+                          " remote_ids TEXT DEFAULT '',"
+                          // The same messages named the cache's way. The server
+                          // is told about remote_ids; rolling the change back
+                          // has to find the local rows, and only the uid can do
+                          // that. Two names for one thing, because the two sides
+                          // of a provisional change genuinely use two.
+                          " uids TEXT DEFAULT '',"
+                          " target TEXT DEFAULT '',"
+                          " flags_add TEXT DEFAULT '',"
+                          " flags_del TEXT DEFAULT '',"
+                          " queued_at INTEGER NOT NULL,"
+                          " tries INTEGER NOT NULL DEFAULT 0,"
+                          " last_error TEXT DEFAULT '',"
+                          " retired INTEGER NOT NULL DEFAULT 0)"));
+    // Replay reads "this account's live ops in id order" and the sync asks
+    // "does this folder have any"; both are this index.
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_journal_account"
+                          " ON journal(account, retired, id)"));
+    // The outbox: sends the server has still to be handed. AUTOINCREMENT for
+    // the same reason as the journal — id is the send order, and a reused id
+    // would reorder the queue. The wire is one blob on purpose; see the
+    // header. "sender" rather than the roadmap's "from", which is an SQL
+    // keyword.
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS outbox ("
+                          " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                          " account TEXT NOT NULL,"
+                          " wire BLOB NOT NULL,"
+                          " envelope TEXT NOT NULL,"
+                          " sender TEXT NOT NULL,"
+                          " subject TEXT DEFAULT '',"
+                          " created INTEGER NOT NULL,"
+                          " attempts INTEGER NOT NULL DEFAULT 0,"
+                          " last_error TEXT DEFAULT '',"
+                          " next_try INTEGER NOT NULL DEFAULT 0,"
+                          " state INTEGER NOT NULL DEFAULT 0,"
+                          " encrypted INTEGER NOT NULL DEFAULT 0,"
+                          " has_attachments INTEGER NOT NULL DEFAULT 0)"));
+    // The drain reads "this account's queued rows in id order" and the badge
+    // asks how many rows there are at all; both are this index.
+    q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_outbox_account"
+                          " ON outbox(account, state, id)"));
+    return true;
+}
+
+void MailStore::refreshFtsRebuildNeeded()
+{
+    if (!m_ftsAvailable)
+        return;
+    QSqlQuery schema(m_db);
+    if (schema.exec(QStringLiteral(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts'"))
+        && schema.next()) {
+        m_ftsRebuildNeeded =
+            !schema.value(0).toString().contains(QLatin1String("remove_diacritics 2"));
+    }
+}
+
+// --- deferred one-time migrations ------------------------------------------
+
+QList<MailStore::Migration> MailStore::pendingMigrations(const QString &account) const
+{
+    QList<Migration> out;
+    if (!m_db.isOpen())
+        return out;
+
+    // Ordered by what the user notices first, with one exception: the legacy
+    // adoption goes before everything, because until it has run this account's
+    // cached mail is under folder keys nothing else here matches.
+    //
+    // Skipped for a local archive (empty \a account): its key was born after
+    // that migration and must not adopt another account's leftovers.
+    if (!account.isEmpty() && !migrationDone(m_db, QStringLiteral("legacy_adopt1"))) {
+        out.append({QStringLiteral("legacy_adopt1"),
+                    tr("Claiming cached mail for this account")});
+    }
+    if (!migrationDone(m_db, QStringLiteral("ghost_sweep1")))
+        out.append({QStringLiteral("ghost_sweep1"), tr("Removing unreadable cached rows")});
+    if (!migrationDone(m_db, QStringLiteral("raw_refetch_29"))) {
+        out.append({QStringLiteral("raw_refetch_29"),
+                    tr("Clearing signature checks made against re-assembled mail")});
+    }
+    // Both FTS steps are pointless without an index to migrate, and their flags
+    // must stay unset so they run if FTS5 turns up on a later start.
     if (m_ftsAvailable) {
-        QSqlQuery schema(m_db);
-        if (schema.exec(QStringLiteral(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts'"))
-            && schema.next()) {
-            m_ftsRebuildNeeded =
-                !schema.value(0).toString().contains(QLatin1String("remove_diacritics 2"));
+        if (!migrationDone(m_db, QStringLiteral("fts_rowid")))
+            out.append({QStringLiteral("fts_rowid"), tr("Re-keying the search index")});
+        if (!migrationDone(m_db, QStringLiteral("fts_rebuild1")))
+            out.append({QStringLiteral("fts_rebuild1"), tr("Repairing the search index")});
+    }
+    if (!migrationDone(m_db, QStringLiteral("attach_backfill")))
+        out.append({QStringLiteral("attach_backfill"), tr("Finding attachments in cached mail")});
+    // Last, because everything works without it: the list indexes of a cache
+    // written before soft delete existed are unfiltered, and the queries that
+    // now say "AND soft_deleted = 0" still use them, just with a row check on
+    // top. Rebuilding them as partial indexes takes a pass over `messages`,
+    // which is precisely why it is not done in open().
+    if (!migrationDone(m_db, QStringLiteral("softdelete_index1"))) {
+        out.append({QStringLiteral("softdelete_index1"),
+                    tr("Rebuilding the message list index")});
+    }
+    return out;
+}
+
+void MailStore::runMigration(QSqlDatabase &db, const Migration &step, const QString &account,
+                             const std::function<void(int)> &progress,
+                             const std::function<bool()> &cancelled)
+{
+    // Every step below works in chunks against a total counted up front, even
+    // where one statement would have done the job. Two reasons, and the modal
+    // is both of them: a single UPDATE over a multi-gigabyte table reports
+    // nothing until it returns, so the user is shown a bar that cannot move and
+    // no idea how long to wait; and it holds the write lock for its whole run,
+    // where a chunk loop yields between slices.
+    //
+    // The price is that a step is no longer one transaction. That costs nothing
+    // here because each chunk matches only rows it has not already changed, so
+    // an interrupted run leaves consistent rows behind and simply repeats: the
+    // flag is set at the end or not at all.
+
+    // Logs the step's outcome however it leaves — every branch below returns
+    // early, and the interesting cases (cancelled, failed) are exactly the ones
+    // that would otherwise slip out silently. The flag is the ground truth for
+    // "did it finish", so the destructor asks the cache rather than trusting a
+    // bool somebody has to remember to set.
+    struct StepLog {
+        ~StepLog()
+        {
+            const bool complete = migrationDone(db, flag);
+            qCInfo(logMigrate).nospace()
+                << "migration " << flag << (complete ? ": done" : ": STOPPED, resumes next start")
+                << ", " << rows << " rows, " << timer.elapsed() << " ms";
         }
+        const QSqlDatabase &db;
+        QString flag;
+        qint64 rows = 0; ///< what it set out to change, counted before starting
+        QElapsedTimer timer;
+    } log{db, step.flag, 0, {}};
+    log.timer.start();
+    qCInfo(logMigrate) << "migration" << step.flag << "starting";
+
+    if (step.flag == QLatin1String("legacy_adopt1")) {
+        // Global folder list -> this account's per-account list, then the
+        // unscoped message/body/index rows get this account's key as a prefix.
+        QSqlQuery q(db);
+        q.prepare(QStringLiteral(
+            "INSERT OR IGNORE INTO account_folders (account, mailbox, sortkey, uidvalidity)"
+            " SELECT ?, mailbox, sortkey, uidvalidity FROM folders"));
+        q.addBindValue(account);
+        q.exec();
+        q.exec(QStringLiteral("DELETE FROM folders"));
+
+        QStringList tables{QStringLiteral("messages"), QStringLiteral("bodies")};
+        if (tableExists(db, QStringLiteral("fts")))
+            tables.append(QStringLiteral("fts"));
+
+        const QString unscoped = QStringLiteral(" WHERE instr(folder, char(31)) = 0");
+        qint64 total = 0;
+        for (const QString &table : std::as_const(tables))
+            total += countOf(db, QStringLiteral("SELECT COUNT(*) FROM %1%2").arg(table, unscoped));
+        log.rows = total;
+        if (total == 0) {
+            markMigrationDone(db, step.flag);
+            return;
+        }
+
+        // The prefix is what stops a row matching, so each pass takes rows the
+        // last one left — no cursor, and a repeat run finds only what is left.
+        const QString prefix = account + QChar(0x1f);
+        qint64 done = 0;
+        for (const QString &table : std::as_const(tables)) {
+            // Unlike the synchronous version this replaced, the adoption no
+            // longer runs before the account can connect: the sync may have
+            // written a scoped row for a message whose unscoped twin is still
+            // waiting here — in the half-second before the pause lands, or in
+            // a session an earlier run was interrupted under. Renaming the
+            // twin would then collide with the (folder, uid) primary key,
+            // aborting the whole UPDATE — and since the scoped row is not
+            // going anywhere, aborting it on every future launch too. Each
+            // slice therefore clears duplicates first, dropping the unscoped
+            // copy: the scoped one was synced moments ago and is the fresher
+            // of the two. fts has no unique constraint, so no such pass.
+            const bool hasKey = table != QLatin1String("fts");
+            const bool ok = runInChunks([&] {
+                if (hasKey) {
+                    QSqlQuery dup(db);
+                    dup.prepare(
+                        QStringLiteral(
+                            "DELETE FROM %1 WHERE rowid IN (SELECT t.rowid FROM %1 t"
+                            " WHERE instr(t.folder, char(31)) = 0 AND EXISTS"
+                            "  (SELECT 1 FROM %1 s WHERE s.folder = ? || t.folder"
+                            "   AND s.uid = t.uid) LIMIT ?)")
+                            .arg(table));
+                    dup.addBindValue(prefix);
+                    dup.addBindValue(kMigrationChunk);
+                    if (!dup.exec())
+                        return -1;
+                    // The whole slice, so the rename below never runs while a
+                    // duplicate could still be hiding past the LIMIT.
+                    if (const int removed = dup.numRowsAffected(); removed > 0)
+                        return removed;
+                }
+                QSqlQuery upd(db);
+                upd.prepare(QStringLiteral("UPDATE %1 SET folder = ? || folder"
+                                           " WHERE rowid IN (SELECT rowid FROM %1%2 LIMIT ?)")
+                                .arg(table, unscoped));
+                upd.addBindValue(prefix);
+                upd.addBindValue(kMigrationChunk);
+                if (!upd.exec())
+                    return -1;
+                return upd.numRowsAffected();
+            }, total, done, progress, cancelled);
+            if (!ok)
+                return; // cancelled or failed: the flag stays unset
+        }
+        markMigrationDone(db, step.flag);
+        return;
     }
 
-    // One-time rebuild keying every fts row by its messages.rowid. folder/uid
-    // are UNINDEXED in fts5, so per-message maintenance filtered on them was
-    // a full scan of the whole index — O(index) CPU on the GUI thread for
-    // EVERY header stored and body cached. rowid lookups are O(1).
-    if (m_ftsAvailable
-        && (!q.exec(QStringLiteral("SELECT 1 FROM meta_flags WHERE flag = 'fts_rowid'"))
-            || !q.next())) {
-        q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS meta_flags (flag TEXT PRIMARY KEY)"));
-        m_db.transaction();
-        QSqlQuery mig(m_db);
-        mig.exec(QStringLiteral(
-            "CREATE VIRTUAL TABLE fts_new USING fts5("
-            " subject, sender, body, folder UNINDEXED, uid UNINDEXED)"));
-        mig.exec(QStringLiteral(
-            "INSERT INTO fts_new (rowid, subject, sender, body, folder, uid)"
-            " SELECT m.rowid, f.subject, f.sender, f.body, f.folder, f.uid"
-            " FROM fts f JOIN messages m ON m.folder = f.folder AND m.uid = f.uid"));
-        mig.exec(QStringLiteral("DROP TABLE fts"));
-        mig.exec(QStringLiteral("ALTER TABLE fts_new RENAME TO fts"));
-        q.exec(QStringLiteral("INSERT OR IGNORE INTO meta_flags (flag) VALUES ('fts_rowid')"));
-        m_db.commit();
+    if (step.flag == QLatin1String("ghost_sweep1")) {
+        // Rows cached by earlier versions with no uid, or with no content at
+        // all ("(no subject), 1970"), which can never be opened. Neither
+        // predicate is indexable, hence a full pass - once, since no current
+        // code writes them.
+        const QString ghosts = QStringLiteral(
+            " WHERE uid <= 0 OR (IFNULL(subject,'') = '' AND IFNULL(sender,'') = ''"
+            "  AND IFNULL(date,0) <= 0)");
+        qint64 total = countOf(db, QStringLiteral("SELECT COUNT(*) FROM messages") + ghosts)
+            + countOf(db, QStringLiteral("SELECT COUNT(*) FROM bodies WHERE uid <= 0"));
+        log.rows = total;
+        if (total == 0) {
+            markMigrationDone(db, step.flag);
+            return;
+        }
+        qint64 done = 0;
+        if (!runInChunks([&] {
+                return deleteChunk(db, QStringLiteral("messages"), ghosts);
+            }, total, done, progress, cancelled)) {
+            return;
+        }
+        if (!runInChunks([&] {
+                return deleteChunk(db, QStringLiteral("bodies"),
+                                   QStringLiteral(" WHERE uid <= 0"));
+            }, total, done, progress, cancelled)) {
+            return;
+        }
+        markMigrationDone(db, step.flag);
+        return;
     }
 
-    // Self-healing index rebuild: (re)creates the header rows for every
-    // message missing from fts in one statement, and queues every cached
-    // body for background text re-indexing (fts_pending). Runs once; if any
-    // step fails (e.g. the DB is locked by another instance) nothing is
-    // committed and it retries on the next start.
-    if (m_ftsAvailable
-        && (!q.exec(QStringLiteral("SELECT 1 FROM meta_flags WHERE flag = 'fts_rebuild1'"))
-            || !q.next())) {
-        q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS meta_flags (flag TEXT PRIMARY KEY)"));
-        m_db.transaction();
-        QSqlQuery mig(m_db);
+    if (step.flag == QLatin1String("raw_refetch_29")) {
+        // Recent bodies go, so the backfill re-fetches them through the
+        // octet-faithful path, and everything derived from them is cleared so
+        // it re-derives on open. See the note in open().
+        const QString recent = QStringLiteral(
+            " folder NOT LIKE 'import:%' AND date >= strftime('%s','now','-30 days')");
+        const QString staleBodies = QStringLiteral(
+            " WHERE rowid IN (SELECT b.rowid FROM bodies b JOIN messages m"
+            "  ON m.folder = b.folder AND m.uid = b.uid"
+            "  WHERE b.folder NOT LIKE 'import:%'"
+            "   AND m.date >= strftime('%s','now','-30 days'))");
+        // The verdict columns are what stops a message matching the second
+        // pass, so it too shrinks its own work and needs no cursor.
+        const QString unclearedVerdicts = QStringLiteral(" WHERE") + recent
+            + QStringLiteral(" AND (dkim <> '' OR dkim_detail <> ''"
+                             " OR dkim_trusted <> 0 OR arc <> '' OR arc_sealer <> ''"
+                             " OR arc_detail <> '' OR spam_score <> 0 OR spam_detail <> ''"
+                             " OR spam_state NOT IN (0, 3))");
+
+        qint64 total = countOf(db, QStringLiteral("SELECT COUNT(*) FROM bodies") + staleBodies)
+            + countOf(db, QStringLiteral("SELECT COUNT(*) FROM messages") + unclearedVerdicts);
+        log.rows = total;
+        if (total == 0) {
+            markMigrationDone(db, step.flag);
+            return;
+        }
+        qint64 done = 0;
+        if (!runInChunks([&] {
+                return deleteChunk(db, QStringLiteral("bodies"), staleBodies);
+            }, total, done, progress, cancelled)) {
+            return;
+        }
+        if (!runInChunks([&] {
+                QSqlQuery upd(db);
+                upd.prepare(QStringLiteral(
+                    "UPDATE messages SET dkim = '', dkim_detail = '', dkim_trusted = 0,"
+                    " arc = '', arc_sealer = '', arc_detail = '', spam_score = 0,"
+                    " spam_detail = '',"
+                    " spam_state = CASE WHEN spam_state = 3 THEN 3 ELSE 0 END"
+                    " WHERE rowid IN (SELECT rowid FROM messages%1 LIMIT ?)")
+                                .arg(unclearedVerdicts));
+                upd.addBindValue(kMigrationChunk);
+                if (!upd.exec())
+                    return -1;
+                return upd.numRowsAffected();
+            }, total, done, progress, cancelled)) {
+            return;
+        }
+        markMigrationDone(db, step.flag);
+        return;
+    }
+
+    if (step.flag == QLatin1String("fts_rowid")) {
+        // Keys every fts row by its messages.rowid. folder/uid are UNINDEXED in
+        // fts5, so per-message maintenance filtered on them was a full scan of
+        // the whole index - O(index) CPU for EVERY header stored and body
+        // cached. rowid lookups are O(1).
+        //
+        // The one step that must be a single transaction after all: it swaps
+        // the index out from under every reader, and a half-copied fts_new
+        // left behind by an interrupted run is not something a repeat could
+        // tell from a complete one.
+        const qint64 total = qMax<qint64>(1, countOf(db, QStringLiteral("SELECT COUNT(*) FROM fts")));
+        log.rows = total;
+        db.transaction();
+        QSqlQuery mig(db);
         bool ok = mig.exec(QStringLiteral(
-            "INSERT INTO fts (rowid, subject, sender, body, folder, uid)"
-            " SELECT m.rowid, IFNULL(m.subject, ''), IFNULL(m.sender, ''), '', m.folder, m.uid"
-            " FROM messages m"
-            " WHERE NOT EXISTS (SELECT 1 FROM fts WHERE rowid = m.rowid)"));
-        ok = mig.exec(QStringLiteral(
-                 "CREATE TABLE IF NOT EXISTS fts_pending ("
-                 " folder TEXT NOT NULL, uid INTEGER NOT NULL,"
-                 " PRIMARY KEY(folder, uid))"))
-            && ok;
-        ok = mig.exec(QStringLiteral(
-                 "INSERT OR IGNORE INTO fts_pending (folder, uid)"
-                 " SELECT folder, uid FROM bodies"))
-            && ok;
-        if (ok) {
-            q.exec(QStringLiteral(
-                "INSERT OR IGNORE INTO meta_flags (flag) VALUES ('fts_rebuild1')"));
-            m_db.commit();
+            "CREATE VIRTUAL TABLE fts_new USING fts5("
+            " subject, sender, body, folder UNINDEXED, uid UNINDEXED,"
+            " tokenize = \"unicode61 remove_diacritics 2\")"));
+        qint64 cursor = 0;
+        qint64 done = 0;
+        ok = ok && runInChunks([&] {
+            QSqlQuery copy(db);
+            copy.prepare(QStringLiteral(
+                "INSERT INTO fts_new (rowid, subject, sender, body, folder, uid)"
+                " SELECT m.rowid, f.subject, f.sender, f.body, f.folder, f.uid"
+                " FROM fts f JOIN messages m ON m.folder = f.folder AND m.uid = f.uid"
+                " WHERE f.rowid > ? ORDER BY f.rowid LIMIT ?"));
+            copy.addBindValue(cursor);
+            copy.addBindValue(kMigrationChunk);
+            if (!copy.exec())
+                return -1;
+            // Rows of the old index with no message behind them are dropped by
+            // the join, so the number copied says neither how far this slice
+            // reached nor how much of the index it got through — ask the index
+            // itself for both.
+            QSqlQuery reached(db);
+            reached.prepare(QStringLiteral(
+                "SELECT COUNT(*), IFNULL(MAX(rowid), 0) FROM"
+                " (SELECT rowid FROM fts WHERE rowid > ? ORDER BY rowid LIMIT ?)"));
+            reached.addBindValue(cursor);
+            reached.addBindValue(kMigrationChunk);
+            if (!reached.exec() || !reached.next())
+                return -1;
+            const int seen = reached.value(0).toInt();
+            if (seen == 0)
+                return 0;
+            cursor = reached.value(1).toLongLong();
+            return seen;
+            // No yield: every slice here runs inside the one transaction
+            // above, so the lock never drops between them and there is
+            // nothing to hand over — see runInChunks.
+        }, total, done, progress, cancelled, /* yield = */ false);
+        ok = ok && mig.exec(QStringLiteral("DROP TABLE fts"));
+        ok = ok && mig.exec(QStringLiteral("ALTER TABLE fts_new RENAME TO fts"));
+        if (ok && db.commit()) {
+            markMigrationDone(db, step.flag);
         } else {
-            qWarning() << "mailstore: fts rebuild failed, retrying next start:"
+            qWarning() << "mailstore: fts re-key failed, retrying next start:"
                        << mig.lastError().text();
-            m_db.rollback();
+            db.rollback();
         }
+        return;
     }
 
-    // One-time backfill: rows cached before the attach column existed get
-    // their flag recomputed from the raw bodies we already have on disk.
-    if (!q.exec(QStringLiteral("SELECT 1 FROM meta_flags WHERE flag = 'attach_backfill'"))
-        || !q.next()) {
-        q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS meta_flags (flag TEXT PRIMARY KEY)"));
-        QSqlQuery bodies(m_db);
-        QSqlQuery upd(m_db);
-        upd.prepare(QStringLiteral(
-            "UPDATE messages SET attach = 1 WHERE folder = ? AND uid = ?"));
-        m_db.transaction();
-        if (bodies.exec(QStringLiteral("SELECT folder, uid, raw FROM bodies"))) {
+    if (step.flag == QLatin1String("fts_rebuild1")) {
+        // Self-healing: (re)creates the header rows for every message missing
+        // from fts, and queues every cached body for background text
+        // re-indexing. Both halves skip what they have already done, so an
+        // interrupted run resumes rather than starting over.
+        const QString missing = QStringLiteral(
+            " WHERE NOT EXISTS (SELECT 1 FROM fts WHERE rowid = messages.rowid)");
+        const QString unqueued = QStringLiteral(
+            " WHERE NOT EXISTS (SELECT 1 FROM fts_pending p"
+            "  WHERE p.folder = bodies.folder AND p.uid = bodies.uid)");
+        qint64 total = countOf(db, QStringLiteral("SELECT COUNT(*) FROM messages") + missing)
+            + countOf(db, QStringLiteral("SELECT COUNT(*) FROM bodies") + unqueued);
+        log.rows = total;
+        if (total == 0) {
+            markMigrationDone(db, step.flag);
+            return;
+        }
+        qint64 done = 0;
+        if (!runInChunks([&] {
+                QSqlQuery ins(db);
+                ins.prepare(QStringLiteral(
+                    "INSERT INTO fts (rowid, subject, sender, body, folder, uid)"
+                    " SELECT rowid, IFNULL(subject, ''), IFNULL(sender, ''), '', folder, uid"
+                    " FROM messages%1 LIMIT ?").arg(missing));
+                ins.addBindValue(kMigrationChunk);
+                if (!ins.exec())
+                    return -1;
+                return ins.numRowsAffected();
+            }, total, done, progress, cancelled)) {
+            return;
+        }
+        if (!runInChunks([&] {
+                QSqlQuery ins(db);
+                ins.prepare(QStringLiteral(
+                    "INSERT OR IGNORE INTO fts_pending (folder, uid)"
+                    " SELECT folder, uid FROM bodies%1 LIMIT ?").arg(unqueued));
+                ins.addBindValue(kMigrationChunk);
+                if (!ins.exec())
+                    return -1;
+                return ins.numRowsAffected();
+            }, total, done, progress, cancelled)) {
+            return;
+        }
+        markMigrationDone(db, step.flag);
+        return;
+    }
+
+    if (step.flag == QLatin1String("attach_backfill")) {
+        // Rows cached before the attach column existed get their flag
+        // recomputed from the raw bodies already on disk. The only step that
+        // reads blobs, and so the slowest of them by far: a cursor rather than
+        // a self-shrinking predicate, because "has been looked at" is not
+        // something the row records.
+        const qint64 total = countOf(db, QStringLiteral("SELECT COUNT(*) FROM bodies"));
+        log.rows = total;
+        if (total == 0) {
+            markMigrationDone(db, step.flag);
+            return;
+        }
+        qint64 cursor = 0;
+        qint64 done = 0;
+        const bool ok = runInChunks([&] {
+            QSqlQuery bodies(db);
+            bodies.prepare(QStringLiteral(
+                "SELECT rowid, folder, uid, raw FROM bodies WHERE rowid > ?"
+                " ORDER BY rowid LIMIT ?"));
+            bodies.addBindValue(cursor);
+            bodies.addBindValue(kMigrationChunk);
+            if (!bodies.exec())
+                return -1;
+
+            QList<QPair<QString, qint64>> withAttachments;
+            int seen = 0;
             while (bodies.next()) {
-                const QByteArray raw = bodies.value(2).toByteArray();
-                const int headEnd = raw.indexOf("\r\n\r\n") >= 0
-                    ? raw.indexOf("\r\n\r\n") : raw.indexOf("\n\n");
+                ++seen;
+                cursor = bodies.value(0).toLongLong();
+                const QByteArray raw = bodies.value(3).toByteArray();
+                const int crlf = raw.indexOf("\r\n\r\n");
+                const int headEnd = crlf >= 0 ? crlf : raw.indexOf("\n\n");
                 if (headIndicatesAttachment(headEnd > 0 ? raw.left(headEnd) : raw)) {
-                    upd.addBindValue(bodies.value(0));
-                    upd.addBindValue(bodies.value(1));
-                    upd.exec();
+                    withAttachments.append(
+                        {bodies.value(1).toString(), bodies.value(2).toLongLong()});
                 }
             }
-        }
-        q.exec(QStringLiteral("INSERT OR IGNORE INTO meta_flags (flag) VALUES ('attach_backfill')"));
-        m_db.commit();
+            if (seen == 0)
+                return 0;
+            if (!withAttachments.isEmpty()) {
+                db.transaction();
+                QSqlQuery upd(db);
+                upd.prepare(QStringLiteral(
+                    "UPDATE messages SET attach = 1 WHERE folder = ? AND uid = ?"));
+                for (const auto &row : std::as_const(withAttachments)) {
+                    upd.addBindValue(row.first);
+                    upd.addBindValue(row.second);
+                    upd.exec();
+                }
+                db.commit();
+            }
+            return seen;
+        }, total, done, progress, cancelled);
+        if (ok)
+            markMigrationDone(db, step.flag);
+        return;
     }
-    return true;
+
+    if (step.flag == QLatin1String("softdelete_index1")) {
+        // The one step here that cannot be chunked: SQLite builds an index in
+        // one statement or not at all. It is also the one that does not need
+        // to be — CREATE INDEX sorts the table it reads rather than walking it
+        // row by row, so the cost is a fraction of the sweeps above, and the
+        // modal simply leaves the bar indeterminate.
+        //
+        // Idempotent because each pair is dropped and recreated together: an
+        // interrupted run leaves either the old index or the new one, and the
+        // reads work against both. Only the flag at the end says it is done.
+        log.rows = countOf(db, QStringLiteral("SELECT COUNT(*) FROM messages"));
+        struct PartialIndex {
+            const char *name;
+            const char *columns;
+            const char *predicate;
+        };
+        static constexpr PartialIndex kIndexes[] = {
+            {"idx_messages_date", "folder, date DESC, uid DESC", "soft_deleted = 0"},
+            {"idx_messages_color", "folder, color, date DESC, uid DESC", "soft_deleted = 0"},
+            // idx_messages_unseen is deliberately not here. It is built lazily
+            // by unreadCountsOn() on a worker connection under its own flag,
+            // and rebuilding it from two places is how one of them ends up
+            // dropping an index the other believes it has created.
+        };
+        QSqlQuery q(db);
+        for (const PartialIndex &idx : kIndexes) {
+            if (cancelled())
+                return;
+            const QString name = QString::fromLatin1(idx.name);
+            q.exec(QStringLiteral("DROP INDEX IF EXISTS %1").arg(name));
+            if (!q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS %1 ON messages(%2) WHERE %3")
+                            .arg(name, QLatin1String(idx.columns),
+                                 QLatin1String(idx.predicate)))) {
+                qCWarning(logMigrate) << "index rebuild failed:" << q.lastError().text();
+                return; // the flag stays unset; the next start tries again
+            }
+        }
+        markMigrationDone(db, step.flag);
+        return;
+    }
+
+    qWarning() << "mailstore: unknown migration" << step.flag;
 }
 
 void MailStore::setAccountKey(const QString &key)
@@ -428,45 +997,6 @@ QString MailStore::scopedIn(const QString &account, const QString &folder)
     if (account.isEmpty())
         return folder;
     return account + QChar(0x1f) + folder;
-}
-
-void MailStore::adoptLegacyCache(const QString &account)
-{
-    if (!m_db.isOpen() || account.isEmpty())
-        return;
-    // Strictly a first-run upgrade step. The instr() predicates below cannot
-    // use an index, so re-running it on an already-scoped cache scanned every
-    // messages/bodies/fts row for nothing — the single largest cost in
-    // startup. Once claimed, no unscoped row can appear again.
-    if (migrationDone(m_db, QStringLiteral("legacy_adopt1")))
-        return;
-    SlowGuard guard("adoptLegacyCache");
-    m_db.transaction();
-    QSqlQuery q(m_db);
-
-    // Global folder list → this account's per-account list.
-    q.prepare(QStringLiteral(
-        "INSERT OR IGNORE INTO account_folders (account, mailbox, sortkey, uidvalidity)"
-        " SELECT ?, mailbox, sortkey, uidvalidity FROM folders"));
-    q.addBindValue(account);
-    q.exec();
-    q.exec(QStringLiteral("DELETE FROM folders"));
-
-    // Unscoped message/body/index rows get this account's folder-key prefix.
-    // instr() guards make this idempotent — prefixed rows are left alone.
-    const QString prefix = account + QChar(0x1f);
-    for (const char *table : {"messages", "bodies", "fts"}) {
-        if (!m_ftsAvailable && qstrcmp(table, "fts") == 0)
-            continue;
-        QSqlQuery upd(m_db);
-        upd.prepare(QStringLiteral(
-                        "UPDATE %1 SET folder = ? || folder WHERE instr(folder, char(31)) = 0")
-                        .arg(QLatin1String(table)));
-        upd.addBindValue(prefix);
-        upd.exec();
-    }
-    if (m_db.commit())
-        markMigrationDone(m_db, QStringLiteral("legacy_adopt1"));
 }
 
 QStringList MailStore::cachedFolders(const QString &account)
@@ -595,7 +1125,7 @@ QList<MessageListModel::Header> MailStore::cachedHeaders(const QString &folder, 
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
                              " color, crypto, spam_score, spam_state, spam_detail,"
                              " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '')"
-                             " FROM messages WHERE folder = ?"
+                             " FROM messages WHERE folder = ? AND soft_deleted = 0"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
     q.addBindValue(limit);
@@ -614,7 +1144,7 @@ QList<MessageListModel::Header> MailStore::cachedHeadersBefore(const QString &fo
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
                              " color, crypto, spam_score, spam_state, spam_detail,"
                              " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '')"
-                             " FROM messages WHERE folder = ?"
+                             " FROM messages WHERE folder = ? AND soft_deleted = 0"
                              " AND (date < ? OR (date = ? AND uid < ?))"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
@@ -713,7 +1243,7 @@ QList<MessageListModel::Header> MailStore::sortedHeadersOn(QSqlDatabase &db,
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
                              " color, crypto, spam_score, spam_state, spam_detail,"
                              " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '')"
-                             " FROM messages WHERE folder = ?")
+                             " FROM messages WHERE folder = ? AND soft_deleted = 0")
               + where + order + QStringLiteral(" LIMIT ?"));
     q.addBindValue(scopedFolder);
     if (after) {
@@ -743,6 +1273,7 @@ QList<MessageListModel::Header> MailStore::headersByColor(const QString &folder,
                              " color, crypto, spam_score, spam_state, spam_detail,"
                              " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '')"
                              " FROM messages WHERE folder = ? AND color = ?"
+                             " AND soft_deleted = 0"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
     q.addBindValue(color);
@@ -762,7 +1293,13 @@ int MailStore::cachedHeaderCountIn(const QString &account, const QString &folder
     if (!m_db.isOpen())
         return 0;
     QSqlQuery q(m_db);
-    q.prepare(QStringLiteral("SELECT COUNT(*) FROM messages WHERE folder = ?"));
+    // The predicate matters more here than anywhere else: the all-folders
+    // backfill decides whether a folder needs syncing at all by comparing this
+    // with the server's message count (SyncEngine::applyFolderOpened). Counting
+    // rows the user has already deleted would inflate it past the server's
+    // figure and skip syncing the folder outright.
+    q.prepare(QStringLiteral(
+        "SELECT COUNT(*) FROM messages WHERE folder = ? AND soft_deleted = 0"));
     q.addBindValue(scopedIn(account, folder));
     return (q.exec() && q.next()) ? q.value(0).toInt() : 0;
 }
@@ -819,9 +1356,22 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
         // Never overwrite a known Message-ID with an unknown one: a header
         // refresh that could not read it must not erase what a body gave us.
         " msgid = COALESCE(excluded.msgid, messages.msgid),"
-        // A locally-read message stays read even if the server still reports
-        // \Unseen — e.g. it was read offline and the STORE never went out.
-        " seen = MAX(messages.seen, excluded.seen),"
+        // The server's answer, plainly. This used to be
+        // MAX(messages.seen, excluded.seen) — a hand-rolled guard from before
+        // the journal existed, protecting a local read mark whose STORE had
+        // never gone out. It only ever worked in one direction: it defended
+        // "read" and let the server clobber "unread", and it was also why a
+        // message read on another device kept its unread pill here for good.
+        // The journal covers the case properly now — a folder with an
+        // unreplayed op is not synced at all, so nothing can land on top of a
+        // local change before it has been pushed. Two rules that disagreed
+        // about the same thing are now one.
+        " seen = excluded.seen,"
+        // soft_deleted is deliberately absent from the column list above: a
+        // merge must not resurrect a row the user has deleted but the server
+        // has not been told about yet. Leaving it out of the INSERT defaults it
+        // to 0 for genuinely new rows and leaves it untouched on conflict,
+        // which is exactly both rules.
         " suspicious = excluded.suspicious, auth = excluded.auth,"
         " attach = CASE WHEN messages.attach > 1 AND excluded.attach = 1"
         " THEN messages.attach ELSE excluded.attach END,"
@@ -1117,7 +1667,8 @@ QList<MailStore::AgedMessage> MailStore::messagesOlderThan(const QString &folder
     // does: that is what an IMAP backend expects, and what rows cached before
     // the remote_id column existed hold implicitly.
     q.prepare(QStringLiteral("SELECT uid, IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '') FROM messages"
-                             " WHERE folder = ? AND (date < ? OR date <= 0)"));
+                             " WHERE folder = ? AND soft_deleted = 0"
+                             " AND (date < ? OR date <= 0)"));
     q.addBindValue(scoped(folder));
     q.addBindValue(cutoffSecs);
     if (!q.exec())
@@ -1147,7 +1698,7 @@ QList<MailStore::AgedMessage> MailStore::unseenMessages(const QString &folder)
     // Same remote-id fallback as remoteIdFor(): rows cached before the
     // remote_id column existed carry the uid in decimal implicitly.
     q.prepare(QStringLiteral("SELECT uid, IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '') FROM messages"
-                             " WHERE folder = ? AND seen = 0"));
+                             " WHERE folder = ? AND seen = 0 AND soft_deleted = 0"));
     q.addBindValue(scoped(folder));
     if (!q.exec())
         return out;
@@ -1178,6 +1729,20 @@ void MailStore::setSeen(const QString &folder, qint64 uid)
     q.exec();
 }
 
+int MailStore::clearUnseenIn(const QString &account, const QString &folder)
+{
+    if (!m_db.isOpen())
+        return 0;
+    // Small in practice, and indexed: idx_messages_unseen holds only the
+    // unread rows, so a folder with no stale flags costs an empty index probe.
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET seen = 1 WHERE folder = ? AND seen = 0"));
+    q.addBindValue(scopedIn(account, folder));
+    if (!q.exec())
+        return 0;
+    return q.numRowsAffected();
+}
+
 QList<qint64> MailStore::uidsWithoutBody(const QString &folder, int limit)
 {
     QList<qint64> out;
@@ -1189,6 +1754,7 @@ QList<qint64> MailStore::uidsWithoutBody(const QString &folder, int limit)
         " LEFT JOIN bodies b ON b.folder = m.folder AND b.uid = m.uid"
         " LEFT JOIN body_skipped s ON s.folder = m.folder AND s.uid = m.uid"
         " WHERE m.folder = ? AND b.uid IS NULL AND s.uid IS NULL"
+        " AND m.soft_deleted = 0"
         " ORDER BY m.date DESC, m.uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
     q.addBindValue(limit);
@@ -1208,7 +1774,8 @@ int MailStore::missingBodyCount(const QString &folder)
         "SELECT COUNT(*) FROM messages m"
         " LEFT JOIN bodies b ON b.folder = m.folder AND b.uid = m.uid"
         " LEFT JOIN body_skipped s ON s.folder = m.folder AND s.uid = m.uid"
-        " WHERE m.folder = ? AND b.uid IS NULL AND s.uid IS NULL"));
+        " WHERE m.folder = ? AND b.uid IS NULL AND s.uid IS NULL"
+        " AND m.soft_deleted = 0"));
     q.addBindValue(scoped(folder));
     return (q.exec() && q.next()) ? q.value(0).toInt() : 0;
 }
@@ -1933,6 +2500,93 @@ void MailStore::renameFolderOn(QSqlDatabase &db, const QString &account,
     db.commit();
 }
 
+QHash<QString, int> MailStore::unreadCounts(const QString &account) const
+{
+    if (!m_db.isOpen())
+        return {};
+    QSqlDatabase db = m_db;
+    return unreadCountsOn(db, account);
+}
+
+int MailStore::applyUnseenSet(const QString &account, const QString &folder,
+                              const QStringList &unseenIds)
+{
+    if (!m_db.isOpen())
+        return 0;
+    const QString scopedFolder = account + QLatin1Char('\x1f') + folder;
+    // Bound as a temporary table rather than an IN list: an inbox can hold
+    // thousands of unread ids, and SQLite's parameter limit is not something
+    // to discover in the field.
+    QSqlQuery drop(m_db);
+    drop.exec(QStringLiteral("DROP TABLE IF EXISTS temp.server_unseen"));
+    QSqlQuery make(m_db);
+    if (!make.exec(QStringLiteral("CREATE TEMP TABLE server_unseen (id TEXT PRIMARY KEY)"))) {
+        qWarning() << "mailstore: unseen reconcile failed:" << make.lastError().text();
+        return 0;
+    }
+    m_db.transaction();
+    QSqlQuery ins(m_db);
+    ins.prepare(QStringLiteral("INSERT OR IGNORE INTO temp.server_unseen (id) VALUES (?)"));
+    for (const QString &id : unseenIds) {
+        ins.addBindValue(id);
+        ins.exec();
+    }
+    int changed = 0;
+    // Read here, unread on the server.
+    QSqlQuery up(m_db);
+    up.prepare(QStringLiteral(
+        "UPDATE messages SET seen = 0 WHERE folder = ? AND seen = 1 AND soft_deleted = 0"
+        " AND IFNULL(remote_id, CAST(uid AS TEXT)) IN (SELECT id FROM temp.server_unseen)"));
+    up.addBindValue(scopedFolder);
+    if (up.exec())
+        changed += up.numRowsAffected();
+    // Unread here, not on the server — the stale-flag case, and the common one.
+    QSqlQuery down(m_db);
+    down.prepare(QStringLiteral(
+        "UPDATE messages SET seen = 1 WHERE folder = ? AND seen = 0 AND soft_deleted = 0"
+        " AND IFNULL(remote_id, CAST(uid AS TEXT)) NOT IN (SELECT id FROM temp.server_unseen)"));
+    down.addBindValue(scopedFolder);
+    if (down.exec())
+        changed += down.numRowsAffected();
+    m_db.commit();
+    QSqlQuery cleanup(m_db);
+    cleanup.exec(QStringLiteral("DROP TABLE IF EXISTS temp.server_unseen"));
+    return changed;
+}
+
+QHash<QString, int> MailStore::cachedRowCounts(const QString &account) const
+{
+    QHash<QString, int> out;
+    if (!m_db.isOpen())
+        return out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT folder, COUNT(*) FROM messages WHERE folder LIKE ? AND soft_deleted = 0"
+        " GROUP BY folder"));
+    q.addBindValue(account + QStringLiteral("\x1f%"));
+    if (!q.exec())
+        return out;
+    const int prefix = account.size() + 1;
+    while (q.next())
+        out.insert(q.value(0).toString().mid(prefix), q.value(1).toInt());
+    return out;
+}
+
+bool MailStore::workDoneOn(QSqlDatabase &db, const QString &flag)
+{
+    return migrationDone(db, flag);
+}
+
+void MailStore::markWorkDoneOn(QSqlDatabase &db, const QString &flag)
+{
+    markMigrationDone(db, flag);
+}
+
+bool MailStore::workDone(const QString &flag) const
+{
+    return m_db.isOpen() && migrationDone(m_db, flag);
+}
+
 QHash<QString, int> MailStore::unreadCountsOn(QSqlDatabase &db, const QString &account)
 {
     QHash<QString, int> out;
@@ -1950,10 +2604,17 @@ QHash<QString, int> MailStore::unreadCountsOn(QSqlDatabase &db, const QString &a
     // a worker connection and is done once, recorded in meta_flags. Without it
     // the planner picked idx_messages_color and had to visit every row of the
     // account in the table to read `seen`.
-    if (!migrationDone(db, QStringLiteral("unseen_index1"))) {
-        if (q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_unseen"
-                                  " ON messages(folder) WHERE seen = 0")))
-            markMigrationDone(db, QStringLiteral("unseen_index1"));
+    // Version 2 of it excludes the soft-deleted rows as well, so the count is
+    // answered from the index alone rather than by visiting the table to check.
+    // A new name and a new flag rather than a rebuild in place: the old index
+    // stays usable until the new one exists, so an interrupted build costs a
+    // slower count rather than none at all.
+    if (!migrationDone(db, QStringLiteral("unseen_index2"))) {
+        if (q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_unseen2"
+                                  " ON messages(folder) WHERE seen = 0 AND soft_deleted = 0"))) {
+            q.exec(QStringLiteral("DROP INDEX IF EXISTS idx_messages_unseen"));
+            markMigrationDone(db, QStringLiteral("unseen_index2"));
+        }
     }
 
     // Half-open range over "account\x1f<folder>", the same trick renameFolderOn
@@ -1962,8 +2623,11 @@ QHash<QString, int> MailStore::unreadCountsOn(QSqlDatabase &db, const QString &a
     QString hi = lo;
     hi[hi.size() - 1] = QChar(0x20);
 
+    // Soft-deleted rows excluded, or a locally deleted unread message keeps
+    // its sidebar pill and the folder reads as having mail that is not there.
     q.prepare(QStringLiteral("SELECT folder, count(*) FROM messages"
                              " WHERE folder >= ? AND folder < ? AND seen = 0"
+                             " AND soft_deleted = 0"
                              " GROUP BY folder"));
     q.addBindValue(lo);
     q.addBindValue(hi);
@@ -2093,7 +2757,16 @@ void MailStore::purgeFolder(const QString &scopedFolder, const QAtomicInt &cance
 
 qint64 MailStore::databaseBytes() const
 {
-    return m_db.isOpen() ? QFileInfo(m_db.databaseName()).size() : 0;
+    if (!m_db.isOpen())
+        return 0;
+    // The write-ahead log counts. In WAL mode a burst of writes lands there
+    // and only reaches the main file at the next checkpoint, so the two are
+    // both "the cache" as far as the disk is concerned — reading only the
+    // main file reported 4 KB for a database holding megabytes of unflushed
+    // mail, and made the figure in Settings wander for reasons no user could
+    // connect to anything they did.
+    const QString path = m_db.databaseName();
+    return QFileInfo(path).size() + QFileInfo(path + QStringLiteral("-wal")).size();
 }
 
 qint64 MailStore::reclaimableBytes()
@@ -2107,36 +2780,93 @@ qint64 MailStore::reclaimableBytes()
     return q.value(0).toLongLong() * q.value(1).toLongLong();
 }
 
-bool MailStore::vacuum(QString *error)
+bool MailStore::vacuumInto(const QString &target, QString *error)
 {
-    // Its own connection, so this can run on a worker thread while the GUI
-    // thread's "mailstore" connection stays put. The connection name is unique
-    // per call — a stale one left by a previous failed run would be reused
-    // with the wrong thread affinity.
-    const QString name = QStringLiteral("mailstore-vacuum");
+    // A leftover from a run that was killed part way. Left in place it would
+    // fail the VACUUM INTO below, which refuses to write over a file.
+    QFile::remove(target);
+
+    const QString name = QStringLiteral("mailstore-compact");
     bool ok = false;
     {
         QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), name);
-        db.setDatabaseName(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
-                           + QStringLiteral("/mailove.db"));
+        db.setDatabaseName(databaseFilePath());
         if (!db.open()) {
             if (error)
                 *error = db.lastError().text();
         } else {
             QSqlQuery q(db);
-            // No busy_timeout would make this fail instantly whenever the GUI
-            // thread happens to hold a write lock.
             q.exec(QStringLiteral("PRAGMA busy_timeout=%1")
-           .arg(AdvancedConfig::i("db/rebuildBusyTimeoutMs")));
-            ok = q.exec(QStringLiteral("VACUUM"));
+                       .arg(AdvancedConfig::i("db/rebuildBusyTimeoutMs")));
+            // Quoted rather than bound: VACUUM INTO takes an expression, and
+            // the escaping rule for a SQL string literal is one doubled quote.
+            QString path = target;
+            path.replace(QLatin1Char('\''), QLatin1String("''"));
+            ok = q.exec(QStringLiteral("VACUUM INTO '%1'").arg(path));
             if (!ok && error)
                 *error = q.lastError().text();
             db.close();
         }
     }
     QSqlDatabase::removeDatabase(name);
+    if (!ok)
+        QFile::remove(target); // a half-written copy is worse than none
     return ok;
 }
+
+bool MailStore::swapInCompacted(const QString &compacted, QString *error)
+{
+    const QString path = databaseFilePath();
+    if (!QFile::exists(compacted)) {
+        if (error)
+            *error = QStringLiteral("the compacted cache is missing");
+        return false;
+    }
+
+    m_db.close();
+    // The handle has to go too, or the re-add below is refused as a duplicate
+    // connection name — and Qt warns that the old one is "still in use".
+    m_db = QSqlDatabase();
+    QSqlDatabase::removeDatabase(QStringLiteral("mailstore"));
+
+    // Closing the last connection checkpoints and removes the write-ahead log,
+    // but a crash could have left one behind — and a WAL belonging to the file
+    // we are about to replace would be applied to its replacement, which is
+    // how a compaction turns into corruption.
+    QFile::remove(path + QStringLiteral("-wal"));
+    QFile::remove(path + QStringLiteral("-shm"));
+
+    // std::rename, not QFile::rename: this has to replace an existing file,
+    // which QFile refuses to do, and it has to be atomic — at no instant may
+    // there be no cache at that path. Both files are in the same directory,
+    // so it is a single directory entry swap.
+    const bool renamed = std::rename(QFile::encodeName(compacted).constData(),
+                                     QFile::encodeName(path).constData()) == 0;
+    if (!renamed && error)
+        *error = QStringLiteral("could not put the compacted cache in place");
+    QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner);
+
+    // Reopened either way: on a failed rename the original file is still
+    // there, untouched, and the client has to be able to read it again.
+    m_db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
+                                     QStringLiteral("mailstore"));
+    m_db.setDatabaseName(path);
+    if (!m_db.open()) {
+        if (error)
+            *error = m_db.lastError().text();
+        return false;
+    }
+    // The pragmas only. Not the schema or the migrations: this file is a
+    // byte-for-byte compacted copy of one that already passed both, and
+    // re-running them here would put the migration modal in front of a user
+    // who asked for disk space back.
+    QSqlQuery q(m_db);
+    q.exec(QStringLiteral("PRAGMA journal_mode=WAL"));
+    q.exec(QStringLiteral("PRAGMA busy_timeout=%1").arg(AdvancedConfig::i("db/busyTimeoutMs")));
+    q.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
+    return renamed;
+}
+
 
 QString MailStore::messageIdFromHead(const QByteArray &head)
 {
@@ -2686,7 +3416,8 @@ void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QS
             " m.color, m.spam_score, m.spam_state, m.spam_detail, IFNULL(m.recipients, '')"
             " FROM messages m"
             " WHERE m.rowid IN (SELECT rowid FROM fts WHERE fts MATCH ?)"
-            " AND m.folder = ? ORDER BY m.date DESC LIMIT 200"));
+            " AND m.folder = ? AND m.soft_deleted = 0"
+            " ORDER BY m.date DESC LIMIT 200"));
         // Quote as a literal phrase so FTS5 operators in user input can't
         // break it; the trailing * makes it a prefix query, so partial words
         // match too ("hung" finds "hungarian").
@@ -2716,7 +3447,8 @@ void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QS
     like.prepare(QStringLiteral(
         "SELECT uid, subject, sender, date, seen, suspicious, auth, attach, color,"
         " spam_score, spam_state, spam_detail, IFNULL(recipients, '') FROM messages"
-        " WHERE folder = ? AND (subject LIKE ? ESCAPE '\\' OR %1 LIKE ? ESCAPE '\\')"
+        " WHERE folder = ? AND soft_deleted = 0"
+        " AND (subject LIKE ? ESCAPE '\\' OR %1 LIKE ? ESCAPE '\\')"
         " ORDER BY date DESC LIMIT 200")
                      // Whichever column the list is showing. In Sent every row
                      // has the same sender, so matching it finds the whole
@@ -2853,4 +3585,605 @@ void MailStore::queueForReindex(QSqlDatabase &db, const QList<BodyWrite> &batch)
         q.addBindValue(w.uid);
         q.exec();
     }
+}
+
+// --- the journal ------------------------------------------------------------
+//
+// Storage only. What an op *means* — which backend call it becomes, how it is
+// undone, what confirming it purges — is MailClient's, because it is the only
+// thing that holds a backend. Everything here is the durable list and the
+// bookkeeping that keeps its order honest.
+
+namespace
+{
+/// Column order shared by every read below and by journalRowOf().
+constexpr const char *kJournalColumns =
+    "id, account, op, folder, remote_ids, uids, target, flags_add, flags_del,"
+    " queued_at, tries, last_error, retired";
+
+/// The unit separator, as everywhere else in the cache — a mailbox path and a
+/// backend message id can hold anything except this.
+QString joinList(const QStringList &parts)
+{
+    return parts.join(QChar(0x1f));
+}
+QStringList splitList(const QString &packed)
+{
+    return packed.isEmpty() ? QStringList() : packed.split(QChar(0x1f));
+}
+} // namespace
+
+MailStore::JournalOp MailStore::journalRowOf(const QSqlQuery &q)
+{
+    JournalOp op;
+    op.id = q.value(0).toLongLong();
+    op.account = q.value(1).toString();
+    op.op = q.value(2).toString();
+    op.folder = q.value(3).toString();
+    op.remoteIds = splitList(q.value(4).toString());
+    for (const QString &uid : splitList(q.value(5).toString()))
+        op.uids.append(uid.toLongLong());
+    op.target = q.value(6).toString();
+    op.flagsAdd = splitList(q.value(7).toString());
+    op.flagsDel = splitList(q.value(8).toString());
+    op.queuedAt = q.value(9).toLongLong();
+    op.tries = q.value(10).toInt();
+    op.lastError = q.value(11).toString();
+    op.retired = q.value(12).toInt() != 0;
+    return op;
+}
+
+QList<MailStore::JournalOp> MailStore::journalSelect(const QString &where,
+                                                     const QVariantList &binds) const
+{
+    QList<JournalOp> out;
+    if (!m_db.isOpen())
+        return out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT %1 FROM journal %2")
+                  .arg(QLatin1String(kJournalColumns), where));
+    for (const QVariant &b : binds)
+        q.addBindValue(b);
+    if (!q.exec())
+        return out;
+    while (q.next())
+        out.append(journalRowOf(q));
+    return out;
+}
+
+qint64 MailStore::appendJournalOp(JournalOp op)
+{
+    if (!m_db.isOpen())
+        return 0;
+    if (op.account.isEmpty())
+        op.account = m_accountKey;
+    if (op.queuedAt <= 0)
+        op.queuedAt = QDateTime::currentSecsSinceEpoch();
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "INSERT INTO journal (account, op, folder, remote_ids, uids, target,"
+        " flags_add, flags_del, queued_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+    q.addBindValue(op.account);
+    q.addBindValue(op.op);
+    q.addBindValue(op.folder);
+    q.addBindValue(joinList(op.remoteIds));
+    QStringList uidText;
+    uidText.reserve(op.uids.size());
+    for (qint64 uid : std::as_const(op.uids))
+        uidText.append(QString::number(uid));
+    q.addBindValue(joinList(uidText));
+    q.addBindValue(op.target);
+    q.addBindValue(joinList(op.flagsAdd));
+    q.addBindValue(joinList(op.flagsDel));
+    q.addBindValue(op.queuedAt);
+    if (!q.exec()) {
+        qWarning() << "mailstore: journal append failed:" << q.lastError().text();
+        return 0;
+    }
+    return q.lastInsertId().toLongLong();
+}
+
+QList<MailStore::JournalOp> MailStore::journalOps(const QString &account) const
+{
+    return journalSelect(QStringLiteral("WHERE account = ? AND retired = 0 ORDER BY id"),
+                         {account});
+}
+
+QList<MailStore::JournalOp> MailStore::retiredJournalOps(const QString &account) const
+{
+    return journalSelect(QStringLiteral("WHERE account = ? AND retired = 1 ORDER BY id DESC"),
+                         {account});
+}
+
+QList<MailStore::JournalOp> MailStore::journalOpsFor(const QString &account,
+                                                     const QString &folder) const
+{
+    // Both ends of a move: an op that names the folder as its source and one
+    // that is about to file mail into it are equally invalidated when the
+    // folder's uids are renumbered.
+    return journalSelect(
+        QStringLiteral("WHERE account = ? AND retired = 0 AND (folder = ? OR target = ?)"
+                       " ORDER BY id"),
+        {account, folder, folder});
+}
+
+int MailStore::journalOpCount(const QString &account, bool retired) const
+{
+    if (!m_db.isOpen())
+        return 0;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT count(*) FROM journal WHERE account = ? AND retired = ?"));
+    q.addBindValue(account);
+    q.addBindValue(retired ? 1 : 0);
+    return (q.exec() && q.next()) ? q.value(0).toInt() : 0;
+}
+
+QSet<QString> MailStore::journalFolders(const QString &account) const
+{
+    QSet<QString> out;
+    if (!m_db.isOpen())
+        return out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT folder, target FROM journal"
+                             " WHERE account = ? AND retired = 0"));
+    q.addBindValue(account);
+    if (!q.exec())
+        return out;
+    while (q.next()) {
+        out.insert(q.value(0).toString());
+        // A move's destination is as unsyncable as its source: until the push
+        // lands, the message the user can already see there is not on the
+        // server, and a merge would purge it as a row the server never sent.
+        const QString target = q.value(1).toString();
+        if (!target.isEmpty())
+            out.insert(target);
+    }
+    return out;
+}
+
+void MailStore::recordJournalFailure(qint64 id, const QString &error)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "UPDATE journal SET tries = tries + 1, last_error = ? WHERE id = ?"));
+    q.addBindValue(error);
+    q.addBindValue(id);
+    q.exec();
+}
+
+void MailStore::retireJournalOp(qint64 id, const QString &error)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    // The error is only overwritten when one is given: the cascade retires an
+    // op's dependents, and their own last failure (if any) is less use to the
+    // reader than the failure that actually stopped the chain.
+    // IFNULL, not a bare comparison: a default-constructed QString binds as
+    // SQL NULL, and "NULL = ''" is NULL rather than true — so the CASE fell
+    // through to the ELSE and erased the very reason it was meant to keep.
+    // The same trap the recipients column fell into in storeHeadersOn().
+    q.prepare(QStringLiteral("UPDATE journal SET retired = 1,"
+                             " last_error = CASE WHEN IFNULL(?, '') = ''"
+                             "  THEN last_error ELSE ? END"
+                             " WHERE id = ?"));
+    q.addBindValue(error);
+    q.addBindValue(error);
+    q.addBindValue(id);
+    q.exec();
+}
+
+void MailStore::dropJournalOp(qint64 id)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM journal WHERE id = ?"));
+    q.addBindValue(id);
+    q.exec();
+}
+
+void MailStore::reviveJournalOp(qint64 id)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    // queued_at is reset too, or an op retried after a week is dropped by the
+    // age cap before it gets its second chance.
+    q.prepare(QStringLiteral("UPDATE journal SET retired = 0, tries = 0, last_error = '',"
+                             " queued_at = ? WHERE id = ?"));
+    q.addBindValue(QDateTime::currentSecsSinceEpoch());
+    q.addBindValue(id);
+    q.exec();
+}
+
+void MailStore::clearRetiredJournalOps(const QString &account)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM journal WHERE account = ? AND retired = 1"));
+    q.addBindValue(account);
+    q.exec();
+}
+
+void MailStore::dropAccountJournal(const QString &account)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM journal WHERE account = ?"));
+    q.addBindValue(account);
+    q.exec();
+}
+
+QList<MailStore::JournalOp> MailStore::takeStaleJournalOps(const QString &account,
+                                                           qint64 cutoffSecs)
+{
+    const QList<JournalOp> stale = journalSelect(
+        QStringLiteral("WHERE account = ? AND retired = 0 AND queued_at < ? ORDER BY id DESC"),
+        {account, cutoffSecs});
+    // Newest first, because the caller rolls them back in that order — the same
+    // rule the retire cascade follows, and for the same reason.
+    for (const JournalOp &op : stale)
+        dropJournalOp(op.id);
+    return stale;
+}
+
+void MailStore::rewriteJournalFolder(const QString &account, qint64 afterId,
+                                     const QString &from, const QString &to, QChar separator)
+{
+    if (!m_db.isOpen() || from.isEmpty() || from == to)
+        return;
+    // The subtree moves with its root, exactly as MailStore::renameFolderOn
+    // re-keys the cached rows: "Work" -> "Archive/Work" also makes
+    // "Work/2025" into "Archive/Work/2025".
+    const QString prefix = from + separator;
+    QSqlQuery q(m_db);
+    // substr() rather than LIKE: a mailbox may legitimately be called
+    // "50% off" or "read_me", and LIKE would read those as wildcards.
+    q.prepare(QStringLiteral(
+        "UPDATE journal SET"
+        " folder = CASE WHEN folder = :from THEN :to"
+        "               WHEN substr(folder, 1, :plen) = :prefix"
+        "                    THEN :to || substr(folder, :cut)"
+        "               ELSE folder END,"
+        " target = CASE WHEN target = :from THEN :to"
+        "               WHEN substr(target, 1, :plen) = :prefix"
+        "                    THEN :to || substr(target, :cut)"
+        "               ELSE target END"
+        " WHERE account = :account AND id > :after AND retired = 0"
+        "  AND (folder = :from OR substr(folder, 1, :plen) = :prefix"
+        "       OR target = :from OR substr(target, 1, :plen) = :prefix)"));
+    q.bindValue(QStringLiteral(":from"), from);
+    q.bindValue(QStringLiteral(":to"), to);
+    q.bindValue(QStringLiteral(":prefix"), prefix);
+    q.bindValue(QStringLiteral(":plen"), prefix.size());
+    // 1-based, and one past the old root: substr() then yields the separator
+    // and everything under it, which is what the new root is glued to.
+    q.bindValue(QStringLiteral(":cut"), from.size() + 1);
+    q.bindValue(QStringLiteral(":account"), account);
+    q.bindValue(QStringLiteral(":after"), afterId);
+    if (!q.exec())
+        qWarning() << "mailstore: journal folder rewrite failed:" << q.lastError().text();
+}
+
+QList<MailStore::JournalOp> MailStore::rewriteJournalIds(const QString &account, qint64 afterId,
+                                                         const QString &from, const QString &to,
+                                                         const QHash<QString, MovedMessage> &moved)
+{
+    QList<JournalOp> unnameable;
+    if (!m_db.isOpen())
+        return unnameable;
+    // Read, rewrite in C++, write back. The alternative is a per-id string
+    // substitution in SQL over a \x1f-joined list, which cannot tell "12" from
+    // "123" without re-implementing the split — and the queue is a handful of
+    // rows, not a table.
+    const QList<JournalOp> later = journalSelect(
+        QStringLiteral("WHERE account = ? AND retired = 0 AND id > ? AND folder = ? ORDER BY id"),
+        {account, afterId, from});
+    for (const JournalOp &op : later) {
+        if (op.remoteIds.isEmpty())
+            continue; // a folder op: rewriteJournalFolder()'s business, not this
+        QStringList rewritten;
+        QStringList rewrittenUids;
+        bool lost = false;
+        for (const QString &id : op.remoteIds) {
+            const auto it = moved.constFind(id);
+            if (it == moved.cend()) {
+                // The move succeeded but the server did not say under what name
+                // the message now lives (no UIDPLUS COPYUID). It is still there
+                // and the user's change stands; this later op simply has
+                // nothing left to address.
+                lost = true;
+                break;
+            }
+            rewritten.append(it->remoteId);
+            rewrittenUids.append(QString::number(it->uid));
+        }
+        if (lost) {
+            unnameable.append(op);
+            continue;
+        }
+        QSqlQuery q(m_db);
+        q.prepare(QStringLiteral(
+            "UPDATE journal SET folder = ?, remote_ids = ?, uids = ? WHERE id = ?"));
+        q.addBindValue(to);
+        q.addBindValue(joinList(rewritten));
+        q.addBindValue(joinList(rewrittenUids));
+        q.addBindValue(op.id);
+        q.exec();
+    }
+    return unnameable;
+}
+
+// --- the outbox --------------------------------------------------------------
+//
+// Same division of labour as the journal above: the rows and their state
+// machine live here, what a row *means* — the sendMessage() call, the Sent
+// copy, the breadcrumbs — is MailClient's, the only thing holding a backend.
+
+namespace
+{
+/// Column order shared by every outbox read and outboxRowOf().
+constexpr const char *kOutboxColumns =
+    "id, account, wire, envelope, sender, subject, created, attempts,"
+    " last_error, next_try, state, encrypted, has_attachments";
+} // namespace
+
+MailStore::OutboxMessage MailStore::outboxRowOf(const QSqlQuery &q)
+{
+    OutboxMessage msg;
+    msg.id = q.value(0).toLongLong();
+    msg.account = q.value(1).toString();
+    msg.wire = q.value(2).toByteArray();
+    msg.envelope = splitList(q.value(3).toString());
+    msg.sender = q.value(4).toString();
+    msg.subject = q.value(5).toString();
+    msg.created = q.value(6).toLongLong();
+    msg.attempts = q.value(7).toInt();
+    msg.lastError = q.value(8).toString();
+    msg.nextTry = q.value(9).toLongLong();
+    msg.state = q.value(10).toInt();
+    msg.encrypted = q.value(11).toInt() != 0;
+    msg.hasAttachments = q.value(12).toInt() != 0;
+    return msg;
+}
+
+QList<MailStore::OutboxMessage> MailStore::outboxSelect(const QString &where,
+                                                        const QVariantList &binds) const
+{
+    QList<OutboxMessage> out;
+    if (!m_db.isOpen())
+        return out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT %1 FROM outbox %2")
+                  .arg(QLatin1String(kOutboxColumns), where));
+    for (const QVariant &b : binds)
+        q.addBindValue(b);
+    if (!q.exec())
+        return out;
+    while (q.next())
+        out.append(outboxRowOf(q));
+    return out;
+}
+
+qint64 MailStore::enqueueOutbox(OutboxMessage msg)
+{
+    if (!m_db.isOpen())
+        return 0;
+    if (msg.account.isEmpty())
+        msg.account = m_accountKey;
+    if (msg.created <= 0)
+        msg.created = QDateTime::currentSecsSinceEpoch();
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "INSERT INTO outbox (account, wire, envelope, sender, subject, created,"
+        " next_try, encrypted, has_attachments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+    q.addBindValue(msg.account);
+    q.addBindValue(msg.wire);
+    q.addBindValue(joinList(msg.envelope));
+    q.addBindValue(msg.sender);
+    q.addBindValue(msg.subject);
+    q.addBindValue(msg.created);
+    q.addBindValue(msg.nextTry);
+    q.addBindValue(msg.encrypted ? 1 : 0);
+    q.addBindValue(msg.hasAttachments ? 1 : 0);
+    if (!q.exec()) {
+        qWarning() << "mailstore: outbox enqueue failed:" << q.lastError().text();
+        return 0;
+    }
+    return q.lastInsertId().toLongLong();
+}
+
+QList<MailStore::OutboxMessage> MailStore::outboxMessages(const QString &account) const
+{
+    return outboxSelect(QStringLiteral("WHERE account = ? ORDER BY id"), {account});
+}
+
+MailStore::OutboxMessage MailStore::outboxMessage(qint64 id) const
+{
+    const auto rows = outboxSelect(QStringLiteral("WHERE id = ?"), {id});
+    return rows.isEmpty() ? OutboxMessage() : rows.first();
+}
+
+MailStore::OutboxMessage MailStore::nextOutboxMessage(const QString &account,
+                                                      qint64 nowSecs) const
+{
+    const auto rows = outboxSelect(
+        QStringLiteral("WHERE account = ? AND state = 0 AND next_try <= ?"
+                       " ORDER BY id LIMIT 1"),
+        {account, nowSecs});
+    return rows.isEmpty() ? OutboxMessage() : rows.first();
+}
+
+int MailStore::outboxCount(const QString &account) const
+{
+    if (!m_db.isOpen())
+        return 0;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT COUNT(*) FROM outbox WHERE account = ?"));
+    q.addBindValue(account);
+    if (!q.exec() || !q.next())
+        return 0;
+    return q.value(0).toInt();
+}
+
+qint64 MailStore::outboxNextTry(const QString &account) const
+{
+    if (!m_db.isOpen())
+        return 0;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT MIN(next_try) FROM outbox WHERE account = ? AND state = 0"));
+    q.addBindValue(account);
+    if (!q.exec() || !q.next() || q.value(0).isNull())
+        return 0;
+    return q.value(0).toLongLong();
+}
+
+void MailStore::markOutboxSending(qint64 id)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE outbox SET state = 1 WHERE id = ?"));
+    q.addBindValue(id);
+    q.exec();
+}
+
+void MailStore::recordOutboxFailure(qint64 id, const QString &error, qint64 nextTry,
+                                    bool permanent)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "UPDATE outbox SET state = ?, attempts = attempts + 1, last_error = ?,"
+        " next_try = ? WHERE id = ?"));
+    q.addBindValue(permanent ? int(Failed) : int(Queued));
+    q.addBindValue(error);
+    q.addBindValue(nextTry);
+    q.addBindValue(id);
+    q.exec();
+}
+
+void MailStore::deferOutboxMessage(qint64 id)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE outbox SET state = 0 WHERE id = ?"));
+    q.addBindValue(id);
+    q.exec();
+}
+
+void MailStore::dropOutboxMessage(qint64 id)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM outbox WHERE id = ?"));
+    q.addBindValue(id);
+    q.exec();
+}
+
+void MailStore::reviveOutboxMessage(qint64 id)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "UPDATE outbox SET state = 0, attempts = 0, last_error = '', next_try = 0"
+        " WHERE id = ?"));
+    q.addBindValue(id);
+    q.exec();
+}
+
+int MailStore::recoverStaleOutbox(const QString &account, const QString &note)
+{
+    if (!m_db.isOpen())
+        return 0;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "UPDATE outbox SET state = 2, last_error = ? WHERE account = ? AND state = 1"));
+    q.addBindValue(note);
+    q.addBindValue(account);
+    if (!q.exec())
+        return 0;
+    return q.numRowsAffected();
+}
+
+void MailStore::dropAccountOutbox(const QString &account)
+{
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM outbox WHERE account = ?"));
+    q.addBindValue(account);
+    q.exec();
+}
+
+QStringList MailStore::subjectsOf(const QString &folder, const QList<qint64> &uids, int limit)
+{
+    QStringList out;
+    if (!m_db.isOpen() || uids.isEmpty())
+        return out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT subject FROM messages WHERE folder = ? AND uid = ?"));
+    const QString key = scoped(folder);
+    for (qint64 uid : uids) {
+        if (out.size() >= limit)
+            break;
+        q.addBindValue(key);
+        q.addBindValue(uid);
+        out.append((q.exec() && q.next()) ? q.value(0).toString() : QString());
+    }
+    return out;
+}
+
+// --- soft delete ------------------------------------------------------------
+
+namespace
+{
+/// Both directions of the flag are the same statement.
+void setSoftDeleted(QSqlDatabase &db, const QString &scopedFolder, const QList<qint64> &uids,
+                    bool deleted)
+{
+    if (!db.isOpen() || uids.isEmpty())
+        return;
+    db.transaction();
+    QSqlQuery q(db);
+    q.prepare(QStringLiteral("UPDATE messages SET soft_deleted = ?"
+                             " WHERE folder = ? AND uid = ?"));
+    for (qint64 uid : uids) {
+        q.addBindValue(deleted ? 1 : 0);
+        q.addBindValue(scopedFolder);
+        q.addBindValue(uid);
+        q.exec();
+    }
+    db.commit();
+}
+} // namespace
+
+void MailStore::softDeleteMessages(const QString &folder, const QList<qint64> &uids)
+{
+    setSoftDeleted(m_db, scoped(folder), uids, true);
+}
+
+void MailStore::restoreSoftDeleted(const QString &folder, const QList<qint64> &uids)
+{
+    setSoftDeleted(m_db, scoped(folder), uids, false);
+}
+
+QHash<QString, QList<qint64>> MailStore::softDeletedIn(const QString &account) const
+{
+    QHash<QString, QList<qint64>> out;
+    if (!m_db.isOpen() || account.isEmpty())
+        return out;
+    // Half-open range over "account\x1f<folder>", the same trick
+    // unreadCountsOn() uses — a LIKE could not seek the index.
+    const QString lo = account + QChar(0x1f);
+    QString hi = lo;
+    hi[hi.size() - 1] = QChar(0x20);
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT folder, uid FROM messages"
+                             " WHERE soft_deleted = 1 AND folder >= ? AND folder < ?"));
+    q.addBindValue(lo);
+    q.addBindValue(hi);
+    if (!q.exec())
+        return out;
+    while (q.next())
+        out[q.value(0).toString().section(QChar(0x1f), 1)].append(q.value(1).toLongLong());
+    return out;
 }

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailove VERSION 2.8 LANGUAGES CXX)
+project(mailove VERSION 3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -52,6 +52,10 @@ qt_add_executable(mailove
     src/main.cpp
     src/advancedconfig.cpp
     src/advancedconfig.h
+    src/diagnosticslog.cpp
+    src/diagnosticslog.h
+    src/settingsbackup.cpp
+    src/settingsbackup.h
     src/mailclient.cpp
     src/mailclient.h
     src/accountstore.cpp
@@ -119,6 +123,7 @@ set_target_properties(mailove PROPERTIES
 set_source_files_properties(src/qml/Main.qml PROPERTIES QT_RESOURCE_ALIAS Main.qml)
 set_source_files_properties(src/qml/AccountSheet.qml PROPERTIES QT_RESOURCE_ALIAS AccountSheet.qml)
 set_source_files_properties(src/qml/AdvancedSheet.qml PROPERTIES QT_RESOURCE_ALIAS AdvancedSheet.qml)
+set_source_files_properties(src/qml/LogSheet.qml PROPERTIES QT_RESOURCE_ALIAS LogSheet.qml)
 set_source_files_properties(src/qml/MessageViewer.qml PROPERTIES QT_RESOURCE_ALIAS MessageViewer.qml)
 set_source_files_properties(src/qml/ComposeSheet.qml PROPERTIES QT_RESOURCE_ALIAS ComposeSheet.qml)
 set_source_files_properties(src/qml/ComposeWindow.qml PROPERTIES QT_RESOURCE_ALIAS ComposeWindow.qml)
@@ -138,6 +143,7 @@ qt_add_qml_module(mailove
         src/qml/Main.qml
         src/qml/AccountSheet.qml
         src/qml/AdvancedSheet.qml
+        src/qml/LogSheet.qml
         src/qml/KeyManagerSheet.qml
         src/qml/NewKeyDialog.qml
         src/qml/MessageViewer.qml
@@ -393,6 +399,50 @@ qt_add_executable(storetest tests/storetest.cpp
 target_include_directories(storetest PRIVATE src)
 target_link_libraries(storetest PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql PkgConfig::ZSTD)
 
+# The deferred cache migrations, against a legacy-shaped throwaway database:
+# what is reported pending, what each step does to the rows, that they are safe
+# to re-run, and that a cancelled one resumes. Exit 0 = every check passed.
+qt_add_executable(migrationtest tests/migrationtest.cpp
+    src/mailstore.cpp src/mailstore.h
+    src/messagelistmodel.cpp src/messagelistmodel.h
+    src/attachmentstore.cpp src/attachmentstore.h
+    src/spamheuristics.cpp src/spamheuristics.h
+    src/publicsuffixlist.cpp src/publicsuffixlist.h
+    src/advancedconfig.cpp src/advancedconfig.h)
+target_include_directories(migrationtest PRIVATE src)
+target_link_libraries(migrationtest PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql PkgConfig::ZSTD)
+
+# The journal and soft delete — replay order, failure bookkeeping, rewriting
+# after a rename or a move, the age cap, and that a provisionally deleted row
+# is invisible to every read that shows or counts mail. Exit 0 = every check
+# passed.
+qt_add_executable(journaltest tests/journaltest.cpp
+    src/mailstore.cpp src/mailstore.h
+    src/messagelistmodel.cpp src/messagelistmodel.h
+    src/attachmentstore.cpp src/attachmentstore.h
+    src/spamheuristics.cpp src/spamheuristics.h
+    src/publicsuffixlist.cpp src/publicsuffixlist.h
+    src/advancedconfig.cpp src/advancedconfig.h)
+target_include_directories(journaltest PRIVATE src)
+target_link_libraries(journaltest PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql PkgConfig::ZSTD)
+
+# The outbox — that a pressed Send survives as byte-exact wire in the queue,
+# rows go out in order, the failure state machine (transient backoff vs.
+# permanent rejection), the undo-send hold, startup recovery of a row a killed
+# process left mid-send, and account scoping. Exit 0 = every check passed.
+qt_add_executable(outboxtest tests/outboxtest.cpp
+    src/mailstore.cpp src/mailstore.h
+    src/messagelistmodel.cpp src/messagelistmodel.h
+    src/attachmentstore.cpp src/attachmentstore.h
+    src/spamheuristics.cpp src/spamheuristics.h
+    src/publicsuffixlist.cpp src/publicsuffixlist.h
+    src/advancedconfig.cpp src/advancedconfig.h)
+target_include_directories(outboxtest PRIVATE src)
+target_link_libraries(outboxtest PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql PkgConfig::ZSTD)
+
 # Checks JMAP session discovery (RFC 8620 §2) against recorded session objects,
 # with no server involved — see the file's own comment for why that is the
 # right boundary. Exit 0 = every check passed.
@@ -436,7 +486,8 @@ target_compile_definitions(jmapbackendtest PRIVATE
 target_link_libraries(jmapbackendtest PRIVATE Qt6::Core Qt6::Network KPim6::Mime)
 
 set(_mailove_tests attachmenttest viewertest dkimtest dkimchecktool rawfidelitytest
-                 fidelitytool pgpmimetest securewipetest spamtool storetest
+                 fidelitytool pgpmimetest securewipetest spamtool storetest migrationtest
+                 journaltest outboxtest diagnosticslogtest settingsbackuptest
                  jmapsessiontest jmaprequesttest jmapbackendtest)
 
 # Checks what SecureWipe guarantees, and pins the one thing it deliberately
@@ -485,6 +536,23 @@ qt_add_executable(spamheuristicstest tests/spamheuristicstest.cpp
 target_include_directories(spamheuristicstest PRIVATE src)
 target_link_libraries(spamheuristicstest PRIVATE Qt6::Core Qt6::Network)
 set_target_properties(spamheuristicstest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)
+
+# The log sink's two bounds — the file recycling in place at 5000 lines, the
+# model evicting at the same — plus repeat collapsing, the severity filter and
+# redaction. Writes into a throwaway XDG_STATE_HOME.
+qt_add_executable(diagnosticslogtest tests/diagnosticslogtest.cpp
+    src/diagnosticslog.cpp src/diagnosticslog.h)
+target_include_directories(diagnosticslogtest PRIVATE src)
+target_link_libraries(diagnosticslogtest PRIVATE Qt6::Core Qt6::Gui)
+set_target_properties(diagnosticslogtest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)
+
+# The settings backup: taken from before the change, written only when the
+# session changed something, and never overwritten by a session that did not.
+qt_add_executable(settingsbackuptest tests/settingsbackuptest.cpp
+    src/settingsbackup.cpp src/settingsbackup.h)
+target_include_directories(settingsbackuptest PRIVATE src)
+target_link_libraries(settingsbackuptest PRIVATE Qt6::Core)
+set_target_properties(settingsbackuptest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)
 
 qt_add_executable(securewipetest tests/securewipetest.cpp
     src/securewipe.cpp src/securewipe.h)

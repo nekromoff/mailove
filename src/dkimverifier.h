@@ -38,10 +38,11 @@ struct ArcResult {
         None,      ///< no ARC headers at all — the ordinary case
         Pass,      ///< every seal verified, and so did the newest signature
         /// Every seal verified, but the newest ARC-Message-Signature did not
-        /// match our copy of the body. Kept apart from Fail for the same reason
-        /// as DkimResult::BodyMismatch: today that usually says more about our
-        /// stored octets than about the message. The seals cover only the ARC
-        /// headers, so they stay meaningful when the body hash does not.
+        /// match the body. Kept apart from Fail for the same reason as
+        /// DkimResult::BodyMismatch: the seals held, so the chain is intact —
+        /// what changed is the body, after the last sealer saw it. The seals
+        /// cover only the ARC headers, so they stay meaningful when the body
+        /// hash does not.
         SealsOnly,
         Fail,      ///< a seal did not verify, or a hop recorded cv=fail
         TempError, ///< DNS lookup failed; retrying later may succeed
@@ -68,15 +69,14 @@ struct DkimResult {
         /// would claim we checked something we refused to check. The honest
         /// answer is that this signature cannot be evaluated.
         Unsupported,
-        /// The body hash did not match. Deliberately NOT Fail: this happens
-        /// whenever our own copy of the message is not byte-identical to what
-        /// arrived, and measured against real cached mail that is currently
-        /// the common case — for most messages our body hash matches neither
-        /// the sender's bh= nor the independent one Gmail recorded in
-        /// ARC-Message-Signature. Until the fetch path preserves the original
-        /// octets (see doc/roadmap.md) a mismatch cannot be distinguished from
-        /// tampering, and announcing "signature invalid" on good mail is the
-        /// same class of error as trusting a forged Authentication-Results.
+        /// The body hash did not match. Deliberately NOT Fail: the key was
+        /// fetched and the header hash checked out — what differs is the body,
+        /// and a changed body is the everyday work of mailing lists and
+        /// forwarders appending footers or re-encoding parts. Since 2.9 the
+        /// fetch path preserves the original octets (doc/roadmap.md), so on
+        /// freshly fetched mail this really means "not the body that was
+        /// signed" — but announcing "signature invalid" for it would still cry
+        /// wolf on most list mail, which is ARC's case to explain, not Fail's.
         BodyMismatch,
     };
 
@@ -96,6 +96,26 @@ struct DkimResult {
 
     bool trustworthy() const { return status == Pass && aligned && !bodyTruncated; }
 };
+
+/**
+ * Which of two verdicts on the same message deserves to be the one shown.
+ *
+ * A message may carry several signatures — the author's plus a mailing list's
+ * or an ESP's — and only one verdict reaches the badge. An aligned Pass ends
+ * the search before this is ever consulted; everything below it needs ordering,
+ * because "whichever signature happened to be last in the header block" is not
+ * a judgement about the message.
+ *
+ * The order runs from most evidence to least, and it deliberately does not put
+ * the harshest verdict first. Fail is the one accusation the badge makes, and
+ * on a message a list rewrote it is also the ordinary outcome for the author's
+ * signature — so a valid signature from someone else, or a body hash that did
+ * not match, both say more and accuse less. Nothing here is hidden: every
+ * signature's fate is in the tooltip.
+ *
+ * Exposed for the tests, which check the orderings that used to come out wrong.
+ */
+[[nodiscard]] bool moreInformative(const DkimResult &candidate, const DkimResult &current);
 
 /**
  * Canonicalization primitives (RFC 6376 §3.4).

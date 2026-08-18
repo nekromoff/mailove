@@ -409,8 +409,8 @@ bool DkimVerifier::prepare(const QByteArray &head, const QByteArray &body, const
         QCryptographicHash::hash(canonBody, QCryptographicHash::Sha256).toBase64();
     if (bodyHash != stripWsp(tagValue(sig.tags, "bh"))) {
         out->status = DkimResult::BodyMismatch;
-        out->detail = QObject::tr("body hash does not match — the message was changed in "
-                                  "transit, or our cached copy is not byte-identical to it");
+        out->detail = QObject::tr("the message body changed after the sender signed it — "
+                                  "mailing lists and forwarders commonly do this");
         return false;
     }
 
@@ -760,6 +760,42 @@ ArcResult DkimVerifier::verifyArcChain(const QByteArray &head, const QByteArray 
     return out;
 }
 
+bool moreInformative(const DkimResult &candidate, const DkimResult &current)
+{
+    // Rank, best first. The reasoning is in the header; what matters here is
+    // that a signature we could actually evaluate outranks one we could not,
+    // and that Fail sits below both kinds of evaluated outcome rather than
+    // above them.
+    const auto rank = [](const DkimResult &r) {
+        switch (r.status) {
+        case DkimResult::Pass:
+            return 0; // valid, just not aligned — an aligned Pass never gets here
+        case DkimResult::BodyMismatch:
+            return 1; // key and headers checked out; our copy of the body did not
+        case DkimResult::Fail:
+            return 2; // key fetched, signature does not match it
+        case DkimResult::Unsupported:
+            return 3; // could be computed, deliberately was not
+        case DkimResult::PermError:
+            return 4; // nothing to evaluate: no key, malformed signature
+        case DkimResult::TempError:
+            return 5; // says nothing at all about the message; retry may
+        case DkimResult::None:
+            return 6; // not a per-signature outcome; here for completeness
+        }
+        return 6;
+    };
+    const int a = rank(candidate);
+    const int b = rank(current);
+    if (a != b)
+        return a < b;
+    // Same verdict twice: the aligned one describes the sender's own signature,
+    // which is the one the reader is asking about. Otherwise keep what we have,
+    // so the reported signature is the first in header order rather than
+    // whichever the loop saw last.
+    return candidate.aligned && !current.aligned;
+}
+
 void DkimVerifier::verify(quint64 requestId, const QByteArray &rawMessageCrlf,
                           const QString &fromDomain)
 {
@@ -807,8 +843,18 @@ void DkimVerifier::verify(quint64 requestId, const QByteArray &rawMessageCrlf,
     }
 
     // Try each signature; the first Pass that is also aligned wins outright.
+    // Anything short of that is kept only while nothing more informative turns
+    // up — see moreInformative(). Before it existed the last signature in the
+    // header block won by default, so an aligned failure could be replaced by
+    // some forwarder's rotated key and never reach the reader.
     DkimResult best;
-    best.status = DkimResult::PermError;
+    bool haveBest = false;
+    const auto keep = [&best, &haveBest](const DkimResult &r) {
+        if (!haveBest || moreInformative(r, best)) {
+            best = r;
+            haveBest = true;
+        }
+    };
     for (const Signature &sig : signatures) {
         DkimResult r;
         r.domain = QString::fromLatin1(tagValue(sig.tags, "d")).toLower();
@@ -817,13 +863,13 @@ void DkimVerifier::verify(quint64 requestId, const QByteArray &rawMessageCrlf,
         if (r.domain.isEmpty() || r.selector.isEmpty()) {
             r.status = DkimResult::PermError;
             r.detail = tr("signature is missing its domain or selector");
-            best = r;
+            keep(r);
             continue;
         }
 
         QByteArray signedData;
         if (!prepare(head, body, sig, &signedData, &r)) {
-            best = r;
+            keep(r);
             continue;
         }
 
@@ -834,7 +880,7 @@ void DkimVerifier::verify(quint64 requestId, const QByteArray &rawMessageCrlf,
             r.status = tempError ? DkimResult::TempError : DkimResult::PermError;
             r.detail = tempError ? tr("could not reach DNS to fetch the signing key")
                                  : tr("no public key published for %1").arg(r.selector);
-            best = r;
+            keep(r);
             continue;
         }
 
@@ -846,14 +892,14 @@ void DkimVerifier::verify(quint64 requestId, const QByteArray &rawMessageCrlf,
         if (keyData.isEmpty()) {
             r.status = DkimResult::PermError;
             r.detail = tr("the signing key has been revoked");
-            best = r;
+            keep(r);
             continue;
         }
         PkeyPtr key = loadPublicKey(QByteArray::fromBase64(keyData), keyType);
         if (!key) {
             r.status = DkimResult::PermError;
             r.detail = tr("published key is unusable");
-            best = r;
+            keep(r);
             continue;
         }
 
@@ -874,12 +920,12 @@ void DkimVerifier::verify(quint64 requestId, const QByteArray &rawMessageCrlf,
                 Q_EMIT finished(requestId, r);
                 return;
             }
-            best = r;
+            keep(r);
             continue;
         }
         r.status = DkimResult::Fail;
         r.detail = tr("signature does not match the published key");
-        best = r;
+        keep(r);
     }
 
     // Only now, having failed to produce a signature the reader can rely on:

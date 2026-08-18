@@ -375,25 +375,66 @@ QHash<qint64, QByteArray> fetchViaKimap(const Account &a, const QString &passwor
     for (const qint64 uid : uids)
         set.add(KIMAP::ImapInterval(uid, uid));
 
-    KIMAP::FetchJob::FetchScope scope;
-    scope.mode = KIMAP::FetchJob::FetchScope::Full;
+    // Exactly ImapBackend::startBodyFetchJob(): the FullHeaders + Content/TEXT
+    // pair, joined and frozen the same way, so what this measures is the
+    // message mailove would cache and verify — not some other KIMAP mode.
+    QHash<qint64, QByteArray> heads, texts;
 
-    auto *fetch = new KIMAP::FetchJob(&session);
-    fetch->setSequenceSet(set);
-    fetch->setUidBased(true);
-    fetch->setScope(scope);
-    QObject::connect(fetch, &KIMAP::FetchJob::messagesAvailable, &loop,
-                     [&out](const QMap<qint64, KIMAP::Message> &messages) {
+    auto *headers = new KIMAP::FetchJob(&session);
+    headers->setSequenceSet(set);
+    headers->setUidBased(true);
+    KIMAP::FetchJob::FetchScope headScope;
+    headScope.mode = KIMAP::FetchJob::FetchScope::FullHeaders;
+    headers->setScope(headScope);
+    QObject::connect(headers, &KIMAP::FetchJob::messagesAvailable, &loop,
+                     [&heads](const QMap<qint64, KIMAP::Message> &messages) {
                          for (const KIMAP::Message &m : messages) {
-                             if (!m.message)
-                                 continue;
-                             // Exactly what storeFetchedBody() does.
-                             if (m.message->contents().isEmpty())
-                                 m.message->parse();
-                             out.insert(m.uid, m.message->encodedContent());
+                             fprintf(stderr, "  [headers] uid %lld msg=%d head=%lld parts={%s}\n",
+                                     m.uid, m.message ? 1 : 0,
+                                     m.message ? (long long)m.message->head().size() : -1,
+                                     m.parts.keys().join(",").constData());
+                             if (m.message && !m.message->head().isEmpty())
+                                 heads.insert(m.uid, m.message->head());
                          }
                      });
-    run(fetch);
+    run(headers);
+
+    auto *content = new KIMAP::FetchJob(&session);
+    content->setSequenceSet(set);
+    content->setUidBased(true);
+    KIMAP::FetchJob::FetchScope textScope;
+    textScope.mode = KIMAP::FetchJob::FetchScope::Content;
+    textScope.parts = {QByteArrayLiteral("TEXT")};
+    content->setScope(textScope);
+    QObject::connect(content, &KIMAP::FetchJob::messagesAvailable, &loop,
+                     [&texts](const QMap<qint64, KIMAP::Message> &messages) {
+                         for (const KIMAP::Message &m : messages) {
+                             const auto part = m.parts.value(QByteArrayLiteral("TEXT"));
+                             fprintf(stderr, "  [content] uid %lld msg=%d parts={%s} text=%lld\n",
+                                     m.uid, m.message ? 1 : 0,
+                                     m.parts.keys().join(",").constData(),
+                                     part ? (long long)part->body().size() : -1);
+                             if (part)
+                                 texts.insert(m.uid, part->body());
+                         }
+                     });
+    run(content);
+
+    for (auto it = heads.cbegin(); it != heads.cend(); ++it) {
+        if (!texts.contains(it.key())) {
+            fprintf(stderr, "  uid %lld: head only, no TEXT\n", it.key());
+            continue;
+        }
+        QByteArray joined = it.value();
+        if (!(joined.endsWith("\r\n\r\n") || joined.endsWith("\n\n")))
+            joined += joined.endsWith("\r\n") ? "\r\n" : "\n";
+        joined += texts.value(it.key());
+        KMime::Message msg;
+        msg.setContent(KMime::CRLFtoLF(joined));
+        msg.setFrozen(true);
+        msg.parse();
+        out.insert(it.key(), msg.encodedContent());
+    }
     return out;
 }
 

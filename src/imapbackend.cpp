@@ -7,8 +7,16 @@
 
 #include <QDebug>
 #include <QDateTime>
+#include <QLoggingCategory>
 #include <QHash>
 #include <QTimer>
+
+#include <kmime/content.h>
+#include <kmime/message.h>
+#include <kmime/util.h>
+
+/// Defined in mailclient.cpp — the verbose trail, off unless asked for.
+Q_DECLARE_LOGGING_CATEGORY(logTrace)
 
 #include <kimap/capabilitiesjob.h>
 #include <kimap/appendjob.h>
@@ -43,6 +51,105 @@ bool isTooManyConnections(const QString &err)
         || up.contains(QStringLiteral("SIMULTANEOUS CONNECTIONS"));
 }
 
+/// The two halves of a message as the server sent them, before KMime has been
+/// allowed near either.
+///
+/// BODY.PEEK[] is the obvious way to ask for a message and the wrong one:
+/// KIMAP answers it with Message::setContent() followed by parse(), and a
+/// parsed KMime tree can no longer reproduce its own source. Where a nested
+/// multipart's closing delimiter sits tight against the parent boundary — no
+/// blank line between `--INNER--` and `--OUTER`, which is what Gmail emits for
+/// a reply with attachments — re-assembly inserts a blank line the wire did
+/// not have ([KDE bug 523826](https://bugs.kde.org/show_bug.cgi?id=523826)).
+/// The body hash then fails and mailove calls a perfectly good message
+/// "modified after signing".
+///
+/// The section fetches take a different path through KIMAP: BODY[HEADER]
+/// reaches KMime as setHead() and BODY[TEXT] as setBody(), neither of which
+/// re-encodes anything, and a Content with no head of its own parses as
+/// text/plain so its body is never split. Both halves come back octet-exact,
+/// and joining them is the message as it travelled.
+struct RawMessage {
+    QByteArray head; ///< BODY[HEADER], including its terminating blank line
+    QByteArray body; ///< BODY[TEXT]
+    bool haveHead = false;
+    bool haveBody = false;
+    /// Both halves arrived. They may come in one delivery or several.
+    bool complete() const { return haveHead && haveBody; }
+};
+
+/// Takes whichever halves this delivery carried. First one wins: a server that
+/// repeats a section in a later untagged response is describing the same
+/// octets, and re-taking them would only risk a partial overwrite.
+///
+/// The two halves arrive through different doors, from different jobs. The
+/// head comes from the FullHeaders job as m.message->head() — that mode is one
+/// of the three whose responses assign msg.message at all; asking for HEADER
+/// as a Content part instead gets parsed into a message KIMAP never delivers.
+/// The body comes from the Content job's parts map, where TEXT lands via
+/// setBody(). The parts fallback for HEADER costs nothing and keeps this
+/// working if KIMAP ever routes it there.
+void mergeRawParts(const KIMAP::Message &m, RawMessage &raw)
+{
+    if (!raw.haveHead) {
+        if (m.message && !m.message->head().isEmpty()) {
+            raw.head = m.message->head();
+            raw.haveHead = true;
+        } else if (const auto part = m.parts.value(QByteArrayLiteral("HEADER"))) {
+            raw.head = part->head();
+            raw.haveHead = true;
+        }
+    }
+    if (!raw.haveBody) {
+        if (const auto part = m.parts.value(QByteArrayLiteral("TEXT"))) {
+            raw.body = part->body();
+            raw.haveBody = true;
+        }
+    }
+}
+
+/// Header section and body section back into one RFC 5322 message.
+///
+/// RFC 9051 §7.5.2 says BODY[HEADER] ends with the blank line that closes the
+/// header, so the two normally concatenate untouched. The fallbacks are for
+/// servers that trim it: the separator is rebuilt in whatever line ending the
+/// header itself used, because guessing CRLF for an LF message would put a
+/// stray byte into the very octets this whole path exists to preserve.
+QByteArray joinRawWire(const QByteArray &head, const QByteArray &body)
+{
+    if (head.isEmpty())
+        return body;
+    if (head.endsWith("\r\n\r\n") || head.endsWith("\n\n"))
+        return head + body;
+    if (head.endsWith("\r\n"))
+        return head + "\r\n" + body;
+    if (head.endsWith('\n'))
+        return head + "\n" + body;
+    return head + "\r\n\r\n" + body;
+}
+
+/// Parses the joined wire into the message the rest of mailove reads.
+///
+/// setFrozen() before parse() is the load-bearing line. Frozen, KMime answers
+/// encodedContent() with the octets it was given instead of re-assembling them
+/// from the parsed tree, which is what keeps ctx->m_raw — and so the DKIM body
+/// hash, and the OpenPGP signed part, which is frozen along with its parent —
+/// equal to what the sender signed. It must come before parse(): afterwards
+/// the original body is already gone and freezing then truncates the message
+/// to its headers. The message is consequently immutable — assemble() will not
+/// write changes back — which is correct for everything on the read path and
+/// the reason composing builds its own messages.
+std::shared_ptr<KMime::Message> buildMessage(const RawMessage &raw)
+{
+    auto message = std::make_shared<KMime::Message>();
+    // CRLFtoLF because setContent() takes LF: handed CRLF, the head parses but
+    // no boundary line ever matches and the message comes out with no parts.
+    message->setContent(KMime::CRLFtoLF(joinRawWire(raw.head, raw.body)));
+    message->setFrozen(true);
+    message->parse();
+    return message;
+}
+
 /// Mirrors MailClient::Security, which is the enum the account settings and
 /// the QML combo box are written in. Not shared as a type because that enum is
 /// registered with QML and moving it would change the singleton's API for no
@@ -60,6 +167,10 @@ ImapBackend::ImapBackend(QObject *parent)
         if (m_connected && m_session)
             (new KIMAP::CapabilitiesJob(m_session))->start();
     });
+    // One retry, owned here rather than posted as a loose singleShot each
+    // time — see m_pushRetry.
+    m_pushRetry.setSingleShot(true);
+    connect(&m_pushRetry, &QTimer::timeout, this, [this] { startPush(m_pushFolder); });
 }
 
 ImapBackend::~ImapBackend()
@@ -114,8 +225,11 @@ void ImapBackend::closeSessions()
     stopPush();
     m_syncReady = false;
     m_syncFolder.clear();
+    m_syncQueuedFolder.clear();
     m_selectedFolder.clear();
     m_selectedReadWrite = false;
+    m_queuedFolder.clear();
+    m_queuedReadWrite = false;
     m_messageCounts.clear();
     for (const auto &conn : std::as_const(m_bodyPool)) {
         if (conn->session)
@@ -213,6 +327,7 @@ void ImapBackend::startSyncSession()
         // its backoff instead of reconnecting and hammering at full speed.
         m_syncReady = false;
         m_syncFolder.clear();
+    m_syncQueuedFolder.clear();
         if (m_syncSession) {
             m_syncSession->deleteLater();
             m_syncSession.clear();
@@ -241,23 +356,39 @@ void ImapBackend::withSyncSession(const QString &folder,
         fn(nullptr);
         return;
     }
-    if (m_syncFolder == folder) {
-        fn(m_syncSession.data());
-        return;
+    // The queued folder, not the selected one — and the caller's job is queued
+    // immediately behind the SELECT rather than when it completes.
+    //
+    // Waiting cost this connection the same bug the write path had. Two reads
+    // of different folders overlap constantly here (the folder pass, the
+    // background poll, an unread reconcile): each saw the *other* folder still
+    // selected, each queued its own SELECT, and both then queued their FETCH
+    // or SEARCH when their SELECT came back — by which time the other SELECT
+    // was already ahead of it. Both commands then ran against whichever
+    // mailbox was selected last. It was two searches for INBOX and Junk coming
+    // back with an identical answer that made it visible; a header fetch
+    // reading the wrong folder is the same fault and says nothing at all.
+    if (m_syncQueuedFolder != folder) {
+        auto *select = new KIMAP::SelectJob(m_syncSession);
+        select->setMailBox(folder);
+        select->setOpenReadOnly(true);
+        m_syncQueuedFolder = folder;
+        connect(select, &KJob::result, this, [this, folder](KJob *job) {
+            if (job->error() || !m_syncSession) {
+                // Nothing reliable is selected now; make the next caller ask
+                // for its own SELECT rather than trust this one.
+                if (m_syncQueuedFolder == folder)
+                    m_syncQueuedFolder.clear();
+                m_syncFolder.clear();
+    m_syncQueuedFolder.clear();
+                return;
+            }
+            m_syncFolder = folder;
+            m_messageCounts[folder] = static_cast<KIMAP::SelectJob *>(job)->messageCount();
+        });
+        select->start();
     }
-    auto *select = new KIMAP::SelectJob(m_syncSession);
-    select->setMailBox(folder);
-    select->setOpenReadOnly(true);
-    connect(select, &KJob::result, this, [this, folder, fn](KJob *job) {
-        if (job->error() || !m_syncSession) {
-            fn(nullptr);
-            return;
-        }
-        m_syncFolder = folder;
-        m_messageCounts[folder] = static_cast<KIMAP::SelectJob *>(job)->messageCount();
-        fn(m_syncSession.data());
-    });
-    select->start();
+    fn(m_syncSession.data());
 }
 
 bool ImapBackend::pushActive() const
@@ -267,11 +398,31 @@ bool ImapBackend::pushActive() const
 
 void ImapBackend::stopPush()
 {
+    if (m_idleSession) {
+        qCDebug(logTrace, "push: dropping the idle connection on %s (idle job %s)",
+                qUtf8Printable(m_pushFolder), m_idleJob.isNull() ? "gone" : "still live");
+    }
+    m_pushRetry.stop();
     m_idleJob.clear(); // owned by the session; dies with it
     if (m_idleSession) {
         m_idleSession->deleteLater();
         m_idleSession.clear();
     }
+}
+
+void ImapBackend::schedulePushRetry()
+{
+    // The session first, always: a half-built one (logged in but not selected,
+    // or selected but never idled) still holds an open socket the server will
+    // talk to, and nothing is left to answer.
+    const QString folder = m_pushFolder;
+    stopPush();
+    if (!m_connected || folder.isEmpty())
+        return;
+    m_pushFolder = folder; // stopPush() does not clear it, but be explicit
+    qCDebug(logTrace, "push: retrying %s in %d ms", qUtf8Printable(folder), m_pushBackoffMs);
+    m_pushRetry.start(m_pushBackoffMs);
+    m_pushBackoffMs = qMin(m_pushBackoffMs * 2, kPushBackoffMaxMs);
 }
 
 /// IMAP IDLE on a dedicated connection: the server reports new mail in the
@@ -285,42 +436,80 @@ void ImapBackend::startPush(const QString &folder)
     m_pushFolder = folder;
 
     m_idleSession = new KIMAP::Session(m_credentials.host, quint16(m_credentials.port), this);
+    // The session this attempt belongs to. Every stage below checks that it is
+    // still the current one before reacting, for the same reason the IdleJob
+    // result does: opening a folder (or switching account) tears the push
+    // connection down, and the login or select already in flight on it then
+    // fails with the server-sounding "Connection to server lost" that we
+    // caused. Acting on that killed the replacement connection and booked a
+    // retry against a backoff that kept doubling — two lines per switch, and
+    // push effectively off.
+    QPointer<KIMAP::Session> attempt = m_idleSession;
+    qCDebug(logTrace, "push: opening an idle connection for %s", qUtf8Printable(folder));
     auto *login = new KIMAP::LoginJob(m_idleSession);
     configureLogin(login);
-    connect(login, &KJob::result, this, [this, folder](KJob *job) {
-        if (job->error() || !m_idleSession) {
+    connect(login, &KJob::result, this, [this, folder, attempt](KJob *job) {
+        if (m_idleSession.isNull() || m_idleSession != attempt)
+            return; // ours was replaced or dropped; not this attempt's business
+        if (job->error()) {
             qWarning() << "mailove: idle login failed:" << job->errorString();
+            schedulePushRetry();
             return;
         }
         auto *select = new KIMAP::SelectJob(m_idleSession);
         select->setMailBox(folder);
         select->setOpenReadOnly(true);
-        connect(select, &KJob::result, this, [this, folder](KJob *job) {
-            if (job->error() || !m_idleSession) {
+        connect(select, &KJob::result, this, [this, folder, attempt](KJob *job) {
+            if (m_idleSession.isNull() || m_idleSession != attempt)
+                return;
+            if (job->error()) {
                 qWarning() << "mailove: idle select failed:" << job->errorString();
+                schedulePushRetry();
                 return;
             }
+            // The connection works; the next failure starts counting again
+            // from the short interval rather than from wherever an earlier
+            // outage left the backoff.
+            m_pushBackoffMs = kPushBackoffMinMs;
             auto *idle = new KIMAP::IdleJob(m_idleSession);
             m_idleJob = idle;
+            // The window in which the server's keepalives have a job to land
+            // in. KIMAP warns "a message was received from the server with no
+            // job to handle it" for anything arriving outside it, and that
+            // warning names no connection — so the pair of lines here is what
+            // says whether IDLE was live at the time.
+            qCDebug(logTrace, "push: IDLE started on %s", qUtf8Printable(folder));
             connect(idle, &KIMAP::IdleJob::mailBoxStats, this,
                     [this, folder](KIMAP::IdleJob *, const QString &mailBox, int, int) {
                         if (mailBox == folder)
                             Q_EMIT folderChanged(mailBox);
                     });
             connect(idle, &KJob::result, this, [this](KJob *job) {
-                // Server ended IDLE (timeout, capability missing, …) — retry
-                // later unless the session was torn down by us.
+                // Only the job we are actually watching. Reopening a folder
+                // calls startPush(), which stops the old session before
+                // building the new one — and the old IdleJob's result lands
+                // *after* that, reporting the "Connection to server lost" we
+                // caused by deleting its session. Acting on it tore down the
+                // healthy new session and booked a retry 30 seconds out, so
+                // every folder click cost push for half a minute and left a
+                // warning implying the server had dropped us. m_idleJob is a
+                // QPointer cleared by stopPush(), so a stale result never
+                // matches.
+                if (m_idleJob.isNull() || m_idleJob.data() != job)
+                    return;
+                // Server ended IDLE (timeout, capability missing, a dropped
+                // socket) — come back later. The teardown is unconditional:
+                // it used to be skipped while disconnected, which left the
+                // dead session (and, when the drop was one-sided, its open
+                // socket) standing until something else called startPush.
+                // Jobless but connected is the state that makes KIMAP warn
+                // about the server's keepalives having no job to handle them.
+                qCDebug(logTrace, "push: IDLE ended on %s (%s)",
+                        qUtf8Printable(m_pushFolder),
+                        job->error() ? qUtf8Printable(job->errorString()) : "no error");
                 if (job->error())
                     qWarning() << "mailove: idle ended:" << job->errorString();
-                if (m_idleSession && m_connected) {
-                    const QString folder = m_pushFolder;
-                    // Drop the session now rather than at the retry: jobless
-                    // but still connected, it has nothing to receive the
-                    // server's keepalives ("* OK Still here"), and KIMAP logs
-                    // every one as a message with no job to handle it.
-                    stopPush();
-                    QTimer::singleShot(30 * 1000, this, [this, folder] { startPush(folder); });
-                }
+                schedulePushRetry();
             });
             idle->start();
         });
@@ -468,24 +657,27 @@ void ImapBackend::deleteFolder(const QString &path, const OpCallback &done)
 
 // --- Messages --------------------------------------------------------------
 
-void ImapBackend::withFolderSelected(
-    const QString &folder, bool readWrite,
-    const std::function<void(bool ok, const QString &error)> &then)
+KIMAP::SelectJob *ImapBackend::issueSelect(const QString &folder, bool readWrite)
 {
-    if (!m_session) {
-        then(false, tr("Not connected."));
-        return;
-    }
-    if (m_selectedFolder == folder && (m_selectedReadWrite || !readWrite)) {
-        then(true, QString());
-        return;
-    }
     auto *select = new KIMAP::SelectJob(m_session);
     select->setMailBox(folder);
     select->setOpenReadOnly(!readWrite);
-    connect(select, &KJob::result, this, [this, folder, readWrite, then](KJob *job) {
+    // Recorded now, not when the result arrives. Everything queued on this
+    // session after this job runs against this mailbox, so this is what a
+    // later "is it already selected?" has to be answered from.
+    m_queuedFolder = folder;
+    m_queuedReadWrite = readWrite;
+    connect(select, &KJob::result, this, [this, folder, readWrite](KJob *job) {
         if (job->error()) {
-            then(false, job->errorString());
+            // Nothing is reliably selected now. Clearing both makes the next
+            // caller issue its own SELECT rather than trust a mailbox the
+            // server just refused to open.
+            if (m_queuedFolder == folder) {
+                m_queuedFolder.clear();
+                m_queuedReadWrite = false;
+            }
+            m_selectedFolder.clear();
+            m_selectedReadWrite = false;
             return;
         }
         auto *sel = static_cast<KIMAP::SelectJob *>(job);
@@ -496,11 +688,61 @@ void ImapBackend::withFolderSelected(
         // folder writable, and the STORE that followed was refused with the
         // server's "NO STORE attempt on READ-ONLY folder".
         m_selectedReadWrite = !sel->isOpenReadOnly();
+        if (!m_selectedReadWrite && m_queuedFolder == folder)
+            m_queuedReadWrite = false;
+        // Asked-for versus granted, plus what the server says can be stored
+        // permanently. A write refused on a mailbox that answered writable is
+        // otherwise indistinguishable from a bug in our own bookkeeping, and
+        // the difference decides where to look next.
+        qCDebug(logTrace, "select %s: asked %s, granted %s, permanent flags %s",
+                qUtf8Printable(folder), readWrite ? "read-write" : "read-only",
+                m_selectedReadWrite ? "read-write" : "read-only",
+                qUtf8Printable(QString::fromLatin1(
+                    QByteArrayList(sel->permanentFlags().cbegin(),
+                                   sel->permanentFlags().cend()).join(' '))));
         // EXISTS and UIDVALIDITY come free with every SELECT; positional
         // windows need the first, and the caller compares the second against
         // what it stored to notice a mailbox the server regenerated.
         m_messageCounts[folder] = sel->messageCount();
         m_lastUidValidity = sel->uidValidity();
+    });
+    select->start();
+    return select;
+}
+
+void ImapBackend::selectThenQueue(const QString &folder,
+                                  const std::function<void()> &queueWork)
+{
+    // Only when the session is already headed there read-write. Anything else
+    // — a different mailbox, one opened read-only, or one whose SELECT is
+    // still in flight — gets its own SELECT immediately in front of the work.
+    if (m_queuedFolder != folder || !m_queuedReadWrite)
+        issueSelect(folder, true);
+    // No waiting, deliberately: the two jobs go into the session's queue back
+    // to back, so nothing can be queued between them. See the header.
+    queueWork();
+}
+
+void ImapBackend::withFolderSelected(
+    const QString &folder, bool readWrite,
+    const std::function<void(bool ok, const QString &error)> &then)
+{
+    if (!m_session) {
+        then(false, tr("Not connected."));
+        return;
+    }
+    if (m_queuedFolder == folder && (m_queuedReadWrite || !readWrite)) {
+        then(true, QString());
+        return;
+    }
+    auto *select = issueSelect(folder, readWrite);
+    // After issueSelect's own handler, which Qt runs first because it was
+    // connected first — so m_selectedReadWrite below is this SELECT's answer.
+    connect(select, &KJob::result, this, [this, folder, readWrite, then](KJob *job) {
+        if (job->error()) {
+            then(false, job->errorString());
+            return;
+        }
         if (readWrite && !m_selectedReadWrite) {
             // Failing here spares the round trip a doomed write costs and
             // turns the server's cryptic refusal into a statement of fact.
@@ -509,7 +751,6 @@ void ImapBackend::withFolderSelected(
         }
         then(true, QString());
     });
-    select->start();
 }
 
 /// The protocol-neutral flag names of MailBackend::HeaderInfo, as IMAP spells
@@ -553,16 +794,17 @@ void ImapBackend::setFlags(const QString &folder, const QStringList &remoteIds,
             done(Error::None, QString());
         return;
     }
-    withFolderSelected(folder, true, [this, set, addFlags, removeFlags, done](
-                                         bool ok, const QString &error) {
-        if (!ok) {
-            if (done)
-                done(Error::Protocol, error);
-            return;
-        }
+    if (!m_session) {
+        if (done)
+            done(Error::Connection, tr("Not connected."));
+        return;
+    }
+    {
         // Two STOREs when both directions are asked for: IMAP has no single
-        // command that adds some flags and removes others.
-        const auto run = [this, set](const QStringList &flags, bool add,
+        // command that adds some flags and removes others. Each is queued
+        // behind its own SELECT — the second one is created in the first's
+        // callback, which is another gap something else can queue into.
+        const auto run = [this, folder, set](const QStringList &flags, bool add,
                                      const std::function<void(bool, QString)> &next) {
             if (flags.isEmpty()) {
                 next(true, QString());
@@ -571,16 +813,20 @@ void ImapBackend::setFlags(const QString &folder, const QStringList &remoteIds,
             QList<QByteArray> imapFlags;
             for (const QString &f : flags)
                 imapFlags.append(imapFlag(f));
-            auto *store = new KIMAP::StoreJob(m_session);
-            store->setUidBased(true);
-            store->setSequenceSet(set);
-            store->setMode(add ? KIMAP::StoreJob::AppendFlags
-                               : KIMAP::StoreJob::RemoveFlags);
-            store->setFlags(imapFlags);
-            connect(store, &KJob::result, this, [next](KJob *job) {
-                next(!job->error(), job->errorString());
+            selectThenQueue(folder, [this, folder, set, add, imapFlags, next] {
+                auto *store = new KIMAP::StoreJob(m_session);
+                store->setUidBased(true);
+                store->setSequenceSet(set);
+                store->setMode(add ? KIMAP::StoreJob::AppendFlags
+                                   : KIMAP::StoreJob::RemoveFlags);
+                store->setFlags(imapFlags);
+                connect(store, &KJob::result, this, [this, folder, next](KJob *job) {
+                    if (job->error())
+                        noteWriteRefusal(folder, job->errorString());
+                    next(!job->error(), job->errorString());
+                });
+                store->start();
             });
-            store->start();
         };
         run(addFlags, true, [run, removeFlags, done](bool ok, const QString &error) {
             if (!ok) {
@@ -593,7 +839,7 @@ void ImapBackend::setFlags(const QString &folder, const QStringList &remoteIds,
                     done(ok ? Error::None : Error::Protocol, ok ? QString() : error);
             });
         });
-    });
+    }
 }
 
 void ImapBackend::moveMessages(const QString &folder, const QStringList &remoteIds,
@@ -624,6 +870,26 @@ void ImapBackend::moveMessages(const QString &folder, const QStringList &remoteI
     });
 }
 
+void ImapBackend::noteWriteRefusal(const QString &folder, const QString &error)
+{
+    if (!error.contains(QLatin1String("READ-ONLY"), Qt::CaseInsensitive))
+        return;
+    // withFolderSelected() already refuses to write to a mailbox the server
+    // answered [READ-ONLY] on. Reaching here means it was answered writable
+    // and refused anyway — an ACL the SELECT did not reflect, a proxy, or a
+    // mailbox that changed under us. Either way the cache of "Junk is open
+    // read-write" is wrong, and left standing it makes every later attempt
+    // skip the SELECT and repeat the same refusal.
+    qWarning() << "mailove:" << folder
+               << "refused a write although its SELECT reported it writable";
+    if (m_selectedFolder == folder) {
+        m_selectedReadWrite = false;
+        // Cleared, not just marked: the next withFolderSelected() has to issue
+        // a real SELECT to find out what the server says now.
+        m_selectedFolder.clear();
+    }
+}
+
 void ImapBackend::deleteMessages(const QString &folder, const QStringList &remoteIds,
                                  const OpCallback &done)
 {
@@ -635,13 +901,12 @@ void ImapBackend::deleteMessages(const QString &folder, const QStringList &remot
     }
     // IMAP has no "destroy these": \Deleted marks them and EXPUNGE is what
     // actually removes them, so the two always travel together here.
-    withFolderSelected(folder, true, [this, folder, set, done](bool ok,
-                                                               const QString &error) {
-        if (!ok) {
-            if (done)
-                done(Error::Protocol, error);
-            return;
-        }
+    if (!m_session) {
+        if (done)
+            done(Error::Connection, tr("Not connected."));
+        return;
+    }
+    selectThenQueue(folder, [this, folder, set, done] {
         auto *store = new KIMAP::StoreJob(m_session);
         store->setUidBased(true);
         store->setSequenceSet(set);
@@ -649,23 +914,19 @@ void ImapBackend::deleteMessages(const QString &folder, const QStringList &remot
         store->setFlags({QByteArrayLiteral("\\Deleted")});
         connect(store, &KJob::result, this, [this, folder, done](KJob *job) {
             if (job->error()) {
+                noteWriteRefusal(folder, job->errorString());
                 if (done)
                     done(Error::Protocol, job->errorString());
                 return;
             }
-            // Re-assert the selection before expunging. EXPUNGE acts on
-            // whatever mailbox the connection has selected, and the event loop
-            // runs between the STORE finishing and this job being created — so
-            // another operation can SELECT a different mailbox in the gap, and
-            // the expunge would then destroy *that* folder's \Deleted messages
-            // instead. This is a no-op when nothing moved, and a re-SELECT when
-            // something did.
-            withFolderSelected(folder, true, [this, done](bool ok, const QString &error) {
-                if (!ok) {
-                    if (done)
-                        done(Error::Protocol, error);
-                    return;
-                }
+            // Re-assert the selection before expunging, in front of the
+            // EXPUNGE in the same queue. EXPUNGE acts on whatever mailbox the
+            // connection has selected, and the event loop runs between the
+            // STORE finishing and this job being created — so another
+            // operation can SELECT a different mailbox in the gap, and the
+            // expunge would then destroy *that* folder's \Deleted messages
+            // instead.
+            selectThenQueue(folder, [this, done] {
                 auto *expunge = new KIMAP::ExpungeJob(m_session);
                 connect(expunge, &KJob::result, this, [done](KJob *ejob) {
                     if (done)
@@ -716,10 +977,17 @@ void ImapBackend::withReadSession(const QString &folder, bool background,
 {
     if (!background) {
         // Interactive work goes on the connection the folder is already open
-        // on; anything else would cost a SELECT the user waits for.
-        withFolderSelected(folder, false, [this, fn](bool ok, const QString &) {
-            fn(ok ? m_session.data() : nullptr);
-        });
+        // on; anything else would cost a SELECT the user waits for. Queued in
+        // front of the caller's job rather than awaited, for the reason spelled
+        // out in withSyncSession(): waiting hands the mailbox to whoever
+        // queued a SELECT in the meantime.
+        if (!m_session) {
+            fn(nullptr);
+            return;
+        }
+        if (m_queuedFolder != folder)
+            issueSelect(folder, false);
+        fn(m_session.data());
         return;
     }
     // Background work gets its own connection so a folder click never queues
@@ -730,7 +998,10 @@ void ImapBackend::withReadSession(const QString &folder, bool background,
         withSyncSession(folder, fn);
         return;
     }
-    fn(m_selectedFolder == folder ? m_session.data() : nullptr);
+    // The queued selection again: m_selectedFolder is what the connection has
+    // finished selecting, which during any overlap names the folder it is
+    // about to leave.
+    fn(m_queuedFolder == folder ? m_session.data() : nullptr);
 }
 
 void ImapBackend::runHeaderFetch(KIMAP::Session *session, const QString &folder,
@@ -1024,37 +1295,77 @@ void ImapBackend::startBodyFetchJob(KIMAP::Session *session, const QString &fold
                                     const KIMAP::ImapSet &set, const OpCallback &done,
                                     const std::function<void()> &release)
 {
-    auto *fetch = new KIMAP::FetchJob(session);
-    fetch->setSequenceSet(set);
-    fetch->setUidBased(true);
-    KIMAP::FetchJob::FetchScope scope;
-    scope.mode = KIMAP::FetchJob::FetchScope::Full;
-    fetch->setScope(scope);
+    // Two FETCHes per batch, not one. The halves have to be asked for
+    // separately because of how KIMAP hands each back:
+    //
+    //  - FullHeaders answers BODY.PEEK[HEADER] and is one of the three modes
+    //    whose end-of-response code assigns msg.message at all — Content mode
+    //    parses the same header into a message it then never delivers. This is
+    //    also where FLAGS and RFC822.SIZE ride along.
+    //  - Content with parts={TEXT} answers BODY.PEEK[TEXT] into the parts map
+    //    via setBody(), which is the one route through KIMAP that neither
+    //    KMime-parses nor re-encodes the payload (setContent() does both, and
+    //    is where KDE bug 523826 lives — see RawMessage above).
+    //
+    // Both jobs queue on the same session, so this is one extra round trip per
+    // batch, not per message.
+    auto *headers = new KIMAP::FetchJob(session);
+    headers->setSequenceSet(set);
+    headers->setUidBased(true);
+    KIMAP::FetchJob::FetchScope headScope;
+    headScope.mode = KIMAP::FetchJob::FetchScope::FullHeaders;
+    headers->setScope(headScope);
 
-    // Emit each body the moment its delivery streams in: memory stays flat
+    auto *content = new KIMAP::FetchJob(session);
+    content->setSequenceSet(set);
+    content->setUidBased(true);
+    KIMAP::FetchJob::FetchScope textScope;
+    textScope.mode = KIMAP::FetchJob::FetchScope::Content;
+    textScope.parts = {QByteArrayLiteral("TEXT")};
+    content->setScope(textScope);
+
+    // Emit each body the moment its second half lands: memory stays flat
     // (roughly one body at a time) however big the batch is, and the parse and
-    // indexing work downstream spreads across the socket events. `found` only
-    // stashes content-less deliveries — a message's attributes may arrive split
-    // across several emissions.
-    auto found = std::make_shared<QHash<qint64, std::shared_ptr<KMime::Message>>>();
+    // indexing work downstream spreads across the socket events. `found`
+    // stashes half-arrived messages — the two jobs stream independently.
+    auto found = std::make_shared<QHash<qint64, RawMessage>>();
     auto sent = std::make_shared<QSet<qint64>>();
-    connect(fetch, &KIMAP::FetchJob::messagesAvailable, this,
-            [this, folder, found, sent](const QMap<qint64, KIMAP::Message> &messages) {
-                for (const KIMAP::Message &m : messages) {
-                    if (!m.message || m.uid <= 0 || sent->contains(m.uid))
-                        continue;
-                    if (!m.message->body().isEmpty() || !m.message->contents().isEmpty()) {
-                        sent->insert(m.uid);
-                        found->remove(m.uid);
-                        Q_EMIT bodyFetched(folder, QString::number(m.uid), m.message);
-                    } else if (!found->contains(m.uid)) {
-                        (*found)[m.uid] = m.message;
-                    }
+    const auto onMessages =
+        [this, folder, found, sent](const QMap<qint64, KIMAP::Message> &messages) {
+            for (const KIMAP::Message &m : messages) {
+                if (m.uid <= 0 || sent->contains(m.uid))
+                    continue;
+                RawMessage &raw = (*found)[m.uid];
+                mergeRawParts(m, raw);
+                if (raw.complete()) {
+                    sent->insert(m.uid);
+                    // take(), not remove-then-use: raw is a reference into the
+                    // hash and dies with the entry.
+                    const RawMessage whole = found->take(m.uid);
+                    Q_EMIT bodyFetched(folder, QString::number(m.uid),
+                                       buildMessage(whole));
                 }
-            });
-    connect(fetch, &KJob::result, this,
-            [this, found, folder, done, release](KJob *job) {
+            }
+        };
+    connect(headers, &KIMAP::FetchJob::messagesAvailable, this, onMessages);
+    connect(content, &KIMAP::FetchJob::messagesAvailable, this, onMessages);
+
+    // One shared completion: the batch is done when both jobs are, and a
+    // failure of either reports once and silences the survivor.
+    auto remaining = std::make_shared<int>(2);
+    auto failed = std::make_shared<bool>(false);
+    const QPointer<KIMAP::FetchJob> headersPtr(headers);
+    const QPointer<KIMAP::FetchJob> contentPtr(content);
+    const auto onResult = [this, found, folder, done, release, remaining, failed,
+                           headersPtr, contentPtr](KJob *job) {
         if (job->error()) {
+            if (*failed)
+                return; // the other job already reported this batch
+            *failed = true;
+            if (headersPtr && headersPtr != job)
+                headersPtr->kill(KJob::Quietly);
+            if (contentPtr && contentPtr != job)
+                contentPtr->kill(KJob::Quietly);
             release();
             // Server pushback. On the concurrent-connection cap specifically,
             // shed a pool connection too so a retry does not hit the same wall.
@@ -1065,25 +1376,25 @@ void ImapBackend::startBodyFetchJob(KIMAP::Session *session, const QString &fold
                 done(Error::Throttled, job->errorString());
             return;
         }
-        // Leftovers whose deliveries never showed content (rare): emit what we
-        // got, one per event-loop pass to keep the GUI thread fluid.
-        auto drain = std::make_shared<std::function<void()>>();
-        *drain = [this, found, folder, done, release, drain]() {
-            if (!found->isEmpty()) {
-                const qint64 uid = found->cbegin().key();
-                Q_EMIT bodyFetched(folder, QString::number(uid), found->take(uid));
-                if (!found->isEmpty()) {
-                    QTimer::singleShot(0, this, *drain);
-                    return;
-                }
-            }
-            release();
-            if (done)
-                done(Error::None, QString());
-        };
-        (*drain)();
-    });
-    fetch->start();
+        if (--*remaining > 0 || *failed)
+            return;
+        // Leftovers with only one half (rare — the server answered one FETCH
+        // and not the other) are dropped, not emitted. Emitting a half-message
+        // put headerless bodies into the viewer, the cache and the spam scorer
+        // at once; saying nothing costs one backfill retry. uidsWithoutBody
+        // cannot tell "dropped" from "never fetched", so they come back round.
+        for (auto it = found->cbegin(); it != found->cend(); ++it)
+            qWarning() << "mailove: uid" << it.key() << "in" << folder
+                       << "arrived" << (it.value().haveHead ? "head-only" : "body-only")
+                       << "- dropped for refetch";
+        release();
+        if (done)
+            done(Error::None, QString());
+    };
+    connect(headers, &KJob::result, this, onResult);
+    connect(content, &KJob::result, this, onResult);
+    headers->start();
+    content->start();
 }
 
 void ImapBackend::folderUnreadCounts(
@@ -1128,6 +1439,39 @@ void ImapBackend::folderUnreadCounts(
 }
 
 // --- Search ----------------------------------------------------------------
+
+void ImapBackend::fetchUnseenIds(
+    const QString &folder,
+    const std::function<void(Error, const QStringList &, const QString &)> &done)
+{
+    // Read-only select: this asks a question, it does not change a flag. The
+    // background connection where one is free, so polling another account's
+    // folders never re-aims the mailbox the user is reading.
+    withReadSession(folder, /*background=*/true, [this, folder, done](KIMAP::Session *s) {
+        if (!s) {
+            done(Error::Connection, {}, tr("No connection available for %1.").arg(folder));
+            return;
+        }
+        auto *search = new KIMAP::SearchJob(s);
+        search->setUidBased(true);
+        // NOT SEEN. One command, and the complete answer: every id it returns
+        // is unread, and every cached row it does not is read.
+        search->setTerm(KIMAP::Term(KIMAP::Term::Seen).setNegated(true));
+        connect(search, &KJob::result, this, [folder, done](KJob *job) {
+            if (job->error()) {
+                done(Error::Protocol, {}, job->errorString());
+                return;
+            }
+            const QList<qint64> uids = static_cast<KIMAP::SearchJob *>(job)->results();
+            QStringList ids;
+            ids.reserve(uids.size());
+            for (qint64 uid : uids)
+                ids.append(QString::number(uid));
+            done(Error::None, ids, QString());
+        });
+        search->start();
+    });
+}
 
 void ImapBackend::search(const QString &folder, const QString &query, bool headersOnly,
                          bool byRecipient, const OpCallback &done)

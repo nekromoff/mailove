@@ -98,6 +98,12 @@ class MailClient : public QObject
     Q_PROPERTY(QString migrationLabel READ migrationLabel NOTIFY migrationChanged)
     /// 0-100, or -1 when the total is not known yet — an indeterminate bar.
     Q_PROPERTY(int migrationPercent READ migrationPercent NOTIFY migrationChanged)
+    /// Roughly how much longer, e.g. "about 2 minutes left"; empty until there
+    /// has been enough progress to measure a rate.
+    Q_PROPERTY(QString migrationEta READ migrationEta NOTIFY migrationChanged)
+    /// Which of how many steps this is (1-based; 0 when it stands alone).
+    Q_PROPERTY(int migrationStep READ migrationStep NOTIFY migrationChanged)
+    Q_PROPERTY(int migrationStepCount READ migrationStepCount NOTIFY migrationChanged)
     /// ABOUT.md compiled into the binary (Settings → About). CONSTANT — baked
     /// in at build time, never changes at runtime.
     Q_PROPERTY(QString aboutText READ aboutText CONSTANT)
@@ -171,6 +177,9 @@ class MailClient : public QObject
     /// Off by default; takes effect immediately. Persisted.
     Q_PROPERTY(bool debugLogging READ debugLogging WRITE setDebugLogging
                    NOTIFY debugLoggingChanged)
+    Q_PROPERTY(int outboxCount READ outboxCount NOTIFY outboxChanged)
+    Q_PROPERTY(bool undoSend READ undoSend WRITE setUndoSend NOTIFY undoSendChanged)
+    Q_PROPERTY(qint64 undoSendDeadline READ undoSendDeadline NOTIFY undoSendDeadlineChanged)
     /// The folder actually open right now. The sidebar follows this rather
     /// than deciding for itself which row is open.
     Q_PROPERTY(QString selectedFolder READ selectedFolder NOTIFY selectedFolderChanged)
@@ -179,6 +188,17 @@ class MailClient : public QObject
     /// and the viewer; today's messages show only the time. Persisted.
     Q_PROPERTY(QString dateFormat READ dateFormat WRITE setDateFormat
                    NOTIFY dateFormatChanged)
+
+    /// Changes made locally that the server has still to be told about, and
+    /// changes that were given up on and rolled back. See the journal section
+    /// further down and doc/OFFLINE_FIRST_ROADMAP.md.
+    Q_PROPERTY(int journalPendingCount READ journalPendingCount NOTIFY journalChanged)
+    Q_PROPERTY(int journalFailedCount READ journalFailedCount NOTIFY journalChanged)
+    /// How many messages the user has moved into the folder now open that the
+    /// server has not been told about yet — so the list can say where they
+    /// went instead of leaving them apparently nowhere. 0 the moment the move
+    /// is pushed, which offline means "on reconnect". See incomingCount().
+    Q_PROPERTY(int incomingCount READ incomingCount NOTIFY journalChanged)
 
 public:
     // Keep in sync with the combo box in AccountSheet.qml
@@ -242,6 +262,12 @@ public:
     /// Static and called first thing in main(): parts of the app log during
     /// construction, before the settings-driven setDebugLogging() runs.
     static void applyLogFilterRules(bool on);
+    /// Whether the console is currently the quiet one. The rules keep
+    /// warnings flowing in both modes now — the log in Settings would be
+    /// empty of everything worth reading otherwise — so what "quiet" means
+    /// is decided here, in the message handler, rather than by the category
+    /// filter. See applyLogFilterRules().
+    static bool consoleQuiet();
     void setRefreshMinutes(int minutes);
     QString dateFormat() const { return m_dateFormat; }
     void setDateFormat(const QString &format);
@@ -550,6 +576,9 @@ public:
     bool migrationRunning() const;
     QString migrationLabel() const;
     int migrationPercent() const;
+    QString migrationEta() const;
+    int migrationStep() const;
+    int migrationStepCount() const;
     /// Asks to quit as soon as the rebuild finishes; the window is closed for
     /// the user rather than leaving them to try again.
     Q_INVOKABLE void quitWhenIndexRebuildDone() { m_quitAfterIndex = true; }
@@ -640,12 +669,187 @@ public:
     /// "Mark all read" instead of offering a command with nothing to do.
     Q_INVOKABLE bool folderHasUnread(const QString &mailBox);
 
+    // --- the journal --------------------------------------------------------
+    //
+    // Every change is made locally and recorded here; replay is the only thing
+    // that talks to the backend. See doc/OFFLINE_FIRST_ROADMAP.md. The store
+    // owns the rows; this owns what they *mean* — which call each becomes, how
+    // it is undone, what confirming it makes permanent.
+
+    /// Changes still waiting to reach the server, and changes given up on.
+    /// Both are shown: one as a quiet indicator, the other as a list the user
+    /// can act on.
+    int journalPendingCount() const { return m_journalPending; }
+    int journalFailedCount() const { return m_journalFailed; }
+    /// Messages queued to be moved into the open folder — mail the user has
+    /// filed here that is not on screen because the server has not been told
+    /// yet, and until it has, the destination has no name for it.
+    ///
+    /// Showing the messages themselves was tried and abandoned. A borrowed row
+    /// would have to be keyed by the uid it has in the folder it came from,
+    /// and uids are per folder: MessageListModel keys rows by uid and *merges*
+    /// on a collision, so a borrowed uid 5 would overwrite the destination's
+    /// own message 5 — the wrong message shown under a real entry. Minting a
+    /// uid instead does not help, because nothing can mint one in the
+    /// destination's namespace until the server does. Counting them says the
+    /// true thing without inventing an identity for it.
+    int incomingCount() const;
+    /// The retired ops of the open account, newest first, as rows for the
+    /// "Failed changes" list: what/from/which mail/why/when. Subjects are
+    /// resolved from the cache here rather than in QML, which has no store.
+    Q_INVOKABLE QVariantList failedChanges() const;
+    /// Puts one retired op back in the queue: re-applied locally, replayed if
+    /// connected. \a id is the op id the list row carries.
+    Q_INVOKABLE void retryFailedChange(qint64 id);
+    /// Forgets one retired op; the local rollback already happened when it was
+    /// retired, so this only clears the record.
+    Q_INVOKABLE void discardFailedChange(qint64 id);
+    Q_INVOKABLE void discardAllFailedChanges();
+
+    // --- the outbox ---------------------------------------------------------
+    //
+    // Sending, made durable: sendMail() ends at an INSERT and the drain below
+    // is the only thing that calls sendMessage(). See doc/OUTBOX_ROADMAP.md.
+    // The store owns the rows; this owns what they mean — the backend call,
+    // the Sent copy, and what each failure kind does to the queue.
+
+    /// Rows waiting (or having failed) to be sent, for the Outbox badge. The
+    /// pane shows the folder only while this is non-zero.
+    int outboxCount() const { return m_outboxCount; }
+    /// Whether a pressed Send is held for a few seconds before the drain may
+    /// touch it, leaving a window to change your mind. Off by default; the
+    /// delay is compose/undoSendDelaySecs in the advanced settings.
+    bool undoSend() const { return m_undoSend; }
+    void setUndoSend(bool on);
+    /// The configured hold, for the settings page to name truthfully — the
+    /// advanced-settings default or whatever compose/undoSendDelaySecs was
+    /// changed to, never a number copied into UI text.
+    Q_INVOKABLE int undoSendDelaySecs() const;
+    /// When the send just made stops being undoable, in seconds since the
+    /// epoch — 0 when there is nothing to undo. What the toolbar's temporary
+    /// Undo button counts down to; it and the shortcut act on the same one
+    /// remembered message.
+    qint64 undoSendDeadline() const { return m_undoDeadline; }
+    /// The queue as rows for the Outbox list: {id, subject, to, created,
+    /// state, error, encrypted, holdUntil}. Subjects and recipients are the
+    /// display copies the enqueue stored, so nothing parses wire blobs here.
+    Q_INVOKABLE QVariantList outboxList() const;
+    /// Drops a queued or failed row — the message is simply not sent. A row
+    /// already in flight cannot be cancelled; false says so.
+    Q_INVOKABLE bool cancelOutboxMessage(qint64 id);
+    /// Puts a failed row back in the queue with a clean slate ("Retry now").
+    Q_INVOKABLE void retryOutboxMessage(qint64 id);
+    /// The compose fields of an unencrypted queued row, in draftData() shape
+    /// ({to, cc, bcc, subject, body}) plus its id — parsed back out of the
+    /// wire. Empty map for an encrypted row (ciphertext cannot be re-opened;
+    /// the UI offers only Cancel there) or one that is gone. The row itself
+    /// stays queued until the caller cancels it, so a composer that fails to
+    /// open loses nothing.
+    Q_INVOKABLE QVariantMap outboxEditData(qint64 id);
+    /// The undo-send shortcut: acts on the send just made, and only while it
+    /// is still inside its hold — pressed any later (or after anything else
+    /// was sent) there is nothing to undo. An editable message comes back as
+    /// {mode: "reopen", …compose fields…} and its row is dropped — the
+    /// message returns to the composer as if Send had not been pressed. One
+    /// the composer cannot reconstruct (ciphertext, attachments) is kept
+    /// instead: its hold is cancelled into a failed row saying "Send undone",
+    /// so Retry now can still send it and nothing is silently discarded —
+    /// {mode: "kept"}. Empty map when there is nothing to undo.
+    Q_INVOKABLE QVariantMap undoLastSend();
+
+Q_SIGNALS:
+    /// The pending or failed count changed — both properties and the list
+    /// read off the same rows, so one signal covers them.
+    void journalChanged();
+    /// The outbox gained, lost or changed a row — the badge, the folder row's
+    /// visibility and the list all read off the same rows.
+    void outboxChanged();
+    void undoSendChanged();
+    void undoSendDeadlineChanged();
+
 private:
-    /// STOREs \Seen on \a ids of \a mailBox, best effort — what a folder's
-    /// "mark all read" comes down to on the wire.
-    void sendSeenStore(const QString &mailBox, const QStringList &ids);
-    /// Sends the \Seen stores that markFolderRead() could not send offline.
-    void flushPendingSeen();
+    /// Records \a op, applies nothing (the caller has already changed the cache
+    /// and the model) and starts the drain when connected.
+    void journalAppend(MailStore::JournalOp op);
+    /// Replays the open account's ops, one at a time in id order. A no-op when
+    /// offline, when one is already in flight, or when the queue is empty.
+    void drainJournal();
+    /// Turns one op into its backend call.
+    void sendJournalOp(const MailStore::JournalOp &op);
+    /// What the backend said about it. Confirms and drops, retries, or retires.
+    void finishJournalOp(const MailStore::JournalOp &op, MailBackend::Error error,
+                         const QString &message);
+    /// Makes an op's effect permanent locally now that the server agrees.
+    void confirmJournalOp(const MailStore::JournalOp &op);
+    /// Gives up on \a op: rolls its local change back, and every later op
+    /// naming the same messages with it — in reverse, or an earlier undo
+    /// restores a state a later op has already moved past.
+    void retireJournalOp(const MailStore::JournalOp &op, const QString &error);
+    /// Undoes one op's local effect. Derived from the op rather than stored,
+    /// which holds because an op is only ever appended for a real change.
+    void rollbackJournalOp(const MailStore::JournalOp &op);
+    /// Re-applies an op's local effect — for "Retry", which has to put back
+    /// what retiring it rolled back.
+    void reapplyJournalOp(const MailStore::JournalOp &op);
+    /// Re-reads both counts and tells QML. Cheap (two indexed counts) and
+    /// called after anything that can change them.
+    void refreshJournalCounts();
+    /// Drops live ops older than the age cap, rolling them back. A change
+    /// queued a week ago is addressing a mailbox that has moved on.
+    void expireJournalOps();
+    /// "3 changes could not be applied", with the first few reasons on hover.
+    void reportFailedChanges();
+    /// True while \a mailBox of the open account has unreplayed ops — the sync
+    /// must leave it alone until they drain, which is what keeps a merge from
+    /// landing between an op's local write and its push.
+    bool folderHasPendingOps(const QString &mailBox) const;
+    /// Sends the next due outbox row, one at a time in id order. A no-op when
+    /// offline, when one is already in flight, or when nothing is due — in
+    /// which case it arms the timer for whenever something will be.
+    void drainOutbox();
+    /// What the backend said about one send. Drops, defers, backs off or
+    /// fails the row, then continues the drain.
+    void finishOutboxSend(const MailStore::OutboxMessage &msg, MailBackend::Error error,
+                          const QString &message);
+    /// Re-reads the count and tells QML; called after anything that can
+    /// change the queue.
+    void refreshOutboxCount();
+    /// Points the wake-up timer at the earliest nextTry still queued — the
+    /// undo-send hold and the retry backoff both wake through this.
+    void armOutboxTimer();
+    /// Sets (or clears) what the undo affordances act on, and tells QML. One
+    /// place so the button and the shortcut can never disagree about whether
+    /// there is something to undo.
+    void setUndoableSend(qint64 id, qint64 deadline);
+    /// Sets or clears \Seen on cached rows and, when that folder is open, on
+    /// the visible ones — the local half of a flag op, in both directions.
+    void applySeenLocally(const QString &folder, const QList<qint64> &uids, bool seen);
+    /// Shared body of markMessagesRead()/markMessagesUnread().
+    void markMessagesSeen(const QVariantList &rows, bool seen);
+    /// Shared body of every "this mail leaves this folder" gesture — delete,
+    /// move, mark as spam, rescue from spam. Hides the rows, records \a kind
+    /// (\c move needs \a target) and returns how many it acted on, 0 for none.
+    /// The caller words the breadcrumb: only it knows what the gesture was.
+    int journalRemoval(const QVariantList &rows, const QString &kind, const QString &target);
+    /// Restores rows an abandoned move or delete had hidden, and puts them
+    /// back on screen when it is the open folder.
+    void restoreHidden(const QString &folder, const QList<qint64> &uids);
+    /// Moves the folder list, the sidebar and the open folder onto the new
+    /// path after a rename's cached rows have been re-keyed. Both directions
+    /// go through it — making a rename, and undoing one.
+    void renameFolderPaths(const QString &from, const QString &to);
+    /// Takes folders out of the stored list and the sidebar without touching
+    /// their cached mail — a provisional folder delete, and what makes undoing
+    /// one possible. Follows the open folder somewhere that still exists.
+    void dropFoldersFromTree(const QStringList &folders);
+    /// Puts them back, in tree order.
+    void restoreFoldersToTree(const QStringList &folders);
+    /// Un-hides rows left provisionally deleted with no journal row to justify
+    /// it — a crash between the two writes, or a discarded op. Without this
+    /// they are mail the user can neither see nor get back. Run at startup.
+    void reconcileSoftDeletes();
+    /// The backend's own name for a model row, falling back to its uid.
+    QString remoteIdOfRow(int row, qint64 uid) const;
 
     /// Sets the folder on screen and keeps every collaborator that cares in
     /// step. The single assignment point: SyncEngine reads it on every fetch
@@ -734,6 +938,31 @@ private:
     /// Unlike startUnreadRecount(), which counts the local cache, this learns
     /// about mail in folders that have never been opened.
     void refreshAccountUnreadCounts();
+    /// Asks the server whether the messages this folder still counts as unread
+    /// really are, and corrects the cache and the visible rows from the answer.
+    ///
+    /// The one way a cached `seen` flag goes stale is mail read on another
+    /// device: it changes no folder size and creates no uid, so no sync path
+    /// re-reads it and the row stays unread here forever — the inbox badge
+    /// promising mail that is not in the folder. Asks about the unread rows
+    /// only, which is a set bounded by how much unread mail there is rather
+    /// than by the size of the folder, and skips a folder with an implausible
+    /// amount of it.
+    void verifyCachedUnread(const QString &folder);
+    /// Makes the cache agree with server-reported unread counts: every listed
+    /// folder the server calls fully read gets its stale cached flags cleared.
+    /// See clearUnseenIn() for why they go stale in the first place.
+    /// Makes the cache agree with the server about *which* mail is unread in
+    /// the folders whose counts disagree. See the call site in the background
+    /// poll for why a count on its own could never do this.
+    void reconcileUnseenIds(MailBackend *backend, const QString &key,
+                            const QHash<QString, int> &counts);
+    /// The same for one folder, with no count to compare first — for the
+    /// background pass, which has the folder open on the server already and
+    /// so can ask for nothing.
+    void reconcileUnseenIn(MailBackend *backend, const QString &key, const QString &folder);
+    void reconcileSeenWithServer(const QString &key, const QStringList &folders,
+                                 const QHash<QString, int> &counts);
     /// The server's hierarchy delimiter, as reported by LIST. Falls back to
     /// guessing from the known paths before the first listing has arrived.
     QChar folderSeparator() const;
@@ -816,7 +1045,8 @@ private:
     /// Stops caring about the search in flight, if any. The worker notices on
     /// its next batch and gives up.
     void abandonLocalSearch() { m_searchSeq.fetchAndAddOrdered(1); }
-    void appendToSentFolder(const QByteArray &rawMessage);
+    void appendToSentFolder(const QByteArray &rawMessage,
+                            const std::function<void()> &done = {});
     /// Builds the MIME message shared by sendMail() and saveDraft().
     /// \a strict rejects malformed or missing recipients (sending); otherwise
     /// unparseable addresses are kept verbatim so a half-typed draft survives.
@@ -980,7 +1210,6 @@ private:
     /// forever.
     bool refetchBodyForVerification(const QString &folder, qint64 uid, bool isRetry,
                                     MessageVerifier::BodyReady done);
-    void purgeDeleted(const QList<qint64> &uids);
     QString oauthWalletKey() const;
     /// Obtains a fresh access token (refresh grant or browser sign-in), then
     /// re-enters connectAccount().
@@ -1088,13 +1317,36 @@ private:
     /// Unread counts per account key, so the pane can show them for accounts
     /// that are only cached — one worker pass fills them all.
     QHash<QString, QHash<QString, int>> m_unreadByAccount;
-    /// "Mark all read" asked while offline: folder -> the remote ids to STORE
-    /// \Seen on once the connection is up. Right-clicking a folder of another
-    /// account opens that account first, so the command routinely lands before
-    /// its connection does — without this the next header sync would read the
-    /// server's untouched flags back and undo it. Dropped on an account
-    /// switch: the ids name messages of the account it was asked on.
-    QHash<QString, QStringList> m_pendingSeen;
+    /// Accounts whose entry above came from the server (STATUS/JMAP), not from
+    /// the cache. The cache recount must not overwrite these: cached seen
+    /// flags go stale for mail read on another device, and the recount was
+    /// resurrecting unread badges minutes after the server had said zero.
+    QSet<QString> m_serverCountedAccounts;
+    /// Last pill line logged per account, so the cached-tree numbers are
+    /// reported when they change rather than on every repaint of the pane.
+    QHash<QString, QString> m_lastCachedPills;
+    /// Journal state. The rows live in the cache; these are what QML watches
+    /// and the one-at-a-time guard that keeps replay in order.
+    ///
+    /// m_pendingSeen used to sit here — a hand-rolled queue for the single
+    /// case ("mark all read" asked before the connection was up) that had been
+    /// noticed. It is now one op kind among the rest, in one queue with one
+    /// drain point: two queues with two drain points is how they drift apart.
+    int m_journalPending = 0;
+    int m_journalFailed = 0;
+    bool m_journalBusy = false;  ///< one op in flight; replay is strictly serial
+    int m_outboxCount = 0;       ///< what the badge shows; failed rows count
+    bool m_outboxBusy = false;   ///< one send in flight; the drain is serial
+    qint64 m_outboxInFlight = 0; ///< its row id, so a reply after an account
+                                 ///< switch is recognised as stale
+    QTimer m_outboxTimer;        ///< wakes the drain at the earliest nextTry
+    bool m_undoSend = false;     ///< hold each send briefly before draining it
+    qint64 m_lastHeldSend = 0;   ///< row id of the send just made, while its
+                                 ///< hold lasts — the one thing Ctrl+Z may act
+                                 ///< on; 0 once consumed or overtaken
+    qint64 m_undoDeadline = 0;   ///< when that hold runs out; 0 = nothing to undo
+    qint64 m_journalInFlight = 0;///< its id, so a reply arriving after an
+                                 ///< account switch can be recognised as stale
     bool m_searching = false;   ///< a search is in flight (server or local)
     int m_searchFound = 0;      ///< hits delivered by it so far
     bool m_quitAfterIndex = false; ///< close was attempted mid-rebuild

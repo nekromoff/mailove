@@ -19,6 +19,7 @@ namespace KIMAP
 class IdleJob;
 class ImapSet;
 class LoginJob;
+class SelectJob;
 class Session;
 }
 
@@ -112,6 +113,10 @@ public:
     /// back on a later tick rather than pushing background work onto the
     /// connection the user's clicks go through.
     bool ensureBackgroundReady() override;
+    void fetchUnseenIds(
+        const QString &folder,
+        const std::function<void(Error, const QStringList &ids,
+                                 const QString &message)> &done) override;
     void folderUnreadCounts(
         const QStringList &folders,
         const std::function<void(Error, const QHash<QString, int> &,
@@ -140,7 +145,7 @@ private:
     KIMAP::Session *syncSession() const;
     /// Mailbox currently selected on the background connection.
     QString syncFolder() const { return m_syncFolder; }
-    void setSyncFolder(const QString &folder) { m_syncFolder = folder; }
+    void setSyncFolder(const QString &folder) { m_syncFolder = folder; m_syncQueuedFolder = folder; }
     /// (Re)opens the background connection if it is missing. Best-effort.
     void startSyncSession();
     /// Runs \a fn with the background connection once \a folder is selected on
@@ -202,8 +207,37 @@ private:
     QPointer<KIMAP::Session> m_syncSession; ///< header backfill + body prefetch
     bool m_syncReady = false;
     QString m_syncFolder;
+    /// What the background connection will be on once everything queued on it
+    /// has run. The same distinction m_queuedFolder draws for the interactive
+    /// one, and for the same reason — see withSyncSession().
+    QString m_syncQueuedFolder;
     QString m_selectedFolder;         ///< mailbox selected on the interactive connection
     bool m_selectedReadWrite = false; ///< ...and whether SELECT, not EXAMINE, opened it
+    /// The mailbox the interactive connection will be on once everything
+    /// already queued on it has run — which is the only thing a job being
+    /// queued *now* can reason about. m_selectedFolder is the past: it is
+    /// updated when a SELECT completes, so while another one is in flight it
+    /// names a mailbox the session is about to leave. Deciding "already
+    /// selected, no SELECT needed" from it is how a STORE meant for
+    /// [Gmail]/Spam was executed against INBOX.
+    QString m_queuedFolder;
+    bool m_queuedReadWrite = false;
+
+    /// Queues a SELECT (or EXAMINE) of \a folder on the interactive session
+    /// and records it as the queued selection immediately. Returns the job so
+    /// a caller can watch its outcome; the bookkeeping is already wired.
+    KIMAP::SelectJob *issueSelect(const QString &folder, bool readWrite);
+    /// Queues a read-write SELECT and \a queueWork's jobs back to back, with
+    /// no event loop turn between them.
+    ///
+    /// This is what write operations must use. Waiting for a SELECT to
+    /// *complete* before creating the job that depends on it leaves a gap that
+    /// anything else queues into: the spam sweep selected [Gmail]/Spam, the
+    /// folder list opened INBOX in the 160 ms before the SELECT's result came
+    /// back, and the sweep's STORE then ran against INBOX. It was refused only
+    /// because INBOX happened to be open read-only — on a writable mailbox it
+    /// would have marked \Deleted on whichever messages held those uids.
+    void selectThenQueue(const QString &folder, const std::function<void()> &queueWork);
     /// EXISTS per mailbox, from the last SELECT/EXAMINE of it on any connection.
     /// A positional window is "the newest N", which in IMAP can only be turned
     /// into a sequence range once the mailbox's size is known.
@@ -223,6 +257,29 @@ private:
     void withReadSession(const QString &folder, bool background,
                          const std::function<void(KIMAP::Session *)> &fn);
     QString m_pushFolder; ///< folder push is watching, for the IDLE restart
+    /// The one pending IDLE retry. A member, not a loose singleShot: a retry
+    /// left running while the folder is reopened fires into a *healthy*
+    /// session later and tears it down to build another, which is churn the
+    /// server sees as a login storm and the log as repeated "idle ended".
+    QTimer m_pushRetry;
+    /// Grows while the server keeps refusing, so an outage costs a handful of
+    /// logins rather than one every 30 seconds for its duration. Reset by a
+    /// SELECT that lands.
+    int m_pushBackoffMs = kPushBackoffMinMs;
+    static constexpr int kPushBackoffMinMs = 30 * 1000;
+    static constexpr int kPushBackoffMaxMs = 15 * 60 * 1000;
+    /// Tears the push connection down and books the next attempt. Called from
+    /// every way starting IDLE can fail — each of which used to return in
+    /// place, leaving a connected but jobless session behind (which is what
+    /// KIMAP reports as "a message was received from the server with no job
+    /// to handle it": the server's untagged traffic arriving at a session
+    /// with an empty job queue) and no attempt to come back.
+    void schedulePushRetry();
+    /// Believes the server over our own bookkeeping. A STORE refused with
+    /// "READ-ONLY" means the mailbox is not writable however the SELECT that
+    /// preceded it was answered — so drop the belief that it is, and make the
+    /// next attempt re-SELECT rather than repeat the doomed write.
+    void noteWriteRefusal(const QString &folder, const QString &error);
 
     /// Keeps the interactive connection from being dropped as idle. Purely a
     /// protocol concern (a periodic CAPABILITY), so it lives here rather than

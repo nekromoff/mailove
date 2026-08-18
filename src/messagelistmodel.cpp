@@ -329,17 +329,29 @@ void MessageListModel::rebuildVisible()
 {
     QElapsedTimer timer;
     timer.start();
-    beginResetModel();
-    m_rows.clear();
-    m_rows.reserve(m_all.size());
+    // Built beside the live list, not over it: the reset is only worth paying
+    // for if the answer actually differs.
+    //
+    // The two halves of this cost nothing alike. Filtering and sorting a
+    // thousand rows is under a millisecond; endResetModel() is ~37 ms, because
+    // it tells every attached view that everything it holds is void — so Qt
+    // Quick destroys every delegate, rebuilds the visible ones and
+    // re-evaluates their bindings, on the GUI thread. Re-applying the same
+    // filter or the same sort was paying that in full for an identical list.
+    QList<int> rows;
+    rows.reserve(m_all.size());
     const bool filtered = hasFilter() || m_colorFilter != 0;
     for (int i = 0; i < m_all.size(); ++i) {
         if (!filtered || matchesFilter(m_all.at(i)))
-            m_rows.append(i);
+            rows.append(i);
     }
-    std::stable_sort(m_rows.begin(), m_rows.end(),
+    std::stable_sort(rows.begin(), rows.end(),
                      [this](int a, int b) { return lessThan(m_all.at(a), m_all.at(b)); });
     const qint64 sortMs = timer.elapsed();
+    if (rows == m_rows)
+        return; // same rows, same order — the view has nothing to redraw
+    beginResetModel();
+    m_rows = std::move(rows);
     endResetModel();
     const qint64 totalMs = timer.elapsed();
     if (totalMs > kSlowMs) {

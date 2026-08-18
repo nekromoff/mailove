@@ -243,6 +243,20 @@ public:
         const std::function<void(Error, const QHash<QString, int> &counts,
                                  const QString &message)> &done) = 0;
 
+    /// The ids the server itself calls unread in \a folder — IMAP's
+    /// `UID SEARCH UNSEEN`, JMAP's Email/query for messages without $seen.
+    ///
+    /// The one authoritative answer to "which mail is unread here". A count
+    /// (folderUnreadCounts above) can only say *how many*, which is enough to
+    /// draw a badge and never enough to correct the rows behind it: cache and
+    /// server disagreeing by ten leaves ten rows unidentified, so the badge
+    /// showed the server's number while the list showed the cache's, and
+    /// neither could be made to agree with the other. This closes that.
+    virtual void fetchUnseenIds(
+        const QString &folder,
+        const std::function<void(Error, const QStringList &ids,
+                                 const QString &message)> &done) = 0;
+
     /// Server-side search within \a folder. \a headersOnly limits matching to
     /// sender and subject; otherwise the body and all headers count. Answered
     /// by searchResults().

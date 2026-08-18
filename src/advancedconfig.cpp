@@ -141,6 +141,9 @@ const AdvancedConfig::Knob kSchema[] = {
      "Remote images fetched per message once remote content is allowed."},
     {"compose/maxRemoteImageBytes", Type::Int, 10485760, 65536, 268435456, Reload::Live,
      "Largest single remote image accepted."},
+    {"compose/undoSendDelaySecs", Type::Int, 10, 2, 120, Reload::Live,
+     "How long a sent message is held in the Outbox before it goes out, once "
+     "undo send is enabled in Settings."},
 
     // --- db ------------------------------------------------------------------
     {"db/busyTimeoutMs", Type::Int, 15000, 1000, 300000, Reload::Restart,

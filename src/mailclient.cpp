@@ -230,6 +230,42 @@ static QString countNoun(qint64 n, const char *singular, const char *plural)
 /// Opt-in diagnostics (Settings -> General -> "Log activity to console"). Off
 /// by default so a normal run stays quiet; toggling needs no restart.
 Q_LOGGING_CATEGORY(logTrace, "mailove.trace")
+/// Where the unread pill's number comes from. Its own category, on by default,
+/// for the reason the badge keeps being reported and keeps being unexplained:
+/// there are four sources for that number — the cache recount, the server's
+/// per-folder counts, the on-open verification and the zero-reconcile — and
+/// which of them last wrote it decides where the bug is. It is a few lines per
+/// folder open and none while nothing changes, and without them "INBOX says 10
+/// and holds nothing" is unanswerable after the fact.
+Q_LOGGING_CATEGORY(logUnread, "mailove.unread")
+
+namespace
+{
+/// Only the folders with a pill, and their numbers — a counts map has an entry
+/// per folder and printing the zeroes buries the two lines that matter.
+QString describeCounts(const QHash<QString, int> &counts)
+{
+    QStringList out;
+    for (auto it = counts.constBegin(); it != counts.constEnd(); ++it) {
+        if (it.value() > 0)
+            out.append(it.key() + QLatin1Char('=') + QString::number(it.value()));
+    }
+    out.sort();
+    return out.isEmpty() ? QStringLiteral("nothing unread") : out.join(QLatin1String(", "));
+}
+}
+
+
+/// The journal's trail, exempt from quiet mode for the same reason
+/// mailove.migrate is: what it records is a change the user made that the
+/// server has not been told about yet. When one is rolled back, "why did that
+/// message come back" has no answer anywhere else — the op is gone from the
+/// queue by then, and the mail looks exactly as if nothing had happened.
+/// A handful of lines per session, and none at all when nothing is queued.
+///
+/// Op ids, kinds and counts only. Never a folder name, a subject or an
+/// address: what is being queued is the user's mail.
+Q_LOGGING_CATEGORY(logJournal, "mailove.journal")
 
 /// Condense a verbose/multi-line error (often a raw server or KJob string)
 /// into a terse status crumb: first line only, trailing punctuation trimmed,
@@ -290,9 +326,12 @@ void MailClient::connectBackend(MailBackend *backend)
         Q_EMIT connectedChanged();
         if (!up)
             return;
-        // A "mark all read" made before the connection was up is sent now,
-        // before the header sync that would otherwise read the old flags back.
-        flushPendingSeen();
+        // Everything changed while the connection was down is pushed now,
+        // before the header sync that would otherwise read the old state back
+        // and undo it. This ordering is the whole reason the drain hangs off
+        // this handler rather than off a timer.
+        drainJournal();
+        drainOutbox();
         // No "loading folders" crumb — the busy spinner shows the activity.
         listFolders();
     });
@@ -395,6 +434,9 @@ MailClient::MailClient(QObject *parent)
 
     m_sync = new SyncEngine(m_store, m_messageModel, m_folderModel, this);
     m_sync->setBusyProvider([this] { return m_busy; });
+    m_sync->setPendingOpsProvider([this](const QString &folder) {
+        return folderHasPendingOps(folder);
+    });
     connect(m_sync, &SyncEngine::statusMessage, this, &MailClient::setStatus);
     connect(m_sync, &SyncEngine::errorOccurred, this, &MailClient::errorOccurred);
     connect(m_sync, &SyncEngine::busyRequested, this, &MailClient::setBusy);
@@ -464,6 +506,13 @@ MailClient::MailClient(QObject *parent)
     // frame — and the timer stops itself the moment there is nothing left.
     m_msgidBackfillTimer.setInterval(2000);
     connect(&m_msgidBackfillTimer, &QTimer::timeout, this, [this] {
+        // Not while the cache migrations run: this writes on the GUI thread's
+        // connection, and the index re-key among them holds one write
+        // transaction for minutes — a tick during it would sit on busy_timeout
+        // with the event loop stopped, freezing the very modal that is
+        // supposed to be showing progress.
+        if (m_jobs->migrationRunning())
+            return;
         if (m_store.backfillMessageIds(100) == 0) {
             m_msgidBackfillTimer.stop();
             qCDebug(logTrace, "message-id backfill complete");
@@ -490,13 +539,24 @@ MailClient::MailClient(QObject *parent)
         return isJunkFolder(scopedFolder.section(QChar(0x1f), -1));
     });
     m_store.open();
-    // Claim any pre-multi-account cache rows for the account they were
-    // written by (the one active at upgrade time), then scope everything.
-    // Never for a local archive: its key was born after the migration and
-    // must not adopt another account's leftovers.
-    if (!m_acct.local)
-        m_store.adoptLegacyCache(accountKey());
     m_store.setAccountKey(accountKey());
+    // Changes made in a previous session that never reached the server. The
+    // counts are read now so the indicator is right from the first frame; the
+    // drain waits for connectedChanged(), which is where it has to happen —
+    // before the header sync reads the old state back.
+    refreshJournalCounts();
+    // Sends interrupted by a killed process are ambiguous — whether the
+    // message left is unknowable — so they surface as failed rows saying so,
+    // never as silent resends (doc/OUTBOX_ROADMAP.md).
+    if (m_store.recoverStaleOutbox(
+            accountKey(), tr("Interrupted while sending — it may already have been sent")))
+        Q_EMIT errorOccurred(
+            tr("A message was interrupted while sending. Check the Outbox."));
+    refreshOutboxCount();
+    // Before the first read of any folder: a row hidden by a change whose
+    // journal entry never landed is mail the user can neither see nor get
+    // back, and this is the only thing that looks for it.
+    reconcileSoftDeletes();
 
     // Instant startup from cache: folders and INBOX appear before (and
     // without) any network connection.
@@ -526,6 +586,9 @@ MailClient::MailClient(QObject *parent)
         appSettings().value(QStringLiteral("ui/authVerification"), true).toBool();
     m_verifier->setAuthVerification(m_authVerification);
     setDebugLogging(appSettings().value(QStringLiteral("ui/debugLogging"), false).toBool());
+    m_undoSend = appSettings().value(QStringLiteral("ui/undoSend"), false).toBool();
+    m_outboxTimer.setSingleShot(true);
+    connect(&m_outboxTimer, &QTimer::timeout, this, [this] { drainOutbox(); });
     connect(&m_pollTimer, &QTimer::timeout, this, [this] {
         if (connected() && !m_backend->pushActive())
             refreshCurrentFolder();
@@ -573,27 +636,45 @@ MailClient::MailClient(QObject *parent)
 
     m_jobs->startReindexTimer();
 
-    // Old mail still has its attachments inside the message BLOBs; move them
-    // out in the background. Deferred so it never competes with startup.
-    if (m_store.attachmentMigrationPending())
-        QTimer::singleShot(8000, this, [this] { m_jobs->startAttachmentMigration(); });
+    // Every outstanding cache migration, on a worker behind the progress modal.
+    // None of this used to be deferred: it ran inside MailStore::open() above,
+    // which meant a launch that got slower the more mail was cached — a window
+    // that did not appear for minutes, with nothing on screen to say why.
+    //
+    // Short delay rather than none so the window is up first: the modal has to
+    // have something to be modal over, and the user should see their cached
+    // mail behind it rather than a migration dialog alone on the desktop.
+    QTimer::singleShot(500, this, [this] {
+        // The static name test, not listsRecipients(): the To-column backfill
+        // walks every account's folders, and the configured Sent/Drafts this
+        // object knows about belong to the open account alone.
+        //
+        // No account key for a local archive: its key was born after the
+        // multi-account migration and must not adopt another account's rows.
+        m_jobs->startCacheMigrations(m_acct.local ? QString() : accountKey(),
+                                     &MailClient::folderNameIsOutgoing);
+    });
 
-    // Same idea for the search index built before diacritic folding. Deferred
-    // further than the attachment migration so the two do not fight over the
-    // write lock in the first seconds.
-    if (m_store.ftsNeedsRebuild())
-        QTimer::singleShot(15000, this, [this] { m_jobs->startIndexRebuild(); });
+    // The two long background jobs wait for those to finish. Not politeness:
+    // the search-index rebuild reads the very index the fts_rowid migration
+    // replaces, and both would otherwise be fighting the migration worker for
+    // the write lock during the one part of the run the user is watching.
+    connect(m_jobs, &MaintenanceScheduler::cacheMigrationsFinished, this, [this] {
+        // Old mail still has its attachments inside the message BLOBs; move
+        // them out in the background.
+        if (m_store.attachmentMigrationPending())
+            QTimer::singleShot(8000, this, [this] { m_jobs->startAttachmentMigration(); });
 
-    // The To column: mail cached before that column existed has none, which in
-    // the Sent folder is every row. The header is still on disk inside the
-    // cached message, so this reads it back rather than re-fetching anything.
-    // Sooner than the other two because until it finishes the Sent folder is
-    // visibly showing the wrong name, and it costs nothing after the first run.
-    QTimer::singleShot(3000, this, [this] {
-        // The static name test, not listsRecipients(): the worker walks every
-        // account's folders, and the configured Sent/Drafts this object knows
-        // about belong to the open account alone.
-        m_jobs->startRecipientBackfill(&MailClient::folderNameIsOutgoing);
+        // Same idea for the search index built before diacritic folding.
+        // Deferred further than the attachment migration so the two do not
+        // fight over the write lock in the first seconds. Asked afresh, not
+        // from the answer noted at open(): the fts_rowid migration that may
+        // have just run replaces the whole index with one that already folds
+        // diacritics, and the stale answer would copy it all again for
+        // nothing.
+        m_store.refreshFtsRebuildNeeded();
+        if (m_store.ftsNeedsRebuild())
+            QTimer::singleShot(15000, this, [this] { m_jobs->startIndexRebuild(); });
     });
 }
 
@@ -608,11 +689,22 @@ void MailClient::setUpMaintenance()
             // Every account the pane can show a pill for, not just the open
             // one — one worker pass fills them all.
             QStringList keys;
+            const QString open = accountKey();
             const int count = m_accounts.count();
             for (int i = 0; i < count; ++i) {
-                const QString key = m_accounts.storedKeyAt(i);
-                if (!key.isEmpty() && !keys.contains(key))
-                    keys.append(key);
+                bool local = false;
+                const QString key = m_accounts.storedKeyAt(i, &local);
+                if (key.isEmpty() || keys.contains(key))
+                    continue;
+                // An imported archive has no server, so nothing can change its
+                // unread mail except the user acting on it — which they can
+                // only do while it is the open account. Counted when it is,
+                // skipped when it is not: recounting it on every poll, every
+                // folder listing and every flag change made elsewhere was a
+                // full scan of an archive that cannot have moved.
+                if (local && key != open)
+                    continue;
+                keys.append(key);
             }
             return keys;
         },
@@ -626,13 +718,19 @@ void MailClient::setUpMaintenance()
             &MailClient::indexRebuildChanged);
     connect(m_jobs, &MaintenanceScheduler::migrationChanged, this, [this] {
         Q_EMIT migrationChanged();
+        if (m_jobs->migrationRunning())
+            return;
         // A finished migration has changed rows the list is already showing.
         // Re-read them rather than leave the old values on screen until
         // something else happens to reload the folder.
-        if (!m_jobs->migrationRunning() && !m_selectedFolder.isEmpty()
-            && m_messageModel.totalCount() > 0 && !m_searchActive) {
+        //
+        // The folder list too, and unconditionally: the legacy adoption is one
+        // of these migrations, and until it has run this account's cached mail
+        // is under keys the sidebar cannot see — so what is on screen at this
+        // moment may be not merely stale but empty.
+        loadCachedFolderModel();
+        if (!m_selectedFolder.isEmpty() && !m_searchActive)
             m_messageModel.setHeaders(m_store.cachedHeaders(m_selectedFolder));
-        }
     });
     connect(m_jobs, &MaintenanceScheduler::indexRebuildFinished, this, [this] {
         if (m_quitAfterIndex)
@@ -669,8 +767,66 @@ void MailClient::setUpMaintenance()
     });
     connect(m_jobs, &MaintenanceScheduler::unreadCountsReady, this,
             [this](const QHash<QString, QHash<QString, int>> &counts) {
-        m_unreadByAccount = counts;
-        m_folderModel.setUnreadCounts(m_unreadByAccount.value(accountKey()));
+        // The recount answers from the cache, and the cache's seen flags can
+        // be stale: mail read on another device changes no folder size, so no
+        // sync path ever re-reads the old flags (see clearUnseenIn). For the
+        // open account the cache is still the freshest source there is — the
+        // user's own mark-read must move the pill now, not at the next poll —
+        // but a background account the server has already answered for keeps
+        // the server's number, exactly as the comment on pollOtherAccounts()
+        // promises. Replacing the whole map here was resurrecting stale
+        // badges minutes after the server had said zero: the "unread" inbox
+        // with nothing new in it.
+        const QString open = accountKey();
+        // What the pills said before this recount — the only place a folder
+        // the cache knows nothing about has a number at all.
+        const QHash<QString, int> previous = m_unreadByAccount.value(open);
+        for (auto it = counts.constBegin(); it != counts.constEnd(); ++it) {
+            if (it.key() == open || !m_serverCountedAccounts.contains(it.key()))
+                m_unreadByAccount.insert(it.key(), it.value());
+        }
+        // Anything for an account that is no longer configured goes — the
+        // wholesale replacement used to drop those for free, a merge has to do
+        // it by hand.
+        //
+        // Against the configured accounts, not against `counts`: the recount
+        // deliberately skips imported archives while they are not open (they
+        // have no server and cannot change unseen), and reading their absence
+        // from the results as "this account is gone" would take their pills
+        // with it.
+        QSet<QString> configured;
+        const int accounts = m_accounts.count();
+        for (int i = 0; i < accounts; ++i) {
+            const QString key = m_accounts.storedKeyAt(i);
+            if (!key.isEmpty())
+                configured.insert(key);
+        }
+        for (auto it = m_unreadByAccount.begin(); it != m_unreadByAccount.end();) {
+            if (configured.contains(it.key())) {
+                ++it;
+            } else {
+                m_serverCountedAccounts.remove(it.key());
+                it = m_unreadByAccount.erase(it);
+            }
+        }
+        // A folder the cache has never held a row of cannot be counted from the
+        // cache: its zero means "unknown", not "read". The server's number for
+        // it — from the STATUS sweep — is the only figure there is, so it
+        // survives the recount instead of being overwritten with a zero. This
+        // is why a subfolder showed no pill until it was clicked: opening it
+        // cached its rows, and only then could the recount see them.
+        const QHash<QString, int> rows = m_store.cachedRowCounts(open);
+        QHash<QString, int> shown = m_unreadByAccount.value(open);
+        for (auto it = previous.constBegin(); it != previous.constEnd(); ++it) {
+            if (it.value() > 0 && rows.value(it.key(), 0) == 0)
+                shown.insert(it.key(), it.value());
+        }
+        m_unreadByAccount.insert(open, shown);
+        qCInfo(logUnread) << "pills <- cache recount for" << open << ":"
+                          << describeCounts(shown)
+                          << (m_serverCountedAccounts.contains(open)
+                                  ? "(account also has server counts)" : "");
+        m_folderModel.setUnreadCounts(shown);
         ++m_cachedFolderRevision;
         Q_EMIT cachedFoldersChanged(); // repaints the other accounts' trees
     });
@@ -873,6 +1029,8 @@ void MailClient::loadCachedFolderModel()
         m_folderModel.setFolders(folders);
     // setFolders() cleared nothing, but the pills belong to this account —
     // hand over what the last pass found and ask for a fresh one.
+    qCInfo(logUnread) << "pills <- remembered counts for" << accountKey() << ":"
+                      << describeCounts(m_unreadByAccount.value(accountKey()));
     m_folderModel.setUnreadCounts(m_unreadByAccount.value(accountKey()));
     scheduleUnreadRecount();
 }
@@ -927,6 +1085,19 @@ void MailClient::setDebugLogging(bool on)
     Q_EMIT debugLoggingChanged();
 }
 
+namespace
+{
+/// Set by applyLogFilterRules(), read by the message handler in main.cpp.
+/// A plain bool: written from main() before any thread exists and only ever
+/// again from the GUI thread, read on whatever thread is logging.
+bool g_consoleQuiet = true;
+}
+
+bool MailClient::consoleQuiet()
+{
+    return g_consoleQuiet;
+}
+
 void MailClient::applyLogFilterRules(bool on)
 {
     // Rules, not a boolean check at each call site: disabled categories cost
@@ -941,21 +1112,51 @@ void MailClient::applyLogFilterRules(bool on)
     // sessions mailove itself closes and about keepalive lines no job owns, the
     // viewer's page chats through "js" (its CSP blocks arrive at *error*
     // severity, hence js.critical below), the PSL loader and wipe breadcrumbs
-    // debug by default. So logging off blankets every category's debug, info
-    // and warning. Critical stays: something exceptional enough to be
-    // critical should print even in quiet mode — except "js", where the
-    // severity is chosen by the sender's HTML, not by anything being wrong
-    // with mailove. Logging on lifts the blanket and turns the trace on.
+    // debug by default. So logging off blankets every category's debug and
+    // info. Critical stays: something exceptional enough to be critical should
+    // print even in quiet mode — except "js", where the severity is chosen by
+    // the sender's HTML, not by anything being wrong with mailove. Logging on
+    // lifts the blanket and turns the trace on.
+    //
+    // Warnings are the exception, and the reason is the log in Settings. A
+    // rule that is off does not merely stop printing — the message is never
+    // constructed, so nothing downstream can keep it either, and the log
+    // someone opens after a failed sync would hold only whatever happened to
+    // be critical. So warnings stay enabled in both modes and the message
+    // handler decides whether the terminal sees them (consoleQuiet()). The
+    // noise this readmits is bounded by the log's own 5000 lines, and it is
+    // exactly the noise a bug report wants: what KIMAP said, in order.
+    //
+    // Two exemptions: mailove.migrate and mailove.maintenance. A cache migration runs once, on one
+    // machine, holds the user in a modal for as long as it takes, and leaves
+    // nothing behind to inspect afterwards — so "it hung on startup" is
+    // undiagnosable without the trail, and asking the user to reproduce it with
+    // logging on is asking for the one thing that cannot happen twice. It costs
+    // a handful of lines per launch and none at all once the cache is current.
+    // What the terminal shows. The categories themselves stay on (below), so
+    // the in-memory log and the file keep receiving warnings whether or not
+    // anyone asked for verbose output; this is the only thing that decides
+    // whether they are also printed.
+    g_consoleQuiet = !on;
     QLoggingCategory::setFilterRules(on ? QStringLiteral("mailove.trace.debug=true\n"
                                                          "mailove.psl.debug=true\n"
                                                          "mailove.wipe.debug=true\n"
+                                                         "mailove.migrate.info=true\n"
+                                                         "mailove.maintenance.info=true\n"
+                                                         "mailove.unread.info=true\n"
+                                                         "mailove.journal.info=true\n"
                                                          "js.debug=true\n"
                                                          "js.info=true\n"
                                                          "js.warning=true\n"
                                                          "js.critical=true")
                                         : QStringLiteral("*.debug=false\n"
                                                          "*.info=false\n"
-                                                         "*.warning=false\n"
+                                                         "mailove.migrate.info=true\n"
+                                                         "mailove.migrate.warning=true\n"
+                                                         "mailove.maintenance.info=true\n"
+                                                         "mailove.unread.info=true\n"
+                                                         "mailove.journal.info=true\n"
+                                                         "mailove.journal.warning=true\n"
                                                          "js.critical=false"));
 }
 
@@ -1027,7 +1228,27 @@ QVariantList MailClient::cachedFolderList(int index)
 
     QVariantList out;
     const QSet<QString> collapsed = FolderModel::savedCollapsed(key);
+    // The *other* trees' numbers. This is a second source of pills entirely —
+    // the connected account draws from FolderModel::setUnreadCounts(), every
+    // other account draws from here — and it is read straight out of
+    // m_unreadByAccount, so a number the cache recount was not allowed to
+    // overwrite (see the merge in the recount handler, which keeps the
+    // server's figure for accounts in m_serverCountedAccounts) is shown
+    // exactly as long as it sits in that map.
     const QHash<QString, int> unread = m_unreadByAccount.value(key);
+    if (!unread.isEmpty()) {
+        const QString shown = describeCounts(unread);
+        // Rebuilt on every repaint of the pane; only worth a line when the
+        // number it is about to draw has changed since the last one.
+        if (m_lastCachedPills.value(key) != shown) {
+            m_lastCachedPills.insert(key, shown);
+            qCInfo(logUnread) << "pills <- remembered counts, cached tree of" << key << ":"
+                              << shown
+                              << (m_serverCountedAccounts.contains(key)
+                                      ? "(the cache recount is not allowed to correct these)"
+                                      : "(the cache recount may correct these)");
+        }
+    }
     QStringList boxes = m_store.cachedFolders(key);
     // Same repair as loadCachedFolderModel(), for an archive that is shown in
     // the pane but has not been switched to yet. Read-only here: the account
@@ -1143,8 +1364,12 @@ void MailClient::setSelectedFolder(const QString &folder)
     // change: the callers that already emit it do so after work this one has
     // no part in, and both firing on the same value is a re-evaluation for
     // nothing.
-    if (changed)
+    if (changed) {
         Q_EMIT selectedFolderChanged();
+        // incomingCount() is about the folder as much as about the journal, so
+        // it goes stale on a folder change with nothing else to say so.
+        Q_EMIT journalChanged();
+    }
 }
 
 void MailClient::setSearchActive(bool active)
@@ -1254,9 +1479,21 @@ void MailClient::saveAccountPrefs(int index, const QVariantMap &d)
 
 void MailClient::removeAccount(int index)
 {
+    // Read before the removal, which is what makes the key unobtainable.
+    const QString goingKey = m_accounts.storedKeyAt(index);
     const int left = m_accounts.remove(index);
     if (left < 0)
         return;
+    // Queued changes name mail of an account that no longer exists, and there
+    // is nothing left to roll them back onto — the cached rows go with the
+    // account. Left behind they would be replayed against whichever account
+    // reused the key, or sit in the failed list forever.
+    if (!goingKey.isEmpty()) {
+        m_store.dropAccountJournal(goingKey);
+        m_store.dropAccountOutbox(goingKey);
+        refreshJournalCounts();
+        refreshOutboxCount();
+    }
 
     if (left == 0) {
         teardownSession();
@@ -1656,13 +1893,30 @@ void MailClient::switchAccountInternal(int index, const QString &sessionPassword
     m_reading->clear();
     setSearchActive(false);
     m_sync->resetFolderCursor();
-    // Queued \Seen stores name messages of the account being left, and the
-    // connection they were waiting for is the one just torn down.
-    m_pendingSeen.clear();
+    // The journal is per account and stays on disk; only the in-flight guard
+    // belongs to the connection just torn down. A reply that arrives for the
+    // old account after this is recognised as stale by its id.
+    m_journalBusy = false;
+    m_journalInFlight = 0;
+    // Same for the outbox — with one difference: a row mid-send when the
+    // connection was torn down is ambiguous the same way a crash is, so it
+    // fails with the same note rather than being deferred into a resend.
+    if (m_outboxInFlight)
+        m_store.recordOutboxFailure(
+            m_outboxInFlight,
+            tr("Interrupted while sending — it may already have been sent"), 0, true);
+    m_outboxBusy = false;
+    m_outboxInFlight = 0;
+    setUndoableSend(0, 0); // the row belongs to the account being left
+    m_outboxTimer.stop();
 
     loadAccountFields();
     m_folderModel.setAccountKey(accountKey());
     m_store.setAccountKey(accountKey());
+    // The switched-to account has its own queue, which may be neither empty
+    // nor the same size as the one just left.
+    refreshJournalCounts();
+    refreshOutboxCount();
     // The switched-to account's sidebar and the target folder come straight
     // from cache; the network refresh merges into them once connected.
     loadCachedFolderModel();
@@ -2225,39 +2479,113 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &b
     // that touches SMTP moves into the continuation (doc/openpgp.md §6).
     applyOutgoingCrypto(
         msg, toList + ccList + bccList, sign, encrypt,
-        [this, toList, ccList, bccList, fromAddr](const QByteArray &wire) {
-    // --- Ship it ---
-    // Sending is silent in the status log: success just closes the compose
-    // window (mailSent), failure keeps it open with a dismissible dialog
-    // (sendFailed). The busy spinner covers the in-progress state.
-    setBusy(true);
-    const QStringList envelope = toList + ccList + bccList;
-    m_backend->sendMessage(wire, fromAddr, envelope,
-                           [this, envelope, wire](MailBackend::Error error,
-                                                  const QString &message) {
-        setBusy(false);
-        if (error != MailBackend::Error::None) {
-            // Keep the compose window open and show the full error there.
-            Q_EMIT sendFailed(message);
-            return;
-        }
-        for (const QString &addr : envelope)
-            m_store.addRecipient(addr);
-        Q_EMIT mailSent(); // compose window closes on this
-        // Whether a Sent copy has to be filed by hand is the protocol's
-        // business: IMAP needs an APPEND, JMAP files it as part of the
-        // submission. The copy is the encrypted one — encrypted to the
-        // sender's own key too, so it stays readable.
-        if (!m_backend->sentCopyIsAutomatic()) {
-            appendToSentFolder(wire);
-        } else if (!m_sentFolder.isEmpty() && m_selectedFolder == m_sentFolder) {
-            // The server filed the copy, but nothing told the list about it:
-            // that is push's job, and a server without it (or with push not yet
-            // established) leaves the folder the user is looking at missing the
-            // message they just sent until they refresh it by hand.
-            refreshCurrentFolder();
-        }
-    });
+        [this, toList, ccList, bccList, fromAddr, subject, encrypt, attachments,
+         html](const QByteArray &wire) {
+    // Everything the outbox would need to know about this message, whether or
+    // not it ends up there.
+    MailStore::OutboxMessage row;
+    row.wire = wire;
+    row.envelope = toList + ccList + bccList;
+    row.sender = fromAddr;
+    row.subject = subject;
+    row.encrypted = encrypt;
+    // Inline (pasted) images ride in the body HTML as cid: parts, so they
+    // gate Edit exactly like an attached file does.
+    row.hasAttachments = !attachments.isEmpty()
+        || html.contains(QLatin1String("src=\"cid:"), Qt::CaseInsensitive)
+        || html.contains(QLatin1String("src='cid:"), Qt::CaseInsensitive)
+        || html.contains(QLatin1String("src=\"file:"), Qt::CaseInsensitive)
+        || html.contains(QLatin1String("src='file:"), Qt::CaseInsensitive);
+
+    // --- Online, no undo hold: straight to the wire ---
+    // The Outbox never appears — not even for the second a queued row would
+    // take to drain. The old synchronous contract holds here: the window
+    // closes on success, a rejection keeps it open with the full error. The
+    // queue steps in only if the connection turns out to be down after all —
+    // that failure means the user was effectively offline, and offline mail
+    // belongs in the Outbox, not in an error dialog.
+    if (connected() && !m_undoSend) {
+        setBusy(true);
+        m_backend->sendMessage(wire, fromAddr, row.envelope,
+                               [this, row](MailBackend::Error error, const QString &message) {
+            setBusy(false);
+            switch (error) {
+            case MailBackend::Error::None:
+                for (const QString &addr : row.envelope)
+                    m_store.addRecipient(addr);
+                Q_EMIT mailSent(); // compose window closes on this
+                // Whether a Sent copy has to be filed by hand is the
+                // protocol's business: IMAP needs an APPEND, JMAP files it as
+                // part of the submission.
+                if (!m_backend->sentCopyIsAutomatic()) {
+                    appendToSentFolder(row.wire);
+                } else if (!m_sentFolder.isEmpty() && m_selectedFolder == m_sentFolder) {
+                    // The server filed the copy, but nothing told the open
+                    // folder about it; that is push's job, and push may not be
+                    // established.
+                    refreshCurrentFolder();
+                }
+                break;
+            case MailBackend::Error::Auth:
+            case MailBackend::Error::Connection:
+            case MailBackend::Error::Throttled: {
+                // Transport, not the message's fault — the same cases the
+                // drain defers on. Queued rather than bounced back into the
+                // composer: connected() was answering for a session that was
+                // already gone.
+                MailStore::OutboxMessage queued = row;
+                if (error == MailBackend::Error::Throttled)
+                    queued.nextTry = QDateTime::currentSecsSinceEpoch() + 15;
+                if (m_store.enqueueOutbox(queued) == 0) {
+                    Q_EMIT sendFailed(message); // durability cannot be promised
+                    return;
+                }
+                Q_EMIT mailSent();
+                setStatus(tr("Queued — will be sent when the connection is back"));
+                refreshOutboxCount();
+                armOutboxTimer();
+                break;
+            }
+            case MailBackend::Error::NotFound:
+            case MailBackend::Error::Protocol:
+                // The server said no to this message. Keep the compose window
+                // open and show the full error there.
+                Q_EMIT sendFailed(message);
+                break;
+            }
+        });
+        return;
+    }
+
+    // --- Queue it ---
+    // The wire bytes are persisted before the network is attempted: quit,
+    // crash or a dead connection can no longer lose a pressed Send
+    // (doc/OUTBOX_ROADMAP.md). The compose window closes on the INSERT.
+    if (m_undoSend) {
+        // The undo-send hold: the drain may not touch the row until the delay
+        // has passed, so Cancel in the Outbox genuinely un-sends it.
+        row.nextTry = QDateTime::currentSecsSinceEpoch()
+            + qMax(1, AdvancedConfig::i("compose/undoSendDelaySecs"));
+    }
+    const qint64 id = m_store.enqueueOutbox(row);
+    if (id == 0) {
+        // The one non-transport failure left: the cache would not take the
+        // row, so durability cannot be promised. Keep the window open.
+        Q_EMIT sendFailed(tr("The message could not be queued for sending."));
+        return;
+    }
+    Q_EMIT mailSent(); // compose window closes on this
+    refreshOutboxCount();
+    // Only the send just made is undoable, and only until its hold runs out
+    // or the next send takes its place.
+    setUndoableSend(m_undoSend ? id : 0, m_undoSend ? row.nextTry : 0);
+    if (m_undoSend) {
+        // No breadcrumb: the toolbar's Undo button is already on screen
+        // counting the hold down, and saying it twice is noise.
+        armOutboxTimer();
+    } else {
+        setStatus(tr("Queued — will be sent when the connection is back"));
+    }
         });
 }
 
@@ -2327,21 +2655,32 @@ void MailClient::saveDraft(const QString &to, const QString &cc, const QString &
         });
 }
 
-void MailClient::appendToSentFolder(const QByteArray &rawMessage)
+void MailClient::appendToSentFolder(const QByteArray &rawMessage,
+                                    const std::function<void()> &done)
 {
+    // \a done fires when the copy has been dealt with — filed, or given up on
+    // for a reason that was reported. The outbox drain deletes its row from
+    // there: a crash before that leaves a row marked "may already have been
+    // sent" for the user, never a message sent and forgotten.
     if (!connected()) {
         setStatus(tr("Sent — not copied to the Sent folder (IMAP offline)"));
+        if (done)
+            done();
         return;
     }
     if (m_sentFolder.isEmpty()) {
         setStatus(tr("Sent — no Sent folder found on the server to copy into"));
+        if (done)
+            done();
         return;
     }
     m_backend->storeMessage(m_sentFolder, rawMessage, {QStringLiteral("seen")},
-                            [this](MailBackend::Error error, const QString &,
-                                   const QString &message) {
+                            [this, done](MailBackend::Error error, const QString &,
+                                         const QString &message) {
         // Success is silent — the closed compose window and the message showing
         // up in Sent are confirmation enough. Only a copy failure is logged.
+        if (done)
+            done();
         if (error != MailBackend::Error::None) {
             Q_EMIT errorOccurred(
                 tr("Sent, but copying to %1 failed: %2").arg(m_sentFolder, message));
@@ -3795,6 +4134,21 @@ QString MailClient::migrationLabel() const
     return m_jobs->migrationLabel();
 }
 
+QString MailClient::migrationEta() const
+{
+    return m_jobs->migrationEta();
+}
+
+int MailClient::migrationStep() const
+{
+    return m_jobs->migrationStep();
+}
+
+int MailClient::migrationStepCount() const
+{
+    return m_jobs->migrationStepCount();
+}
+
 int MailClient::migrationPercent() const
 {
     return m_jobs->migrationPercent();
@@ -4084,34 +4438,44 @@ bool MailClient::isTrashFolder() const
     return !m_selectedFolder.isEmpty() && m_selectedFolder == trashFolderName();
 }
 
-/// Removes the uids from the visible list and the on-disk cache.
-void MailClient::purgeDeleted(const QList<qint64> &uids)
+/// Hides the given rows of the open folder and records \a op for them. The
+/// shared body of every "this mail leaves this folder" gesture: delete, move,
+/// mark as spam, rescue from spam. Nothing waits for the network — the list
+/// updates now and the server is told afterwards, and if it refuses, the
+/// mail comes back (see retireJournalOp).
+int MailClient::journalRemoval(const QVariantList &rows, const QString &kind,
+                               const QString &target)
 {
-    m_messageModel.removeByUids(uids);
-    m_store.removeMessages(m_selectedFolder, uids);
+    MailStore::JournalOp op;
+    for (const QVariant &v : rows) {
+        const int row = v.toInt();
+        const qint64 uid = m_messageModel.uidAt(row);
+        if (uid <= 0)
+            continue;
+        op.uids.append(uid);
+        op.remoteIds.append(remoteIdOfRow(row, uid));
+    }
+    if (op.uids.isEmpty())
+        return 0;
+    op.op = kind;
+    op.folder = m_selectedFolder;
+    op.target = target;
+
+    // Hidden, not removed. The rows, their bodies and their attachments stay
+    // until the server agrees they are gone — that copy is what a rollback
+    // restores from, and destroying it here would make the transaction
+    // one-way.
+    m_store.softDeleteMessages(m_selectedFolder, op.uids);
+    m_messageModel.removeByUids(op.uids);
     invalidateMissingBodies();
+    scheduleUnreadRecount();
+    const int count = op.uids.size();
+    journalAppend(op);
+    return count;
 }
 
 void MailClient::deleteMessages(const QVariantList &rows)
 {
-    if (!connected()) {
-        Q_EMIT errorOccurred(tr("Not connected — cannot delete messages."));
-        return;
-    }
-    // ids for the backend (it names messages the protocol's way), uids for the
-    // model and cache updates that follow a success.
-    QStringList ids;
-    auto uids = std::make_shared<QList<qint64>>();
-    for (const QVariant &v : rows) {
-        const qint64 uid = m_messageModel.uidAt(v.toInt());
-        if (uid > 0) {
-            ids.append(QString::number(uid));
-            uids->append(uid);
-        }
-    }
-    if (uids->isEmpty())
-        return;
-
     // Spam skips the trash when the setting says so — filing junk under
     // "deleted" only means clearing it out twice.
     const bool permanent = deleteIsPermanent();
@@ -4120,27 +4484,13 @@ void MailClient::deleteMessages(const QVariantList &rows)
         Q_EMIT errorOccurred(tr("No trash folder found on the server."));
         return;
     }
-
-    setBusy(true);
-    // No in-progress crumb — the busy spinner covers it; only the result shows.
-
-    // Cache and model are updated only once the server has confirmed, so a
-    // failure never leaves mail on the server that mailove has forgotten.
-    const auto done = [this, uids](const QString &crumb) {
-        return [this, uids, crumb](MailBackend::Error error, const QString &message) {
-            setBusy(false);
-            if (error != MailBackend::Error::None) {
-                Q_EMIT errorOccurred(message);
-                return;
-            }
-            purgeDeleted(*uids);
-            setStatus(crumb.arg(uids->size()));
-        };
-    };
-    if (permanent)
-        m_backend->deleteMessages(m_selectedFolder, ids, done(tr("%1 deleted permanently")));
-    else
-        m_backend->moveMessages(m_selectedFolder, ids, trash, done(tr("%1 moved to trash")));
+    const int count = permanent
+        ? journalRemoval(rows, QStringLiteral("delete"), {})
+        : journalRemoval(rows, QStringLiteral("move"), trash);
+    if (count > 0) {
+        setStatus(permanent ? tr("%n deleted permanently", "", count)
+                            : tr("%n moved to trash", "", count));
+    }
 }
 
 void MailClient::markAsNotSpam(const QVariantList &rows)
@@ -4180,10 +4530,6 @@ void MailClient::markAsNotSpam(const QVariantList &rows)
 
 void MailClient::markAsJunk(const QVariantList &rows)
 {
-    if (!connected()) {
-        Q_EMIT errorOccurred(tr("Not connected — cannot move messages to spam."));
-        return;
-    }
     const QString junk = junkFolderName();
     if (junk.isEmpty()) {
         Q_EMIT errorOccurred(tr("No spam folder found on the server."));
@@ -4191,48 +4537,19 @@ void MailClient::markAsJunk(const QVariantList &rows)
     }
     if (m_selectedFolder == junk)
         return;
-
-    // ids for the backend (it names messages the protocol's way), uids for the
-    // model and cache updates that follow a success.
-    QStringList ids;
-    auto uids = std::make_shared<QList<qint64>>();
-    for (const QVariant &v : rows) {
-        const qint64 uid = m_messageModel.uidAt(v.toInt());
-        if (uid > 0) {
-            ids.append(QString::number(uid));
-            uids->append(uid);
-        }
-    }
-    if (uids->isEmpty())
-        return;
-
-    setBusy(true);
-    // No in-progress crumb — the busy spinner covers it; only the result shows.
-    m_backend->moveMessages(m_selectedFolder, ids, junk,
-                            [this, uids](MailBackend::Error error, const QString &message) {
-        setBusy(false);
-        if (error != MailBackend::Error::None) {
-            Q_EMIT errorOccurred(message);
-            return;
-        }
-        purgeDeleted(*uids);
-        setStatus(tr("%1 moved to spam").arg(uids->size()));
-    });
+    // The local verdict is not journalled: it is mailove's own opinion about
+    // the message, has never been sent anywhere, and already worked offline.
+    // Only the move is something the server has to be told about.
+    const int count = journalRemoval(rows, QStringLiteral("move"), junk);
+    if (count > 0)
+        setStatus(tr("%n moved to spam", "", count));
 }
 
 void MailClient::moveMessagesTo(const QVariantList &rows, const QString &targetFolder)
 {
-    if (!connected()) {
-        Q_EMIT errorOccurred(tr("Not connected — cannot move messages."));
-        return;
-    }
     if (targetFolder.isEmpty() || targetFolder == m_selectedFolder)
         return;
 
-    // ids for the backend (it names messages the protocol's way), uids for the
-    // model and cache updates that follow a success.
-    QStringList ids;
-    auto uids = std::make_shared<QList<qint64>>();
     // Taking a message *out* of the junk folder is the same statement as
     // pressing "Not spam", made with a different gesture, and it has to be
     // recorded the same way. Without this the message keeps its old score, is
@@ -4249,48 +4566,33 @@ void MailClient::moveMessagesTo(const QVariantList &rows, const QString &targetF
     const bool rescuedFromJunk = isJunkFolderKey(m_selectedFolder)
         && !isJunkFolderKey(targetFolder)
         && targetFolder != trashFolderName();
-    auto rescuedSenders = std::make_shared<QStringList>();
-    for (const QVariant &v : rows) {
-        const int row = v.toInt();
-        const qint64 uid = m_messageModel.uidAt(row);
-        if (uid > 0) {
-            ids.append(QString::number(uid));
-            uids->append(uid);
-            if (rescuedFromJunk) {
-                const QString sender = SpamHeuristics::addressOf(m_messageModel.fromAt(row));
-                if (!sender.isEmpty())
-                    rescuedSenders->append(sender);
-            }
+    QStringList rescuedSenders;
+    if (rescuedFromJunk) {
+        for (const QVariant &v : rows) {
+            const int row = v.toInt();
+            if (m_messageModel.uidAt(row) <= 0)
+                continue;
+            const QString sender = SpamHeuristics::addressOf(m_messageModel.fromAt(row));
+            if (!sender.isEmpty())
+                rescuedSenders.append(sender);
         }
     }
-    if (uids->isEmpty())
-        return;
 
-    setBusy(true);
-    m_backend->moveMessages(m_selectedFolder, ids, targetFolder,
-                            [this, uids, targetFolder, rescuedSenders](
-                                MailBackend::Error error, const QString &message) {
-        setBusy(false);
-        if (error != MailBackend::Error::None) {
-            Q_EMIT errorOccurred(message);
-            return;
-        }
-        // After the move, so a failed move records nothing.
-        for (const QString &sender : std::as_const(*rescuedSenders))
-            m_store.addRecipient(sender);
-        purgeDeleted(*uids);
-        // The destination's cached header list no longer matches what the
-        // server holds; its next open re-syncs it anyway, but the missing
-        // -bodies estimate is shared and would be stale immediately.
-        invalidateMissingBodies();
-        if (!rescuedSenders->isEmpty()) {
-            setStatus(tr("%1 moved to %2 — sender added to your known contacts")
-                          .arg(uids->size())
-                          .arg(folderLeaf(targetFolder)));
-        } else {
-            setStatus(tr("%1 moved to %2").arg(uids->size()).arg(folderLeaf(targetFolder)));
-        }
-    });
+    // Recorded before the move rather than after it. The allowlisting is a
+    // statement about a person, made by the user pressing the button — it is
+    // not conditional on the server accepting the move, and a move that is
+    // later rolled back does not make the sender spam again.
+    for (const QString &sender : std::as_const(rescuedSenders))
+        m_store.addRecipient(sender);
+
+    const int count = journalRemoval(rows, QStringLiteral("move"), targetFolder);
+    if (count <= 0)
+        return;
+    const QString where = folderLeaf(targetFolder);
+    setStatus(rescuedSenders.isEmpty()
+                  ? tr("%n moved to %1", "", count).arg(where)
+                  : tr("%n moved to %1 — sender added to your known contacts",
+                       "", count).arg(where));
 }
 
 QChar MailClient::folderSeparator() const
@@ -4402,9 +4704,11 @@ bool MailClient::folderProtected(const QString &mailBox) const
 
 bool MailClient::canMoveFolder(const QString &mailBox, const QString &newParent) const
 {
-    // A local archive edits its cache directly, so being offline is its
-    // normal, fully-capable state.
-    if ((!connected() && !m_acct.local) || mailBox.isEmpty() || mailBox == newParent)
+    // Offline is not a reason to refuse: the move is made locally and queued,
+    // exactly as a local archive's always was. What is still refused is a move
+    // that could not be made at all — onto itself, into its own subtree, or
+    // onto a path something else already occupies.
+    if (mailBox.isEmpty() || mailBox == newParent)
         return false;
     if (folderProtected(mailBox))
         return false;
@@ -4424,10 +4728,8 @@ bool MailClient::canMoveFolder(const QString &mailBox, const QString &newParent)
 
 void MailClient::moveFolder(const QString &mailBox, const QString &newParent)
 {
-    if (!m_acct.local && (!connected())) {
-        Q_EMIT errorOccurred(tr("Not connected — cannot move folders."));
-        return;
-    }
+    // No connection check: the move is made in the cache and the tree now, and
+    // the server is told when there is one (see renameFolderOnServer).
     if (!canMoveFolder(mailBox, newParent))
         return;
     const QChar sep = folderSeparator();
@@ -4445,8 +4747,8 @@ QString MailClient::folderRenameBlockedReason(const QString &mailBox) const
         return tr("No folder selected");
     if (m_acct.local)
         return {}; // plain storage: no folder here means anything to a server
-    if (!connected())
-        return tr("Renaming needs a connection");
+    // Being offline no longer blocks it: the rename happens in the cache and
+    // the tree, and reaches the server when there is one.
     // Named after the folder, so the menu says which one it is talking about.
     // RFC 3501 §6.3.5: renaming INBOX moves its messages out and leaves INBOX
     // in place, so it is not a rename at all. RFC 6154 special-use: a server
@@ -4481,10 +4783,6 @@ void MailClient::renameFolder(const QString &mailBox, const QString &newName)
         Q_EMIT errorOccurred(tr("A folder named %1 is already there.").arg(leaf));
         return;
     }
-    if (!m_acct.local && (!connected())) {
-        Q_EMIT errorOccurred(tr("Not connected — cannot rename folders."));
-        return;
-    }
     renameFolderOnServer(mailBox, dest, tr("Renamed to %1").arg(leaf));
 }
 
@@ -4498,10 +4796,9 @@ bool MailClient::folderDeleteIsPermanent(const QString &mailBox) const
 
 void MailClient::deleteFolder(const QString &mailBox)
 {
-    if (!m_acct.local && (!connected())) {
-        Q_EMIT errorOccurred(tr("Not connected — cannot delete folders."));
-        return;
-    }
+    // Offline is fine here too: the folder leaves the tree now and the server
+    // is told when there is a connection. Its mail is kept until then, which
+    // is what an abandoned delete is undone from.
     if (mailBox.isEmpty() || folderProtected(mailBox))
         return;
 
@@ -4514,131 +4811,126 @@ void MailClient::deleteFolder(const QString &mailBox)
 
     if (m_acct.local) {
         // No server holds a copy: dropping the subtree from the folder list
-        // and purging its cached mail IS the deletion. The purge itself runs
-        // chunked on the worker; the tree and the open folder update now.
+        // and purging its cached mail IS the deletion — there is nothing to
+        // journal and nothing to keep the mail for. The purge runs chunked on
+        // the worker; the tree and the open folder update now.
         const QStringList doomed = folderSubtree(mailBox);
-        QStringList remaining = m_folderModel.allMailBoxes();
-        for (const QString &box : doomed)
-            remaining.removeAll(box);
-        m_store.storeFolders(accountKey(), remaining);
-        m_folderModel.setFolders(foldersFromPaths(remaining));
+        dropFoldersFromTree(doomed);
         purgeCachedFolders(doomed);
-        if (doomed.contains(m_selectedFolder)) {
-            // Even INBOX may be gone here — land on whatever still exists.
-            if (remaining.contains(QStringLiteral("INBOX")))
-                openFolder(QStringLiteral("INBOX"));
-            else if (!remaining.isEmpty())
-                openFolder(remaining.first());
-            else {
-                m_selectedFolder.clear();
-                Q_EMIT selectedFolderChanged();
-                m_messageModel.clear();
-            }
-        }
         setStatus(tr("%1 deleted").arg(leaf));
         return;
     }
 
-    // Already in the trash: this really removes it. Subfolders go first —
-    // deepest first, one job at a time, since a server may refuse to delete a
-    // mailbox that still has children.
-    auto remaining = std::make_shared<QStringList>(folderSubtree(mailBox));
-    if (remaining->isEmpty())
+    // Already in the trash: this really removes it. The subtree goes deepest
+    // first, one op per mailbox — a server may refuse to DELETE a mailbox that
+    // still has children, and replay is serial, so queueing them in that order
+    // is all the sequencing this needs. The chained-callback version this
+    // replaces was doing by hand what the journal now does for every change.
+    const QStringList doomed = folderSubtree(mailBox);
+    if (doomed.isEmpty())
         return;
-    const auto deleted = std::make_shared<QStringList>();
 
-    setBusy(true);
-    // Chained rather than fired together, so the first failure stops the rest
-    // — and a backend that serializes its requests gains nothing from the
-    // parallel version anyway.
-    auto step = std::make_shared<std::function<void()>>();
-    *step = [this, remaining, deleted, step, leaf] {
-        if (remaining->isEmpty()) {
-            purgeCachedFolders(*deleted);
-            // Whatever was open inside the deleted subtree is gone; land on
-            // INBOX rather than on a mailbox the server no longer has.
-            if (deleted->contains(m_selectedFolder))
-                m_pendingFolder = QStringLiteral("INBOX");
-            setStatus(tr("%1 deleted").arg(leaf));
-            listFolders(); // clears busy when the new tree arrives
-            return;
-        }
-        const QString box = remaining->takeFirst();
-        m_backend->deleteFolder(box, [this, box, deleted, step](MailBackend::Error error,
-                                                                const QString &message) {
-            if (error != MailBackend::Error::None) {
-                setBusy(false);
-                setStatus(tr("Deleting folder failed"));
-                Q_EMIT errorOccurred(message);
-                if (!deleted->isEmpty()) {
-                    purgeCachedFolders(*deleted); // whatever did go, goes from the cache too
-                    setBusy(true);
-                    listFolders();
-                }
-                return;
-            }
-            deleted->append(box);
-            (*step)();
-        });
-    };
-    (*step)();
+    // The tree loses them now. The cached mail stays until the server agrees,
+    // which is what a rollback puts back — dropping the folder from the list
+    // is the folder-sized equivalent of hiding a message row.
+    dropFoldersFromTree(doomed);
+    setStatus(tr("%1 deleted").arg(leaf));
+    for (const QString &box : doomed) {
+        MailStore::JournalOp op;
+        op.op = QStringLiteral("folder_delete");
+        op.folder = box;
+        journalAppend(op);
+    }
+}
+
+/// Takes \a folders out of the stored list and the sidebar, leaving their
+/// cached mail alone. Both a provisional delete and the undo of one go through
+/// here, which is why it does not purge: the mail is what makes the undo
+/// possible.
+void MailClient::dropFoldersFromTree(const QStringList &folders)
+{
+    QStringList remaining = m_store.cachedFolders(accountKey());
+    for (const QString &box : folders)
+        remaining.removeAll(box);
+    m_store.storeFolders(accountKey(), remaining);
+    m_folderModel.setFolders(foldersFromPaths(remaining));
+    if (!folders.contains(m_selectedFolder))
+        return;
+    // Whatever was open inside the deleted subtree is gone; land on whatever
+    // still exists — even INBOX may have been in there, for a local archive.
+    if (remaining.contains(QStringLiteral("INBOX")))
+        openFolder(QStringLiteral("INBOX"));
+    else if (!remaining.isEmpty())
+        openFolder(remaining.first());
+    else {
+        m_selectedFolder.clear();
+        Q_EMIT selectedFolderChanged();
+        m_messageModel.clear();
+    }
+}
+
+/// Puts \a folders back in the stored list and the sidebar, in tree order —
+/// undoing dropFoldersFromTree() when the server refused the delete.
+void MailClient::restoreFoldersToTree(const QStringList &folders)
+{
+    QStringList boxes = m_store.cachedFolders(accountKey());
+    for (const QString &box : folders) {
+        if (!boxes.contains(box))
+            boxes.append(box);
+    }
+    sortMailBoxPaths(&boxes, folderSeparator());
+    m_store.storeFolders(accountKey(), boxes);
+    m_folderModel.setFolders(foldersFromPaths(boxes));
 }
 
 void MailClient::renameFolderOnServer(const QString &from, const QString &to,
                                       const QString &doneStatus)
 {
     setBusy(true);
-    if (m_acct.local) {
-        // No server to ask — the cache re-key IS the rename, and it also
-        // rewrites the stored folder list (see MailStore::renameFolderOn).
-        // Unlike the connected path, the tree refresh and the selection
-        // follow-up wait for the worker: reopening a folder whose rows are
-        // still being re-keyed would show it half-empty.
-        renameCachedFolder(from, to, [this, from, to, doneStatus] {
-            const QString prefix = from + folderSeparator();
-            if (m_selectedFolder == from || m_selectedFolder.startsWith(prefix)) {
-                setSelectedFolder(to + m_selectedFolder.mid(from.size()));
-                Q_EMIT selectedFolderChanged();
-            }
-            // The re-key rewrites each path in place but leaves the stored row
-            // order alone, and the tree is drawn from that order — a folder
-            // moved under a parent further down the list would render as an
-            // indented orphan. A connected account gets a freshly sorted list
-            // back from the server's LIST; here nobody else will sort it.
-            QStringList boxes = m_store.cachedFolders(accountKey());
-            sortMailBoxPaths(&boxes, folderSeparator());
-            m_store.storeFolders(accountKey(), boxes);
-            m_folderModel.setFolders(foldersFromPaths(boxes));
-            setBusy(false);
-            if (!m_selectedFolder.isEmpty())
-                openFolder(m_selectedFolder);
-            setStatus(doneStatus);
-        });
-        return;
-    }
-    m_backend->renameFolder(from, to, [this, from, to, doneStatus](
-                                          MailBackend::Error error, const QString &message) {
-        if (error != MailBackend::Error::None) {
-            setBusy(false);
-            setStatus(tr("Moving folder failed"));
-            Q_EMIT errorOccurred(message);
-            return;
-        }
-        // The mail did not change, only the path it is filed under — re-key
-        // the cache instead of making the user sync the folder again. It runs
-        // in the background: a header sync that lands on the new path while it
-        // is still going may lose a row or two to the re-key, which the next
-        // refresh puts back. Blocking the UI for a subtree rewrite would be a
-        // far worse trade.
-        renameCachedFolder(from, to);
-        // RENAME takes the subtree with it, so the open folder may be sitting
-        // at a path that no longer exists. Follow it to the new one.
-        const QString prefix = from + folderSeparator();
-        if (m_selectedFolder == from || m_selectedFolder.startsWith(prefix))
-            m_pendingFolder = to + m_selectedFolder.mid(from.size());
+    // The rename happens here and now, for a server account exactly as for a
+    // local archive: the cache re-key *is* the rename, and the only difference
+    // is that a server has still to be told about it. The mail did not change,
+    // only the path it is filed under, so re-keying beats making the user sync
+    // the whole folder again.
+    //
+    // The re-key runs on a worker (it rewrites body blobs) and the tree waits
+    // for it: reopening a folder whose rows are still being re-keyed would show
+    // it half empty.
+    const bool local = m_acct.local;
+    renameCachedFolder(from, to, [this, from, to, doneStatus, local] {
+        renameFolderPaths(from, to);
+        setBusy(false);
         setStatus(doneStatus);
-        listFolders(); // clears busy when the new tree arrives
+        if (local)
+            return; // no server holds a copy: the re-key was the whole job
+        MailStore::JournalOp op;
+        op.op = QStringLiteral("folder_rename");
+        op.folder = from;
+        op.target = to;
+        journalAppend(op);
     });
+}
+
+/// Moves the folder list, the folder model and the open folder onto \a to
+/// after the cached rows have been re-keyed. Both directions of a rename go
+/// through this — making it, and undoing it.
+void MailClient::renameFolderPaths(const QString &from, const QString &to)
+{
+    // The re-key rewrites each path in place but leaves the stored row order
+    // alone, and the tree is drawn from that order — a folder moved under a
+    // parent further down the list would render as an indented orphan.
+    QStringList boxes = m_store.cachedFolders(accountKey());
+    sortMailBoxPaths(&boxes, folderSeparator());
+    m_store.storeFolders(accountKey(), boxes);
+    m_folderModel.setFolders(foldersFromPaths(boxes));
+    // RENAME takes the subtree with it, so the open folder may be sitting at a
+    // path that no longer exists. Follow it to the new one.
+    const QString prefix = from + folderSeparator();
+    if (m_selectedFolder == from || m_selectedFolder.startsWith(prefix)) {
+        setSelectedFolder(to + m_selectedFolder.mid(from.size()));
+        Q_EMIT selectedFolderChanged();
+        openFolder(m_selectedFolder);
+    }
 }
 
 void MailClient::renameCachedFolder(const QString &from, const QString &to,
@@ -4750,7 +5042,19 @@ void MailClient::pollAccount(const QVariantMap &account, const std::function<voi
                     MailBackend::Error, const QHash<QString, int> &counts, const QString &) {
                 // Replace wholesale: a folder that has dropped to zero unread
                 // must lose its pill, which merging would never do.
+                qCInfo(logUnread) << "server counts <- background poll of" << key << ":"
+                                  << describeCounts(counts);
                 m_unreadByAccount.insert(key, counts);
+                m_serverCountedAccounts.insert(key);
+                reconcileSeenWithServer(key, folders, counts);
+                // Where the count and the cache disagree by anything other
+                // than zero, ask the server *which* mail it calls unread. A
+                // count alone can only draw a badge — it names no rows, so the
+                // pill showed the server's ten while the folder underneath it
+                // showed the cache's none, and nothing could reconcile them.
+                // This is the only path that can, and it is one command per
+                // folder that actually disagrees.
+                reconcileUnseenIds(backend, key, counts);
                 ++m_cachedFolderRevision;
                 Q_EMIT cachedFoldersChanged();
                 // The counts are the news; this is the mail behind them. The
@@ -5064,19 +5368,225 @@ void MailClient::refreshAccountUnreadCounts()
 
     // One call for every folder at once over JMAP, where IMAP would need a
     // STATUS each — which is why this hangs off a signal only JMAP raises.
-    m_backend->folderUnreadCounts(folders, [this, key](MailBackend::Error error,
-                                                       const QHash<QString, int> &counts,
-                                                       const QString &) {
+    m_backend->folderUnreadCounts(folders, [this, key, folders](MailBackend::Error error,
+                                                                const QHash<QString, int> &counts,
+                                                                const QString &) {
         if (error != MailBackend::Error::None)
             return; // best-effort: the poll timer and the backfill still run
         // Replace wholesale, as the other-accounts poll does: a folder that has
         // dropped to zero unread must lose its pill, which merging never does.
+        qCInfo(logUnread) << "pills <- server counts for" << key << ":"
+                          << describeCounts(counts);
         m_unreadByAccount.insert(key, counts);
+        m_serverCountedAccounts.insert(key);
+        reconcileSeenWithServer(key, folders, counts);
         if (key == accountKey())
             m_folderModel.setUnreadCounts(counts);
         ++m_cachedFolderRevision;
         Q_EMIT cachedFoldersChanged();
     });
+}
+
+void MailClient::verifyCachedUnread(const QString &folder)
+{
+    // The badge is counted from the cache's `seen` flags, and those go stale in
+    // exactly one way: mail read on another device. That changes no folder
+    // size and produces no new uid, so no sync path ever re-reads the flag of a
+    // message already cached — the row stays unread here forever, and the
+    // sidebar promises mail that is not there. It is the "12 new messages,
+    // nothing new inside" report, and it survived two previous attempts at a
+    // fix because both of them healed the *other* folders: the open one was
+    // deliberately skipped, and over IMAP the server-count path they hung off
+    // never runs at all (only JMAP raises accountChanged).
+    //
+    // So ask the server directly, about exactly the rows in doubt. The set is
+    // self-limiting — it is the unread mail, not the folder — and the answer is
+    // definitive rather than inferred from a count. storeHeaders() takes the
+    // server's `seen` verbatim now, so the fetch corrects the cache by landing.
+    if (!connected() || folder.isEmpty() || !m_backend) {
+        qCInfo(logUnread) << "verify" << folder << "skipped: not connected";
+        return;
+    }
+    // Not while the folder still owes the server a flag change: the answer
+    // would be the state from before our own push, and believing it would undo
+    // what the user just did. Invariant 3.
+    if (folderHasPendingOps(folder)) {
+        qCInfo(logUnread) << "verify" << folder << "skipped: unsent changes outstanding";
+        return;
+    }
+    const QList<MailStore::AgedMessage> unseen = m_store.unseenMessages(folder);
+    if (unseen.isEmpty()) {
+        qCInfo(logUnread) << "verify" << folder << "skipped: the cache calls nothing unread";
+        return;
+    }
+    // A folder with more unread than this is not the folder anybody is
+    // puzzled about, and re-reading thousands of headers to correct a badge
+    // would cost more than the badge is worth.
+    constexpr int kMaxVerify = 500;
+    if (unseen.size() > kMaxVerify) {
+        qCInfo(logUnread) << "verify" << folder << "skipped:" << unseen.size()
+                          << "unread rows is past the" << kMaxVerify << "cap";
+        return;
+    }
+    qCInfo(logUnread) << "verify" << folder << ": asking the server about"
+                      << unseen.size() << "rows the cache calls unread";
+    QStringList ids;
+    ids.reserve(unseen.size());
+    for (const MailStore::AgedMessage &m : unseen)
+        ids.append(m.remoteId);
+    const int asked = ids.size();
+    m_backend->fetchHeadersById(folder, ids,
+                                [this, folder, asked](MailBackend::Error error, const QString &) {
+        // Drained whether or not it worked: left behind, these rows would be
+        // handed to whatever asks for this folder's pending headers next.
+        const QList<MessageListModel::Header> fetched = m_sync->takePendingHeaders(folder);
+        if (error != MailBackend::Error::None || fetched.isEmpty()) {
+            // Both of these leave the badge exactly as it was, which is the
+            // shape every "supposedly fixed" report has taken: the correction
+            // ran and corrected nothing, and said nothing about it.
+            qCWarning(logUnread) << "verify" << folder << "answered nothing —"
+                                 << "error" << int(error) << ", headers" << fetched.size()
+                                 << "of" << asked << "asked; the badge stands unchecked";
+            return;
+        }
+        // Straight to the cache. Not through the model: this is a background
+        // correction of rows the user is not looking at, and appending to the
+        // visible list would reorder it under them.
+        m_store.storeHeaders(folder, fetched);
+        // A row the server calls read is one of the stale ones this exists to
+        // find; a row it still calls unread was right all along.
+        int corrected = 0;
+        for (const MessageListModel::Header &h : fetched) {
+            if (!h.seen)
+                continue;
+            ++corrected;
+            // The rows on screen have to agree with the cache we just wrote,
+            // or the list shows bold mail the badge no longer counts.
+            if (folder != m_selectedFolder)
+                continue;
+            const int row = m_messageModel.rowForUid(h.uid);
+            if (row >= 0)
+                m_messageModel.markSeen(row);
+        }
+        qCInfo(logUnread) << "verify" << folder << ":" << corrected << "of" << asked
+                          << "had been read elsewhere," << (fetched.size() - corrected)
+                          << "confirmed unread";
+        if (corrected == 0)
+            return;
+        scheduleUnreadRecount();
+    });
+}
+
+void MailClient::reconcileUnseenIds(MailBackend *backend, const QString &key,
+                                    const QHash<QString, int> &counts)
+{
+    if (!backend)
+        return;
+    // What the cache believes, folder by folder, so only the folders that
+    // actually disagree cost a round trip.
+    const QHash<QString, int> cached = m_store.unreadCounts(key);
+    for (auto it = counts.constBegin(); it != counts.constEnd(); ++it) {
+        if (it.value() != cached.value(it.key(), 0))
+            reconcileUnseenIn(backend, key, it.key());
+    }
+}
+
+void MailClient::reconcileUnseenIn(MailBackend *backend, const QString &key,
+                                   const QString &folder)
+{
+    if (!backend || folder.isEmpty())
+        return;
+    // Invariant 3: a folder still owing the server a flag change is asked
+    // about after the change lands, not before — the answer would be the
+    // state from before our own push.
+    if (m_store.journalFolders(key).contains(folder))
+        return;
+    // Nothing cached for this folder means nothing to correct: applyUnseenSet
+    // rewrites rows, it cannot invent them, so the round trip would buy an
+    // answer nobody could act on. The pass caches the folder's headers on the
+    // same visit, so the next one has something to ask about.
+    if (m_store.cachedHeaderCount(folder) == 0)
+        return;
+    {
+        const int local = m_store.unreadCounts(key).value(folder, 0);
+        // Debug: this fires once per folder per pass, and is only interesting
+        // beside an answer that changed something.
+        qCDebug(logUnread) << "reconcile" << key << folder << ": cache says" << local
+                           << "— asking the server which mail it calls unread";
+        backend->fetchUnseenIds(folder, [this, key, folder, local](
+                                            MailBackend::Error error, const QStringList &ids,
+                                            const QString &message) {
+            if (error != MailBackend::Error::None) {
+                qCWarning(logUnread) << "reconcile" << key << folder << "failed:" << message;
+                return;
+            }
+            const int changed = m_store.applyUnseenSet(key, folder, ids);
+            // Only when something moved, or when nothing could: a folder that
+            // already agrees with the server is the normal case and is not
+            // worth a line. The second half is the one to keep — the server
+            // naming mail the cache does not hold is exactly why a pill fed
+            // from counts and one fed from rows can disagree by design.
+            if (changed > 0 || ids.size() != local) {
+                qCInfo(logUnread) << "reconcile" << key << folder << ": server listed"
+                                  << ids.size() << "unread," << changed
+                                  << "cached rows corrected (the cache had" << local << ")";
+            }
+            // The cache has just been made to agree with the server about
+            // this folder, so it is the better source from here on: drop the
+            // override that was keeping the poll's number in place, or the
+            // corrected count would be computed and then thrown away.
+            m_serverCountedAccounts.remove(key);
+            if (changed == 0)
+                return;
+            scheduleUnreadRecount();
+        });
+    }
+}
+
+void MailClient::reconcileSeenWithServer(const QString &key, const QStringList &folders,
+                                         const QHash<QString, int> &counts)
+{
+    // Only the zero case: the server saying "nothing unread here" pins every
+    // cached row of that folder as read, while a partial disagreement cannot
+    // be mapped to rows without fetching every flag. Zero is also the common
+    // way flags go stale — the whole inbox read on the phone.
+    //
+    // A folder the server did not answer for is left alone — absent from
+    // `counts` means unknown, not zero.
+    //
+    // The selected folder used to be skipped here too, on the grounds that
+    // rewriting rows underneath an open list was not this path's business.
+    // That made the open folder — which is INBOX almost all of the time — the
+    // one folder never healed, so the badge everybody actually looks at was
+    // the one that stayed wrong. It is included now, and the rows on screen
+    // are corrected with it (see clearUnseenIn's caller below).
+    //
+    // The trade this used to make knowingly — clearing an unread mark the user
+    // had made offline, because the server had not been told about it — is no
+    // longer necessary: a folder with an unreplayed op is skipped outright.
+    // The server saying "fully read" is a statement about a folder it has not
+    // yet heard the truth about, and acting on it would undo the user's change
+    // moments before the drain pushed it. Invariant 3, in the one place that
+    // used to break it.
+    const QSet<QString> queued = m_store.journalFolders(key);
+    int cleared = 0;
+    for (const QString &folder : folders) {
+        if (counts.value(folder, -1) != 0)
+            continue;
+        if (queued.contains(folder))
+            continue;
+        const int gone = m_store.clearUnseenIn(key, folder);
+        cleared += gone;
+        // The list is showing this folder, so its rows have just been made to
+        // disagree with the cache behind them.
+        if (gone > 0 && key == accountKey() && folder == m_selectedFolder)
+            m_messageModel.markAllSeen();
+    }
+    if (cleared > 0) {
+        qCInfo(logUnread) << "reconcile" << key << ": cleared" << cleared
+                          << "stale unread flags in folders the server calls fully read";
+        scheduleUnreadRecount();
+    }
 }
 
 void MailClient::scheduleUnreadRecount()
@@ -5181,6 +5691,25 @@ void MailClient::applySyncToken(const QString &folder, const QString &syncToken)
 
 void MailClient::applyFolderInvalidated(const QString &folder)
 {
+    // Every uid in this folder has just been declared meaningless — an IMAP
+    // mailbox regenerated under us, or a JMAP position the server can no
+    // longer reason from. Queued changes name messages by exactly those ids,
+    // so replaying one would address whatever now happens to hold the number.
+    // They go, and they go before the cache is cleared: rolling them back
+    // afterwards would be writing to rows that no longer exist.
+    const QList<MailStore::JournalOp> void_ = m_store.journalOpsFor(accountKey(), folder);
+    for (int i = void_.size() - 1; i >= 0; --i) {
+        rollbackJournalOp(void_.at(i));
+        m_store.dropJournalOp(void_.at(i).id);
+    }
+    if (!void_.isEmpty()) {
+        qCWarning(logJournal) << void_.size() << "op(s) dropped: the folder's ids were reset";
+        // Not the failed-changes list: nothing failed and nothing can be
+        // retried, because there is no longer a message to retry it against.
+        setStatus(tr("%n unsent change(s) were lost when the folder was reset", "",
+                     void_.size()));
+        refreshJournalCounts();
+    }
     m_sync->applyFolderInvalidated(folder);
 }
 
@@ -5193,6 +5722,21 @@ void MailClient::applyFolderOpened(const QString &folder, qint64 messageCount,
                                    const QString &syncToken)
 {
     m_sync->applyFolderOpened(folder, messageCount, syncToken);
+    // The folder is selected on the server right now, which is the cheapest
+    // moment there will ever be to ask whether the mail we still call unread
+    // really is.
+    if (folder == m_selectedFolder) {
+        verifyCachedUnread(folder);
+        return;
+    }
+    // Every other folder of the open account, as the background pass walks
+    // them. Without this they were nobody's job: the verification above only
+    // ever ran for the folder on screen, and the id reconcile only ran for
+    // accounts that are *not* open — so a folder of the current account could
+    // only be corrected by opening it, which is exactly the "the badge did not
+    // move until I clicked it" report. One UID SEARCH per folder per pass, on
+    // the connection that already has it selected.
+    reconcileUnseenIn(m_backend, accountKey(), folder);
 }
 
 void MailClient::updatePageAnchor(const QList<MessageListModel::Header> &page)
@@ -5724,67 +6268,50 @@ void MailClient::filterByColor(int color)
     m_messageModel.appendHeaders(m_store.headersByColor(m_selectedFolder, color));
 }
 
-void MailClient::markMessagesUnread(const QVariantList &rows)
+/// Shared body of the two below: applies the mark to the model and the cache,
+/// then records one op for whatever actually changed. The rows already in the
+/// wanted state are skipped, which is not just an optimisation — the journal's
+/// rollback is derived from the op rather than stored, and that only holds
+/// while an op describes a change that really happened.
+void MailClient::markMessagesSeen(const QVariantList &rows, bool seen)
 {
-    QList<qint64> uids;
+    MailStore::JournalOp op;
     for (const QVariant &v : rows) {
         const int row = v.toInt();
         const qint64 uid = m_messageModel.uidAt(row);
-        if (uid < 0 || !m_messageModel.seenAt(row))
-            continue; // already unread: nothing to undo
-        m_messageModel.markUnseen(row);
-        m_store.setUnseen(m_selectedFolder, uid);
-        uids.append(uid);
+        if (uid < 0 || m_messageModel.seenAt(row) == seen)
+            continue; // already in the wanted state: nothing to record
+        if (seen) {
+            m_messageModel.markSeen(row);
+            m_store.setSeen(m_selectedFolder, uid);
+        } else {
+            m_messageModel.markUnseen(row);
+            m_store.setUnseen(m_selectedFolder, uid);
+        }
+        op.uids.append(uid);
+        op.remoteIds.append(remoteIdOfRow(row, uid));
     }
-    if (uids.isEmpty())
+    if (op.uids.isEmpty())
         return;
     scheduleUnreadRecount();
 
     // Nothing here reopens the message. Marking the open one unread leaves it
     // on screen and leaves it unread — the ordinary rule then applies again,
     // and it is only marked read the next time it is actually opened.
-    if (!connected())
-        return;
-    // Clear \Seen server-side so other clients and the next header sync agree,
-    // exactly as markMessageRead() sets it. Best effort, same as there.
-    QStringList ids;
-    for (qint64 uid : std::as_const(uids))
-        ids.append(QString::number(uid));
-    m_backend->setFlags(m_selectedFolder, ids, {}, {QStringLiteral("seen")},
-                        [this](MailBackend::Error error, const QString &) {
-        if (error != MailBackend::Error::None)
-            setStatus(tr("Marking unread failed on the server"));
-    });
+    op.op = QStringLiteral("flag");
+    op.folder = m_selectedFolder;
+    (seen ? op.flagsAdd : op.flagsDel).append(QStringLiteral("seen"));
+    journalAppend(op);
+}
+
+void MailClient::markMessagesUnread(const QVariantList &rows)
+{
+    markMessagesSeen(rows, false);
 }
 
 void MailClient::markMessagesRead(const QVariantList &rows)
 {
-    QList<qint64> uids;
-    for (const QVariant &v : rows) {
-        const int row = v.toInt();
-        const qint64 uid = m_messageModel.uidAt(row);
-        if (uid < 0 || m_messageModel.seenAt(row))
-            continue; // already read: nothing to do
-        m_messageModel.markSeen(row);
-        m_store.setSeen(m_selectedFolder, uid);
-        uids.append(uid);
-    }
-    if (uids.isEmpty())
-        return;
-    scheduleUnreadRecount();
-
-    if (!connected())
-        return;
-    // Set \Seen server-side so other clients and the next header sync agree,
-    // exactly as markMessagesUnread() clears it. Best effort, same as there.
-    QStringList ids;
-    for (qint64 uid : std::as_const(uids))
-        ids.append(QString::number(uid));
-    m_backend->setFlags(m_selectedFolder, ids, {QStringLiteral("seen")}, {},
-                        [this](MailBackend::Error error, const QString &) {
-        if (error != MailBackend::Error::None)
-            setStatus(tr("Marking read failed on the server"));
-    });
+    markMessagesSeen(rows, true);
 }
 
 bool MailClient::folderHasUnread(const QString &mailBox)
@@ -5815,40 +6342,827 @@ void MailClient::markFolderRead(const QString &mailBox)
 
     if (unseen.isEmpty())
         return;
-    QStringList ids;
-    ids.reserve(unseen.size());
-    for (const MailStore::AgedMessage &m : unseen)
-        ids.append(m.remoteId);
-    // Offline — including the moment right after a right-click switched to
-    // this account — the store waits for the connection rather than being
-    // dropped: the cache alone would lose the argument with the next header
-    // sync, which reads the server's untouched flags back.
-    if (!connected()) {
-        m_pendingSeen[mailBox] += ids;
-        return;
+    MailStore::JournalOp op;
+    op.op = QStringLiteral("flag");
+    op.folder = mailBox;
+    op.flagsAdd.append(QStringLiteral("seen"));
+    op.remoteIds.reserve(unseen.size());
+    op.uids.reserve(unseen.size());
+    for (const MailStore::AgedMessage &m : unseen) {
+        op.remoteIds.append(m.remoteId);
+        op.uids.append(m.uid);
     }
-    sendSeenStore(mailBox, ids);
+    journalAppend(op);
 }
 
-void MailClient::sendSeenStore(const QString &mailBox, const QStringList &ids)
+// --- the journal ------------------------------------------------------------
+//
+// The write path. Every mutation above changes the cache and the model and
+// then records an op here; nothing calls the backend directly, and replay is
+// the only thing that does. See doc/OFFLINE_FIRST_ROADMAP.md — the three
+// invariants that hold this together are stated there once, and the code
+// points at them rather than re-arguing each one.
+//
+// Why route *everything* through it, rather than only the offline case: a path
+// exercised only when the network is down is a path nobody tests. Sending the
+// ordinary online change through the same queue means its bugs show up on the
+// first day rather than on somebody's train journey.
+
+namespace
 {
-    m_backend->setFlags(mailBox, ids, {QStringLiteral("seen")}, {},
-                        [this](MailBackend::Error error, const QString &) {
-        if (error != MailBackend::Error::None)
-            setStatus(tr("Marking the folder read failed on the server"));
+/// Attempts before an op is given up on. Three, because the failures worth
+/// retrying (a momentary NO, a mailbox briefly locked) clear within seconds,
+/// and the ones that are not going to clear should reach the user quickly.
+constexpr int kJournalMaxTries = 3;
+/// How long an unsent change is worth keeping. A move queued a week ago is
+/// addressing a mailbox that has changed underneath it — better abandoned
+/// (and rolled back, visibly) than replayed against a world it no longer
+/// describes.
+constexpr int kJournalMaxAgeDays = 7;
+/// Pause before retrying after the server asked us to slow down.
+constexpr int kJournalThrottleMs = 30000;
+/// Pause before retrying an op the server refused. Long enough that three
+/// attempts are three genuine chances rather than one in triplicate, short
+/// enough that a real failure reaches the user while they still remember
+/// making the change.
+constexpr int kJournalRetryMs = 5000;
+} // namespace
+
+QString MailClient::remoteIdOfRow(int row, qint64 uid) const
+{
+    // The backend's own name where the model has one, the uid otherwise —
+    // which is what an IMAP row cached before the remote_id column existed
+    // means implicitly, and what an IMAP backend expects anyway.
+    const QString id = m_messageModel.remoteIdAt(row);
+    return id.isEmpty() ? QString::number(uid) : id;
+}
+
+void MailClient::journalAppend(MailStore::JournalOp op)
+{
+    op.account = accountKey();
+    const qint64 id = m_store.appendJournalOp(op);
+    if (id == 0) {
+        // The cache write is already done and the user can see it. Nothing can
+        // put that back except telling them it will not reach the server.
+        Q_EMIT errorOccurred(tr("This change could not be recorded and may be "
+                                "lost the next time the folder syncs."));
+        return;
+    }
+    qCInfo(logJournal).nospace() << "op " << id << " queued: " << op.op << ", "
+                                 << op.remoteIds.size() << " message(s)";
+    refreshJournalCounts();
+    drainJournal();
+}
+
+void MailClient::drainJournal()
+{
+    if (m_journalBusy || !m_backend || !connected())
+        return;
+    expireJournalOps();
+    const QList<MailStore::JournalOp> ops = m_store.journalOps(accountKey());
+    if (ops.isEmpty()) {
+        // Drained. Whatever the sync skipped while these were outstanding is
+        // now safe to read from the server, so it is asked for again rather
+        // than left waiting for the next connect.
+        if (m_journalPending > 0) {
+            m_sync->restartFolderPass();
+            if (!m_selectedFolder.isEmpty())
+                m_sync->refreshSelectedFolder(m_selectedFolder);
+        }
+        refreshJournalCounts();
+        return;
+    }
+    // Strictly one at a time, in id order. Not a throughput problem — these
+    // are a handful of small commands — and ordering is the entire point: two
+    // in flight at once can be answered out of order, and the second op's
+    // effect can then be undone by the first op's rollback.
+    const MailStore::JournalOp &next = ops.first();
+    m_journalBusy = true;
+    m_journalInFlight = next.id;
+    sendJournalOp(next);
+}
+
+void MailClient::sendJournalOp(const MailStore::JournalOp &op)
+{
+    const auto done = [this, op](MailBackend::Error error, const QString &message) {
+        finishJournalOp(op, error, message);
+    };
+    if (op.op == QLatin1String("flag")) {
+        m_backend->setFlags(op.folder, op.remoteIds, op.flagsAdd, op.flagsDel, done);
+        return;
+    }
+    if (op.op == QLatin1String("move")) {
+        m_backend->moveMessages(op.folder, op.remoteIds, op.target, done);
+        return;
+    }
+    if (op.op == QLatin1String("delete")) {
+        m_backend->deleteMessages(op.folder, op.remoteIds, done);
+        return;
+    }
+    if (op.op == QLatin1String("folder_rename")) {
+        m_backend->renameFolder(op.folder, op.target, done);
+        return;
+    }
+    if (op.op == QLatin1String("folder_delete")) {
+        m_backend->deleteFolder(op.folder, done);
+        return;
+    }
+    // A cache written by a newer version, opened by an older one. Dropping it
+    // is the only option that terminates: it cannot be sent and it cannot be
+    // rolled back by a version that does not know what it did.
+    qCWarning(logJournal) << "op" << op.id << "has unknown kind" << op.op << "- dropped";
+    m_store.dropJournalOp(op.id);
+    m_journalBusy = false;
+    m_journalInFlight = 0;
+    refreshJournalCounts();
+    drainJournal();
+}
+
+void MailClient::finishJournalOp(const MailStore::JournalOp &op, MailBackend::Error error,
+                                 const QString &message)
+{
+    // An account switch clears the guard while a request is still outstanding;
+    // its reply names an op that is no longer this account's business.
+    if (m_journalInFlight != op.id)
+        return;
+    m_journalBusy = false;
+    m_journalInFlight = 0;
+
+    switch (error) {
+    case MailBackend::Error::None:
+        confirmJournalOp(op);
+        m_store.dropJournalOp(op.id);
+        qCInfo(logJournal) << "op" << op.id << op.op << "confirmed";
+        break;
+    case MailBackend::Error::NotFound:
+        // The message or mailbox is already gone. That is the intent being
+        // satisfied by somebody else, not a failure: retire it silently and
+        // let the next sync remove whatever row is left behind. Rolling it
+        // back would restore mail the user deleted.
+        qCInfo(logJournal) << "op" << op.id << op.op << "already applied elsewhere";
+        m_store.dropJournalOp(op.id);
+        break;
+    case MailBackend::Error::Auth:
+    case MailBackend::Error::Connection:
+        // Nothing to do with this op — the session is down. Leave it queued
+        // without spending a try, and let connectedChanged() restart the
+        // drain. Counting these would burn an op's three chances on a flaky
+        // train connection and roll back a change the user made correctly.
+        qCInfo(logJournal) << "op" << op.id << "deferred: connection down";
+        refreshJournalCounts();
+        return;
+    case MailBackend::Error::Throttled:
+        // Also not the op's fault, but here the connection is fine and nothing
+        // else will wake the drain — so it re-arms itself.
+        qCInfo(logJournal) << "op" << op.id << "throttled, retrying shortly";
+        QTimer::singleShot(kJournalThrottleMs, this, [this] { drainJournal(); });
+        refreshJournalCounts();
+        return;
+    case MailBackend::Error::Protocol:
+        m_store.recordJournalFailure(op.id, message);
+        qCWarning(logJournal).nospace()
+            << "op " << op.id << " " << op.op << " failed (try " << (op.tries + 1) << " of "
+            << kJournalMaxTries << ")";
+        if (op.tries + 1 < kJournalMaxTries) {
+            // Wait before trying again. The op is still first in the queue, so
+            // draining now would re-send it immediately — three attempts and a
+            // rolled-back change inside a few milliseconds, which is neither a
+            // real retry nor kind to a server that has just said no.
+            QTimer::singleShot(kJournalRetryMs, this, [this] { drainJournal(); });
+            refreshJournalCounts();
+            return;
+        }
+        retireJournalOp(op, message);
+        break;
+    }
+    refreshJournalCounts();
+    drainJournal();
+}
+
+// --- the outbox drain --------------------------------------------------------
+//
+// The journal above pushes changes; this pushes mail. Same shape on purpose —
+// strictly serial, id order, an in-flight guard that survives account
+// switches — but its own queue, because an outbox row is not a change to
+// existing mail and shares none of the journal's rollback machinery.
+
+namespace
+{
+/// Backoff for a transient send failure: 15 s doubling per attempt, capped at
+/// ten minutes. A permanent rejection never comes back here at all.
+qint64 outboxBackoffSecs(int attempts)
+{
+    qint64 secs = 15;
+    for (int i = 0; i < attempts && secs < 600; ++i)
+        secs *= 2;
+    return qMin<qint64>(secs, 600);
+}
+} // namespace
+
+void MailClient::drainOutbox()
+{
+    // The hold is over the moment the row becomes drainable, whether or not
+    // the connection lets it go out — so the Undo button and the shortcut
+    // stop offering something they can no longer deliver.
+    if (m_undoDeadline > 0 && m_undoDeadline <= QDateTime::currentSecsSinceEpoch())
+        setUndoableSend(0, 0);
+    if (m_outboxBusy || !m_backend || !connected())
+        return;
+    const auto msg =
+        m_store.nextOutboxMessage(accountKey(), QDateTime::currentSecsSinceEpoch());
+    if (msg.id == 0) {
+        // Nothing due now. Something may be due later — an undo-send hold or
+        // a backoff — and nothing else would wake the drain for it.
+        armOutboxTimer();
+        return;
+    }
+    m_outboxBusy = true;
+    m_outboxInFlight = msg.id;
+    m_store.markOutboxSending(msg.id);
+    Q_EMIT outboxChanged(); // the list shows "sending"
+    qCInfo(logJournal) << "outbox: sending row" << msg.id << "to" << msg.envelope.size()
+                       << "recipient(s)";
+    m_backend->sendMessage(msg.wire, msg.sender, msg.envelope,
+                           [this, msg](MailBackend::Error error, const QString &message) {
+        if (m_outboxInFlight != msg.id)
+            return; // the account was switched under it; the row stays Sending
+                    // and startup recovery or the switch-back deals with it
+        m_outboxBusy = false;
+        m_outboxInFlight = 0;
+        finishOutboxSend(msg, error, message);
     });
 }
 
-void MailClient::flushPendingSeen()
+void MailClient::finishOutboxSend(const MailStore::OutboxMessage &msg,
+                                  MailBackend::Error error, const QString &message)
 {
-    if (m_pendingSeen.isEmpty() || !connected())
+    switch (error) {
+    case MailBackend::Error::None: {
+        for (const QString &addr : msg.envelope)
+            m_store.addRecipient(addr);
+        qCInfo(logJournal) << "outbox: row" << msg.id << "sent";
+        // The row outlives the send by exactly as long as the Sent copy takes:
+        // deleted only once the copy is filed (or the protocol files it
+        // itself). A crash in between leaves a "may already have been sent"
+        // row, never a message sent and forgotten.
+        if (!m_backend->sentCopyIsAutomatic()) {
+            appendToSentFolder(msg.wire, [this, id = msg.id] {
+                m_store.dropOutboxMessage(id);
+                refreshOutboxCount();
+                drainOutbox();
+            });
+            return;
+        }
+        m_store.dropOutboxMessage(msg.id);
+        if (!m_sentFolder.isEmpty() && m_selectedFolder == m_sentFolder) {
+            // The server filed the copy, but nothing told the list about it:
+            // that is push's job, and a server without it leaves the folder
+            // the user is looking at missing the message they just sent.
+            refreshCurrentFolder();
+        }
+        break;
+    }
+    case MailBackend::Error::Auth:
+    case MailBackend::Error::Connection:
+        // Nothing to do with this message — the session is down. Back to the
+        // queue without spending an attempt; connectedChanged() restarts the
+        // drain.
+        qCInfo(logJournal) << "outbox: row" << msg.id << "deferred: connection down";
+        m_store.deferOutboxMessage(msg.id);
+        refreshOutboxCount();
         return;
-    // Taken before the first send: a failing store reports through setStatus()
-    // and must not be handed back to a queue we are still walking.
-    const QHash<QString, QStringList> pending = m_pendingSeen;
-    m_pendingSeen.clear();
-    for (auto it = pending.cbegin(); it != pending.cend(); ++it)
-        sendSeenStore(it.key(), it.value());
+    case MailBackend::Error::Throttled: {
+        // The connection is fine and the server wants patience: transient,
+        // costs an attempt, and the row waits out a growing backoff.
+        const qint64 wait = outboxBackoffSecs(msg.attempts);
+        qCInfo(logJournal) << "outbox: row" << msg.id << "throttled, retrying in" << wait
+                           << "s";
+        m_store.recordOutboxFailure(msg.id, message,
+                                    QDateTime::currentSecsSinceEpoch() + wait, false);
+        break;
+    }
+    case MailBackend::Error::NotFound:
+    case MailBackend::Error::Protocol:
+        // The server looked at the request and said no — a bad address, a
+        // policy rejection. Retrying would hammer it with the same answer, so
+        // the row fails outright and waits for the user (doc/OUTBOX_ROADMAP.md:
+        // permanent and transient must not be treated alike).
+        qCWarning(logJournal) << "outbox: row" << msg.id << "rejected:" << message;
+        m_store.recordOutboxFailure(msg.id, message, 0, true);
+        Q_EMIT errorOccurred(tr("Sending \"%1\" failed: %2")
+                                 .arg(msg.subject.isEmpty() ? tr("(no subject)") : msg.subject,
+                                      message));
+        break;
+    }
+    refreshOutboxCount();
+    drainOutbox();
+}
+
+void MailClient::refreshOutboxCount()
+{
+    const int count = m_store.outboxCount(accountKey());
+    if (count != m_outboxCount) {
+        m_outboxCount = count;
+        qCInfo(logJournal) << "outbox:" << count << "message(s) queued";
+    }
+    // Emitted unconditionally: state and error columns change without the
+    // count moving, and the list reads off this signal.
+    Q_EMIT outboxChanged();
+}
+
+void MailClient::armOutboxTimer()
+{
+    const qint64 next = m_store.outboxNextTry(accountKey());
+    if (next <= 0) {
+        m_outboxTimer.stop();
+        return;
+    }
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    // +1: fire just past the boundary, not just before it.
+    m_outboxTimer.start(int(qBound<qint64>(qint64(1), next - now + 1, qint64(3600))) * 1000);
+}
+
+QVariantList MailClient::outboxList() const
+{
+    QVariantList out;
+    const auto rows = m_store.outboxMessages(accountKey());
+    for (const auto &row : rows) {
+        out.append(QVariantMap{
+            {QStringLiteral("id"), row.id},
+            {QStringLiteral("subject"),
+             row.subject.isEmpty() ? tr("(no subject)") : row.subject},
+            {QStringLiteral("to"), row.envelope.join(QStringLiteral(", "))},
+            {QStringLiteral("created"), QDateTime::fromSecsSinceEpoch(row.created)},
+            {QStringLiteral("state"), row.state},
+            {QStringLiteral("error"), row.lastError},
+            {QStringLiteral("editable"), !row.encrypted && !row.hasAttachments},
+            {QStringLiteral("holdUntil"),
+             row.state == MailStore::Queued && row.nextTry > 0 ? row.nextTry : 0},
+        });
+    }
+    return out;
+}
+
+bool MailClient::cancelOutboxMessage(qint64 id)
+{
+    if (id == m_outboxInFlight)
+        return false; // already on the wire; too late to un-send
+    m_store.dropOutboxMessage(id);
+    refreshOutboxCount();
+    return true;
+}
+
+void MailClient::retryOutboxMessage(qint64 id)
+{
+    m_store.reviveOutboxMessage(id);
+    refreshOutboxCount();
+    drainOutbox();
+}
+
+QVariantMap MailClient::outboxEditData(qint64 id)
+{
+    const auto row = m_store.outboxMessage(id);
+    if (row.id == 0 || row.encrypted || row.hasAttachments)
+        return {}; // gone, or ciphertext, or carrying parts an edit would drop
+    auto msg = std::make_shared<KMime::Message>();
+    msg->setContent(KMime::CRLFtoLF(row.wire));
+    msg->parse();
+    auto addressesOf = [](const auto *header) {
+        QStringList out;
+        if (!header)
+            return out;
+        const auto mailboxes = header->mailboxes();
+        for (const auto &mb : mailboxes) {
+            const QString addr = QString::fromLatin1(mb.address());
+            if (addr.contains(QLatin1Char('@')))
+                out.append(addr);
+        }
+        return out;
+    };
+    // Bcc is reconstructed from the envelope: it was deliberately kept out of
+    // the headers when the message was built, and the envelope is the one
+    // place it survives.
+    const QStringList visible = addressesOf(msg->to()) + addressesOf(msg->cc());
+    QStringList bcc;
+    for (const QString &addr : row.envelope) {
+        if (!visible.contains(addr, Qt::CaseInsensitive))
+            bcc.append(addr);
+    }
+    KMime::Content *htmlPart = msg->mainBodyPart("text/html");
+    if (!htmlPart)
+        htmlPart = MimeUtils::findPartByType(msg.get(), "text/html");
+    QString body;
+    if (htmlPart) {
+        body = htmlPart->decodedText();
+    } else {
+        KMime::Content *textPart = msg->mainBodyPart("text/plain");
+        if (!textPart)
+            textPart = MimeUtils::findPartByType(msg.get(), "text/plain");
+        if (textPart)
+            body = textPart->decodedText().toHtmlEscaped().replace(
+                QLatin1Char('\n'), QLatin1String("<br>"));
+    }
+    return {{QStringLiteral("id"), row.id},
+            {QStringLiteral("to"), addressesOf(msg->to()).join(QStringLiteral(", "))},
+            {QStringLiteral("cc"), addressesOf(msg->cc()).join(QStringLiteral(", "))},
+            {QStringLiteral("bcc"), bcc.join(QStringLiteral(", "))},
+            {QStringLiteral("subject"),
+             msg->subject() ? msg->subject()->asUnicodeString() : QString()},
+            {QStringLiteral("body"), body}};
+}
+
+void MailClient::setUndoableSend(qint64 id, qint64 deadline)
+{
+    if (m_lastHeldSend == id && m_undoDeadline == deadline)
+        return;
+    m_lastHeldSend = id;
+    m_undoDeadline = deadline;
+    Q_EMIT undoSendDeadlineChanged();
+}
+
+int MailClient::undoSendDelaySecs() const
+{
+    return qMax(1, AdvancedConfig::i("compose/undoSendDelaySecs"));
+}
+
+QVariantMap MailClient::undoLastSend()
+{
+    // Directly after Send or not at all: the key acts on the one remembered
+    // row, never on whatever else the Outbox holds — older queued mail is
+    // cancelled from the Outbox list, deliberately, not by a window-wide key.
+    const qint64 id = m_lastHeldSend;
+    setUndoableSend(0, 0); // one press consumes it either way
+    if (id == 0)
+        return {};
+    const auto row = m_store.outboxMessage(id);
+    if (row.id == 0 || row.state != MailStore::Queued
+        || row.nextTry <= QDateTime::currentSecsSinceEpoch())
+        return {}; // gone, sending, or the hold ran out — too late to undo
+    if (!row.encrypted && !row.hasAttachments) {
+        QVariantMap data = outboxEditData(id);
+        if (!data.isEmpty()) {
+            m_store.dropOutboxMessage(id);
+            refreshOutboxCount();
+            data.insert(QStringLiteral("mode"), QStringLiteral("reopen"));
+            return data;
+        }
+    }
+    m_store.recordOutboxFailure(
+        id, tr("Send undone — use Retry now to send it after all"), 0, true);
+    refreshOutboxCount();
+    return {{QStringLiteral("mode"), QStringLiteral("kept")}};
+}
+
+void MailClient::setUndoSend(bool on)
+{
+    if (m_undoSend == on)
+        return;
+    m_undoSend = on;
+    appSettings().setValue(QStringLiteral("ui/undoSend"), on);
+    Q_EMIT undoSendChanged();
+}
+
+void MailClient::confirmJournalOp(const MailStore::JournalOp &op)
+{
+    // A flag op has nothing to finish: the cache already says what the server
+    // now also says.
+    if (op.op == QLatin1String("move") || op.op == QLatin1String("delete")) {
+        // Now, and only now, is the mail really gone from here — header, body,
+        // attachments and search rows with it. Everything up to this point was
+        // provisional, which is what made the rollback possible.
+        m_store.removeMessages(op.folder, op.uids);
+        if (op.op == QLatin1String("move")) {
+            // A move renames the message: it is filed under a new id at the
+            // destination. Later ops naming the old one are addressing
+            // something that no longer exists.
+            //
+            // MailBackend::moveMessages reports success without saying what
+            // the message is now called — the answer exists on the wire
+            // (UIDPLUS COPYUID) but not in this interface, so every dependent
+            // op falls into the "cannot be named" case. That is the honest
+            // outcome rather than a guess, and it is visible: the ops are
+            // retired into the failed list with a reason, not dropped.
+            const QList<MailStore::JournalOp> unnameable = m_store.rewriteJournalIds(
+                accountKey(), op.id, op.folder, op.target, {});
+            for (const MailStore::JournalOp &lost : unnameable) {
+                retireJournalOp(lost,
+                                tr("the message was moved before this could be applied"));
+            }
+        }
+        return;
+    }
+    if (op.op == QLatin1String("folder_delete")) {
+        // The mailbox is gone from the server, so the cached mail behind it is
+        // the last copy of something the user asked to destroy. Chunked on the
+        // worker — a folder's bodies are the slowest thing in the cache to
+        // release.
+        purgeCachedFolders({op.folder});
+        return;
+    }
+    if (op.op == QLatin1String("folder_rename")) {
+        // The cache was re-keyed when the user asked; the server has now
+        // caught up. Re-listing is how the tree learns the server's own idea
+        // of the new hierarchy — separators, sort order, and any mailbox it
+        // created or refused to move along the way.
+        listFolders();
+        return;
+    }
+}
+
+void MailClient::retireJournalOp(const MailStore::JournalOp &op, const QString &error)
+{
+    // The failed op does not come back alone. Every later op naming the same
+    // messages describes a world where this one succeeded, so undoing this one
+    // on its own would leave those describing a state that no longer exists —
+    // and their own undo, applied afterwards, would restore something older
+    // still. They go together, newest first.
+    // Only message ops have dependents. A folder op that is undone puts the
+    // folder back where it was, and the changes queued against it since are
+    // still perfectly good changes — they only need re-pointing at the path
+    // the folder turns out to still have, which rollbackJournalOp() does.
+    QList<MailStore::JournalOp> chain{op};
+    const QSet<QString> touched(op.remoteIds.cbegin(), op.remoteIds.cend());
+    if (!touched.isEmpty()) {
+        const QList<MailStore::JournalOp> live = m_store.journalOps(accountKey());
+        for (const MailStore::JournalOp &later : live) {
+            if (later.id <= op.id || later.folder != op.folder)
+                continue;
+            if (std::any_of(later.remoteIds.cbegin(), later.remoteIds.cend(),
+                            [&touched](const QString &id) { return touched.contains(id); }))
+                chain.append(later);
+        }
+    }
+    for (int i = chain.size() - 1; i >= 0; --i) {
+        rollbackJournalOp(chain.at(i));
+        // The same reason on every row of the chain: what stopped them all was
+        // this failure, and each op's own last error (if it has one) would
+        // tell the reader less than that.
+        m_store.retireJournalOp(chain.at(i).id, error);
+    }
+    qCWarning(logJournal).nospace() << "op " << op.id << " retired with "
+                                    << (chain.size() - 1) << " dependent(s), rolled back";
+    reportFailedChanges();
+}
+
+void MailClient::applySeenLocally(const QString &folder, const QList<qint64> &uids, bool seen)
+{
+    for (qint64 uid : uids) {
+        if (seen)
+            m_store.setSeen(folder, uid);
+        else
+            m_store.setUnseen(folder, uid);
+        if (folder != m_selectedFolder)
+            continue;
+        const int row = m_messageModel.rowForUid(uid);
+        if (row < 0)
+            continue;
+        if (seen)
+            m_messageModel.markSeen(row);
+        else
+            m_messageModel.markUnseen(row);
+    }
+    scheduleUnreadRecount();
+}
+
+void MailClient::rollbackJournalOp(const MailStore::JournalOp &op)
+{
+    if (op.op == QLatin1String("flag")) {
+        // The complement. An op that set \Seen is undone by clearing it, and
+        // the other way round — which is exact only because the op was
+        // recorded for messages that really did change state.
+        applySeenLocally(op.folder, op.uids, op.flagsDel.contains(QLatin1String("seen")));
+        return;
+    }
+    if (op.op == QLatin1String("move") || op.op == QLatin1String("delete")) {
+        // The mail comes back, whole: nothing was destroyed, only hidden.
+        restoreHidden(op.folder, op.uids);
+        return;
+    }
+    if (op.op == QLatin1String("folder_delete")) {
+        // The folder returns with everything in it — the mail was never
+        // purged, which is the whole reason the tree entry alone was dropped.
+        restoreFoldersToTree({op.folder});
+        return;
+    }
+    if (op.op == QLatin1String("folder_rename")) {
+        // Re-key it back. Asynchronous, like the rename itself, and the tree
+        // follows when the worker is done.
+        const QString from = op.target;
+        const QString to = op.folder;
+        renameCachedFolder(from, to, [this, from, to] { renameFolderPaths(from, to); });
+        // Changes queued against the new path since are still changes the user
+        // wants; they simply belong to a folder that turns out to have kept
+        // its old name. Rewriting beats retiring them — nothing about them
+        // failed.
+        m_store.rewriteJournalFolder(accountKey(), op.id, from, to, folderSeparator());
+        return;
+    }
+}
+
+void MailClient::reapplyJournalOp(const MailStore::JournalOp &op)
+{
+    if (op.op == QLatin1String("flag")) {
+        applySeenLocally(op.folder, op.uids, op.flagsAdd.contains(QLatin1String("seen")));
+        return;
+    }
+    if (op.op == QLatin1String("move") || op.op == QLatin1String("delete")) {
+        m_store.softDeleteMessages(op.folder, op.uids);
+        if (op.folder == m_selectedFolder)
+            m_messageModel.removeByUids(op.uids);
+        scheduleUnreadRecount();
+        return;
+    }
+    if (op.op == QLatin1String("folder_delete")) {
+        dropFoldersFromTree({op.folder});
+        return;
+    }
+    if (op.op == QLatin1String("folder_rename")) {
+        const QString from = op.folder;
+        const QString to = op.target;
+        renameCachedFolder(from, to, [this, from, to] { renameFolderPaths(from, to); });
+        return;
+    }
+}
+
+void MailClient::restoreHidden(const QString &folder, const QList<qint64> &uids)
+{
+    m_store.restoreSoftDeleted(folder, uids);
+    invalidateMissingBodies();
+    scheduleUnreadRecount();
+    // Reloading the window rather than re-inserting the rows by hand: they
+    // have to land back in sort order, and the cache is what decides that.
+    if (folder == m_selectedFolder)
+        m_sync->reloadWindow();
+}
+
+void MailClient::reconcileSoftDeletes()
+{
+    const QHash<QString, QList<qint64>> hidden = m_store.softDeletedIn(accountKey());
+    if (hidden.isEmpty())
+        return;
+    // Which of them a live op still justifies. Retired ops do not count: the
+    // rollback that retiring them ran has already put their rows back, so
+    // anything still hidden under one is a row that write failed to reach.
+    QHash<QString, QSet<qint64>> justified;
+    const QList<MailStore::JournalOp> live = m_store.journalOps(accountKey());
+    for (const MailStore::JournalOp &op : live) {
+        if (op.op != QLatin1String("move") && op.op != QLatin1String("delete"))
+            continue;
+        QSet<qint64> &set = justified[op.folder];
+        for (qint64 uid : op.uids)
+            set.insert(uid);
+    }
+    int restored = 0;
+    for (auto it = hidden.cbegin(); it != hidden.cend(); ++it) {
+        const QSet<qint64> &keep = justified[it.key()];
+        QList<qint64> orphans;
+        for (qint64 uid : it.value()) {
+            if (!keep.contains(uid))
+                orphans.append(uid);
+        }
+        if (orphans.isEmpty())
+            continue;
+        restored += orphans.size();
+        m_store.restoreSoftDeleted(it.key(), orphans);
+    }
+    if (restored > 0) {
+        qCWarning(logJournal) << "restored" << restored
+                              << "hidden row(s) with no journal entry";
+    }
+}
+
+void MailClient::refreshJournalCounts()
+{
+    const int pending = m_store.journalOpCount(accountKey(), false);
+    const int failed = m_store.journalOpCount(accountKey(), true);
+    if (pending == m_journalPending && failed == m_journalFailed)
+        return;
+    m_journalPending = pending;
+    m_journalFailed = failed;
+    Q_EMIT journalChanged();
+}
+
+void MailClient::expireJournalOps()
+{
+    const qint64 cutoff =
+        QDateTime::currentSecsSinceEpoch() - qint64(kJournalMaxAgeDays) * 24 * 60 * 60;
+    const QList<MailStore::JournalOp> stale = m_store.takeStaleJournalOps(accountKey(), cutoff);
+    if (stale.isEmpty())
+        return;
+    // Already newest-first, which is the order an undo chain has to run in.
+    for (const MailStore::JournalOp &op : stale)
+        rollbackJournalOp(op);
+    qCWarning(logJournal) << stale.size() << "op(s) older than" << kJournalMaxAgeDays
+                          << "days dropped and rolled back";
+    setStatus(tr("%n change(s) too old to still apply were undone", "", stale.size()));
+}
+
+bool MailClient::folderHasPendingOps(const QString &mailBox) const
+{
+    return m_store.journalFolders(accountKey()).contains(mailBox);
+}
+
+int MailClient::incomingCount() const
+{
+    if (m_selectedFolder.isEmpty())
+        return 0;
+    int count = 0;
+    const QList<MailStore::JournalOp> live = m_store.journalOps(accountKey());
+    for (const MailStore::JournalOp &op : live) {
+        if (op.op == QLatin1String("move") && op.target == m_selectedFolder)
+            count += op.remoteIds.size();
+    }
+    return count;
+}
+
+void MailClient::reportFailedChanges()
+{
+    refreshJournalCounts();
+    if (m_journalFailed <= 0)
+        return;
+    // Deliberately not an errorOccurred() dialog: the change has already been
+    // undone on screen, and the list in Settings is where it can be acted on.
+    // This is the notice that something happened, an hour before the user
+    // wonders why a message came back.
+    setStatus(tr("%n change(s) could not be applied and were undone", "", m_journalFailed));
+}
+
+QVariantList MailClient::failedChanges() const
+{
+    QVariantList out;
+    const QList<MailStore::JournalOp> retired = m_store.retiredJournalOps(accountKey());
+    for (const MailStore::JournalOp &op : retired) {
+        const int count = op.remoteIds.size();
+        QString what;
+        if (op.op == QLatin1String("flag")) {
+            what = op.flagsAdd.contains(QLatin1String("seen"))
+                ? tr("Mark %n read", "", count)
+                : tr("Mark %n unread", "", count);
+        } else if (op.op == QLatin1String("move")) {
+            what = tr("Move %n to %1", "", count).arg(folderLeaf(op.target));
+        } else if (op.op == QLatin1String("delete")) {
+            what = tr("Delete %n", "", count);
+        } else if (op.op == QLatin1String("folder_rename")) {
+            what = tr("Rename folder to %1").arg(folderLeaf(op.target));
+        } else if (op.op == QLatin1String("folder_delete")) {
+            what = tr("Delete folder %1").arg(folderLeaf(op.folder));
+        } else {
+            what = op.op;
+        }
+
+        // The subjects are what make this a list rather than a dump: a row of
+        // remote ids means nothing to a reader deciding whether to retry.
+        QStringList named;
+        const QStringList subjects =
+            const_cast<MailStore &>(m_store).subjectsOf(op.folder, op.uids);
+        for (const QString &s : subjects)
+            named.append(s.isEmpty() ? tr("(no longer cached)") : s);
+        QString which = named.join(QStringLiteral(", "));
+        if (count > named.size())
+            which = tr("%1 and %n more", "", count - named.size()).arg(which);
+
+        QVariantMap row;
+        row[QStringLiteral("id")] = op.id;
+        row[QStringLiteral("what")] = what;
+        row[QStringLiteral("from")] = folderLeaf(op.folder);
+        row[QStringLiteral("which")] = which;
+        row[QStringLiteral("why")] = shortenError(op.lastError);
+        row[QStringLiteral("when")] =
+            QDateTime::fromSecsSinceEpoch(op.queuedAt).toString(Qt::TextDate);
+        out.append(row);
+    }
+    return out;
+}
+
+void MailClient::retryFailedChange(qint64 id)
+{
+    const QList<MailStore::JournalOp> retired = m_store.retiredJournalOps(accountKey());
+    for (const MailStore::JournalOp &op : retired) {
+        if (op.id != id)
+            continue;
+        // Retiring it rolled the change back, so retrying has to make it again
+        // locally before it can be pushed — otherwise the op would describe a
+        // change that is no longer there, and its next rollback would undo
+        // something the user never did.
+        reapplyJournalOp(op);
+        m_store.reviveJournalOp(id);
+        qCInfo(logJournal) << "op" << id << "re-queued by the user";
+        refreshJournalCounts();
+        drainJournal();
+        return;
+    }
+}
+
+void MailClient::discardFailedChange(qint64 id)
+{
+    m_store.dropJournalOp(id);
+    refreshJournalCounts();
+}
+
+void MailClient::discardAllFailedChanges()
+{
+    m_store.clearRetiredJournalOps(accountKey());
+    refreshJournalCounts();
 }
 
 void MailClient::markMessageRead(int row)
@@ -5927,12 +7241,25 @@ void MailClient::fetchMessage(int row)
     if (!cachedRaw.isEmpty()) {
         auto msg = std::make_shared<KMime::Message>();
         msg->setContent(KMime::CRLFtoLF(cachedRaw));
+        // A message cached whole is frozen before the parse, same as a fetched
+        // one (see ImapBackend::buildMessage): encodedContent() then answers
+        // with the stored octets and the DKIM verdict — when one is ever
+        // recomputed here — judges what arrived, not KMime's re-assembly of
+        // it. A message with detached attachments cannot be: restoring the
+        // payloads below has to mutate the tree, which is exactly what frozen
+        // forbids, and its stored verdict is the honest answer anyway.
+        const QList<MailStore::PartRef> parts = m_store.partsFor(m_selectedFolder, uid);
+        if (parts.isEmpty())
+            msg->setFrozen(true);
         // The cached form is a stub: attachment payloads live in the file
         // store. Put them back before anything looks at the message. If a
         // payload has gone missing the cache entry is incomplete, so fall
-        // through and re-fetch rather than showing an empty attachment.
+        // through and re-fetch rather than showing an empty attachment. A
+        // cached body with no header block gets the same treatment: however it
+        // got in (a fetch bug once did), presenting it would show a broken
+        // message when one network request produces the real one.
         msg->parse();
-        if (!MimeUtils::restoreAttachments(msg.get(), m_store.partsFor(m_selectedFolder, uid))
+        if ((msg->head().isEmpty() || !MimeUtils::restoreAttachments(msg.get(), parts))
             && connected()) {
             m_store.removeBodyOnly(m_selectedFolder, uid);
         } else {
@@ -6199,6 +7526,15 @@ void MailClient::storeFetchedBody(const QString &folder, qint64 uid,
     KMime::Message *msg = message.get();
     if (msg->contents().isEmpty())
         msg->parse();
+    // A message with no header block is a broken fetch, not a message. Caching
+    // it would poison everything derived from the cache — the spam score, the
+    // DKIM verdict, the viewer — and each of those records its answer, so the
+    // damage outlives the body. Refuse it here, at the one door every fetched
+    // body comes through; the backfill re-asks for what was never stored.
+    if (msg->head().isEmpty()) {
+        qWarning() << "mailove: refusing to cache headerless body" << folder << uid;
+        return;
+    }
     const QByteArray raw = msg->encodedContent();
     const qint64 cap = qint64(m_maxBodyMB) * 1024 * 1024;
     if (cap > 0 && raw.size() > cap) {

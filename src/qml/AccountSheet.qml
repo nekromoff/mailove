@@ -15,6 +15,10 @@ Item {
 
     /// Tab page contract (see Main.qml).
     property string title: "Settings"
+
+    /// The activity log window, owned by Main.qml so the Ctrl+Shift+L shortcut
+    /// can open it without Settings being up.
+    property var logWindow: null
     signal presentRequested()
     signal closeRequested()
     function present() { presentRequested() }
@@ -1462,7 +1466,7 @@ Item {
             }
 
             Kirigami.Separator {
-                Kirigami.FormData.label: "Mail checking"
+                Kirigami.FormData.label: "Mail checking and sending"
                 Kirigami.FormData.isSection: true
             }
             QQC2.TextField {
@@ -1480,6 +1484,33 @@ Item {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
                 text: "Checks for new email on this schedule. 0 to disable."
+                wrapMode: Text.Wrap
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+            QQC2.CheckBox {
+                Kirigami.FormData.label: ""
+                text: "Enable Undo send"
+                checked: Mail.undoSend
+                onToggled: sheet.setMail("undoSend", checked)
+            }
+            QQC2.Label {
+                id: undoDelayHelp
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                // Re-read on every Advanced save. undoSendDelaySecs() is a
+                // plain call with no change signal of its own, so without a
+                // dependency on Advanced.reloaded the text would keep showing
+                // whatever the delay was when this page was first built.
+                property int delaySecs: Mail.undoSendDelaySecs()
+                Connections {
+                    target: Advanced
+                    function onReloaded() {
+                        undoDelayHelp.delaySecs = Mail.undoSendDelaySecs()
+                    }
+                }
+                text: "Holds each sent message for " + undoDelayHelp.delaySecs
+                      + " seconds, so you can still cancel it in the Outbox."
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
@@ -1534,7 +1565,7 @@ Item {
             QQC2.CheckBox {
                 id: authVerifyBox
                 Kirigami.FormData.label: ""
-                text: "Verify DKIM, ARC, SPF and DMARC"
+                text: "Verify DKIM, ARC, SPF and DMARC (and COMPAUTH)"
                 checked: Mail.authVerification
                 onToggled: sheet.setMail("authVerification", checked)
             }
@@ -1589,6 +1620,19 @@ Item {
                     implicitHeight: Kirigami.Units.gridUnit
                 }
             }
+            // Changes made here that the server has not been told about yet —
+            // normally none, and normally for a fraction of a second. Worth
+            // showing because it is the honest answer to "is everything I did
+            // actually saved", which offline-first otherwise hides.
+            QQC2.Label {
+                Kirigami.FormData.label: ""
+                visible: Mail.journalPendingCount > 0
+                text: Mail.journalPendingCount === 1
+                      ? "1 change waiting to reach the server"
+                      : Mail.journalPendingCount + " changes waiting to reach the server"
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
             QQC2.Button {
                 Kirigami.FormData.label: ""
                 text: cacheSizeLabel.worthwhile ? "Reclaim disk space"
@@ -1621,25 +1665,130 @@ Item {
                 }
             }
 
+            // Changes the server refused. Every one of them has already been
+            // undone on screen, so this is the only place left that can say
+            // why a message came back — the breadcrumb that announced it has
+            // long scrolled away by the time anyone wonders.
+            //
+            // Absent entirely when there are none: an empty "Failed changes"
+            // heading in Settings is a permanent suggestion that something is
+            // wrong with syncing.
+            Kirigami.Separator {
+                Kirigami.FormData.label: "Failed changes"
+                Kirigami.FormData.isSection: true
+                visible: Mail.journalFailedCount > 0
+            }
+            ColumnLayout {
+                id: failedChanges
+                Kirigami.FormData.label: ""
+                visible: Mail.journalFailedCount > 0
+                spacing: Kirigami.Units.smallSpacing
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+
+                // Rebuilt rather than bound: the rows come from a C++ call
+                // that reads the cache, and re-running it on every repaint of
+                // a Settings page would be a query per frame.
+                property var rows: []
+                function reload() { rows = Mail.failedChanges() }
+                Component.onCompleted: reload()
+                Connections {
+                    target: Mail
+                    function onJournalChanged() { failedChanges.reload() }
+                }
+
+                Repeater {
+                    model: failedChanges.rows
+                    delegate: ColumnLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        spacing: 0
+                        QQC2.Label {
+                            text: modelData.what + " from " + modelData.from
+                            font.bold: true
+                            wrapMode: Text.Wrap
+                            Layout.fillWidth: true
+                        }
+                        QQC2.Label {
+                            text: modelData.which
+                            wrapMode: Text.Wrap
+                            opacity: 0.8
+                            Layout.fillWidth: true
+                            font.pointSize: Kirigami.Theme.smallFont.pointSize
+                        }
+                        QQC2.Label {
+                            text: modelData.why + " — " + modelData.when
+                            wrapMode: Text.Wrap
+                            opacity: 0.8
+                            Layout.fillWidth: true
+                            font.pointSize: Kirigami.Theme.smallFont.pointSize
+                        }
+                        RowLayout {
+                            spacing: Kirigami.Units.smallSpacing
+                            QQC2.Button {
+                                text: "Retry"
+                                // Offered offline too: retrying re-makes the
+                                // change locally and puts it back in the
+                                // queue, which is exactly what making it
+                                // offline in the first place does.
+                                onClicked: Mail.retryFailedChange(modelData.id)
+                            }
+                            QQC2.Button {
+                                text: "Discard"
+                                onClicked: Mail.discardFailedChange(modelData.id)
+                            }
+                        }
+                    }
+                }
+                QQC2.Button {
+                    text: "Discard all"
+                    visible: failedChanges.rows.length > 1
+                    onClicked: Mail.discardAllFailedChanges()
+                }
+            }
+
             // Last on the page: troubleshooting, not something anyone sets on
             // the way to somewhere else.
             Kirigami.Separator {
                 Kirigami.FormData.label: "Diagnostics"
                 Kirigami.FormData.isSection: true
             }
-            QQC2.CheckBox {
-                Kirigami.FormData.label: "Log activity to console:"
-                checked: Mail.debugLogging
-                onToggled: sheet.setMail("debugLogging", checked)
+            QQC2.Button {
+                Kirigami.FormData.label: "Log:"
+                text: "Show activity log…"
+                icon.name: "view-list-text"
+                // A window of its own, not a page here: it is read while
+                // reproducing the problem it is about, and Settings is in
+                // the way of that.
+                onClicked: if (sheet.logWindow) sheet.logWindow.open()
             }
             QQC2.Label {
                 Kirigami.FormData.label: ""
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
-                text: "Prints folder, account and sync activity to the terminal. "
-                      + "Useful when reporting a bug."
+                text: "The last 5000 lines Mailove logged. You can copy them "
+                      + "into a bug report."
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+            // The label is the checkbox's own text (right column, standard
+            // font), not a FormData.label in the left one — it reads as the
+            // thing being switched, and the explainer sits under it like the
+            // others on this page.
+            ColumnLayout {
+                Kirigami.FormData.label: ""
+                spacing: Kirigami.Units.smallSpacing
+                QQC2.CheckBox {
+                    text: "Log activity in detail"
+                    checked: Mail.debugLogging
+                    onToggled: sheet.setMail("debugLogging", checked)
+                }
+                QQC2.Label {
+                    Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                    text: "Adds folder, account and sync detail to the log."
+                    wrapMode: Text.Wrap
+                    opacity: 0.8
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                }
             }
         }
         } // general ScrollView
@@ -1909,15 +2058,23 @@ Item {
                 model: [
                     {label: "Select message:", key: "shortcutSelect", def: "Ins"},
                     {label: "Delete message:", key: "shortcutDelete", def: "Del"},
-                    {label: "Mark as spam:", key: "shortcutJunk", def: "J"},
-                    {label: "Not spam:", key: "shortcutNotSpam", def: "Shift+J"},
+                    // Both of these flip: the key marks read when the message
+                    // is unread and unread when it is read, spam when it is not
+                    // and not-spam when it is. One row each, and the label says
+                    // so — there is no second key to look for.
+                    {label: "Mark read / unread:", key: "shortcutToggleRead", def: "M"},
+                    {label: "Mark spam / not spam:", key: "shortcutJunk", def: "J"},
                     {label: "Compose:", key: "shortcutCompose", def: "C"},
                     {label: "Reply:", key: "shortcutReply", def: "R"},
                     {label: "Forward:", key: "shortcutForward", def: "F"},
                     {label: "Attach file:", key: "shortcutAttach", def: "Ctrl+Shift+A"},
                     {label: "Send message:", key: "shortcutSend", def: "Ctrl+Return"},
+                    // Acts only while undo send is enabled in General — the
+                    // key exists to call back a message still inside its hold.
+                    {label: "Undo send message:", key: "shortcutUndoSend", def: "Ctrl+Z"},
                     {label: "Find in message:", key: "shortcutFind", def: "Ctrl+F"},
-                    {label: "View source:", key: "shortcutSource", def: "Ctrl+U"}
+                    {label: "View source:", key: "shortcutSource", def: "Ctrl+U"},
+                    {label: "Activity log:", key: "shortcutLog", def: "Ctrl+Shift+L"}
                 ]
                 RowLayout {
                     required property var modelData
@@ -2041,12 +2198,14 @@ Item {
 
         // Footer: the Save button (and its "what's missing" hint) on the
         // Accounts page; on the pages that apply as you change them, the same
-        // slot says so and flashes "Saved" when one of them lands. Only About
-        // has nothing to report.
+        // slot says so and flashes "Saved" when one of them lands. About has
+        // nothing to report, and Advanced is the one page that does not apply
+        // as you type — it edits a file and commits it with its own Apply
+        // button, so this footer would be claiming the opposite of the truth.
         RowLayout {
             Layout.fillWidth: true
             spacing: 0
-            visible: sheet.page !== 4
+            visible: sheet.page !== 4 && sheet.page !== 5
 
             // What the form still needs. The other two things the footer used
             // to say live in the button now — a small grey line beside a Save

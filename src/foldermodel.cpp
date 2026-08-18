@@ -139,6 +139,8 @@ void FolderModel::toggleSavedCollapsed(const QString &accountKey, const QString 
 
 void FolderModel::setAccountKey(const QString &key)
 {
+    if (key == m_accountKey)
+        return;
     m_accountKey = key;
     m_collapsed = savedCollapsed(key);
     beginResetModel();
@@ -156,6 +158,18 @@ void FolderModel::saveCollapsed() const
 
 void FolderModel::setFolders(QList<Folder> folders)
 {
+    // The same tree is handed here several times per account switch: once from
+    // the cache, once from what the server lists, and again from any pass that
+    // re-derives it. Each one used to be a full reset, and a reset empties the
+    // view before refilling it — so the sidebar blinked to nothing and back
+    // three times on one click, taking the selection and the auto-open
+    // debounce with it every time (see folderList.onCountChanged in Main.qml,
+    // which cannot tell a repopulation from a real change).
+    //
+    // Comparing costs one pass over a list of tens of entries. The reset it
+    // avoids costs a rebuild of every delegate.
+    if (folders == m_all)
+        return;
     beginResetModel();
     m_all = std::move(folders);
     rebuildVisible();

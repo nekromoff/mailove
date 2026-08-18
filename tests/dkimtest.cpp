@@ -36,6 +36,17 @@ void check(const char *what, const QByteArray &got, const QByteArray &want)
     printf("        got  %s\n", visible(got).constData());
     printf("        want %s\n", visible(want).constData());
 }
+void checkBool(const char *what, bool got, bool want)
+{
+    if (got == want) {
+        printf("  ok   %s\n", what);
+        return;
+    }
+    ++failures;
+    printf("  FAIL %s\n", what);
+    printf("        got  %s\n", got ? "true" : "false");
+    printf("        want %s\n", want ? "true" : "false");
+}
 } // namespace
 
 int main()
@@ -107,6 +118,56 @@ int main()
     check("wildcard swallows a label", org("bar.ck").toLatin1(), "");
     check("owned name under a wildcard", org("foo.bar.ck").toLatin1(), "foo.bar.ck");
     check("deeper name under a wildcard", org("a.foo.bar.ck").toLatin1(), "foo.bar.ck");
+
+    // Which of several signatures gets to speak for the message. A forwarder
+    // signs on top of the author, so two verdicts on one message is ordinary —
+    // and until moreInformative() existed the one that reached the badge was
+    // whichever sat last in the header block, which is not a judgement about
+    // anything. An aligned Pass never reaches here: verify() returns on it.
+    printf("multi-signature verdict preference\n");
+    auto verdict = [](DkimResult::Status s, bool aligned) {
+        DkimResult r;
+        r.status = s;
+        r.aligned = aligned;
+        return r;
+    };
+    const DkimResult unalignedPass = verdict(DkimResult::Pass, false);
+    const DkimResult alignedFail = verdict(DkimResult::Fail, true);
+    const DkimResult alignedMismatch = verdict(DkimResult::BodyMismatch, true);
+    const DkimResult permError = verdict(DkimResult::PermError, false);
+    const DkimResult tempError = verdict(DkimResult::TempError, false);
+
+    // The two orderings that were actually wrong: a rotated forwarder key used
+    // to overwrite whatever the author's own signature had established.
+    checkBool("aligned failure beats a later PermError",
+              moreInformative(alignedFail, permError), true);
+    checkBool("PermError never replaces an aligned failure",
+              moreInformative(permError, alignedFail), false);
+    checkBool("valid signature beats a later PermError",
+              moreInformative(unalignedPass, permError), true);
+
+    // Evidence outranks accusation: a body hash that did not match says more
+    // about our copy than about the sender, and a list rewriting a subject
+    // fails the author's signature as a matter of course.
+    checkBool("a valid signature outranks a failed one",
+              moreInformative(unalignedPass, alignedFail), true);
+    checkBool("body mismatch outranks a failure",
+              moreInformative(alignedMismatch, alignedFail), true);
+    checkBool("failure outranks a key we could not fetch",
+              moreInformative(alignedFail, permError), true);
+    checkBool("PermError outranks TempError",
+              moreInformative(permError, tempError), true);
+
+    // Ties: the sender's own signature is the one being asked about, and
+    // otherwise the first in header order stays put.
+    checkBool("aligned wins a tie", moreInformative(verdict(DkimResult::Fail, true),
+                                                    verdict(DkimResult::Fail, false)), true);
+    checkBool("an equal verdict does not displace the first",
+              moreInformative(verdict(DkimResult::Fail, false),
+                              verdict(DkimResult::Fail, false)), false);
+    checkBool("an unaligned verdict does not displace an aligned one",
+              moreInformative(verdict(DkimResult::Fail, false),
+                              verdict(DkimResult::Fail, true)), false);
 
     if (failures == 0) {
         printf("PASS: all canonicalization vectors match\n");

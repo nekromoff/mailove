@@ -33,6 +33,39 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.0" date="2026-08-18" type="stable">
+      <description>
+        <ul>
+          <li>Activity log in Settings (Ctrl+Shift+L): the last 5000 lines
+              logged, copyable into a bug report with addresses masked, and
+              mirrored to a self-recycling file. Settings are backed up on
+              change so a bad write no longer loses labels or shortcuts.</li>
+          <li>Unread badges corrected against the server per folder, on the
+              open account and in the background, so a folder read elsewhere
+              loses its pill and a subfolder gains one without being opened.</li>
+          <li>IMAP: writes and reads select their folder atomically, fixing a
+              spam-delete aimed at the inbox and searches of the wrong
+              mailbox; the folder-sync pass no longer loops; push reconnects
+              cleanly.</li>
+          <li>Reclaim disk space compacts a copy and swaps it in off the GUI
+              thread instead of freezing; finished migrations stop
+              re-running.</li>
+          <li>Message-list selection survives arrow and page keys and extends
+              with Shift; assorted QML warnings silenced.</li>
+          <li>DKIM and OpenPGP now verify the exact bytes that travelled:
+              bodies are fetched as octet-exact halves and parsed frozen,
+              fixing false "modified after signing" reports on replies with
+              attachments (KDE bug 523826).</li>
+          <li>One-time refresh: cached bodies from the last month are
+              re-fetched and their verdicts and spam scores recomputed.
+              Imported archives and your own spam answers are untouched.</li>
+          <li>With several DKIM signatures on one message, the most
+              informative verdict is shown instead of the last one parsed.</li>
+          <li>Half-delivered messages are re-fetched instead of shown or
+              cached headerless.</li>
+        </ul>
+      </description>
+    </release>
     <release version="2.8" date="2026-08-17" type="stable">
       <description>
         <ul>

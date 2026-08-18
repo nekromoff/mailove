@@ -304,11 +304,13 @@ QByteArray signedOctets(const Structure &s)
     // way they were signed or nothing ever verifies. Normalising first makes
     // this idempotent whatever the tree happens to hold.
     //
-    // What this still cannot promise is that encodedContent() reproduces the
-    // part byte for byte — re-serialising from a parsed tree can reorder or
-    // refold headers, the same fidelity problem the roadmap records for DKIM.
-    // That is why a mismatch is reported as "not verified" and never as
-    // "invalid" (doc/openpgp.md §3).
+    // For a message parsed frozen — everything the 2.9 fetch and cache paths
+    // deliver — encodedContent() reproduces the part byte for byte, child
+    // parts included. The caveat that remains is the cache-with-attachments
+    // case: restoring detached payloads mutates the tree, so that copy is a
+    // re-serialisation and may not be the signed octets. That is why a
+    // mismatch is reported as "not verified" and never as "invalid"
+    // (doc/openpgp.md §3).
     return KMime::LFtoCRLF(KMime::CRLFtoLF(s.signedPart->encodedContent()));
 }
 

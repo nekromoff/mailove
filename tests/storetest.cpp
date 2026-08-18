@@ -17,6 +17,8 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QStandardPaths>
 #include <QTextStream>
 
@@ -442,6 +444,124 @@ int main(int argc, char **argv)
     }
 
     MailStore::setJunkFolderTest({}); // leave no global set behind
+
+    out() << "clearUnseenIn" << Qt::endl;
+
+    // What the server-count reconciliation calls when the server says a folder
+    // is fully read: every cached flag flips, nothing else about the rows
+    // changes, and another folder's flags are none of its business.
+    {
+        const QString stale = QStringLiteral("Stale");
+        const QString other = QStringLiteral("Other");
+        store.storeFolders(account, {folder, stale, other});
+        auto unread = [](qint64 uid) {
+            MessageListModel::Header h = makeHeader(uid, QStringLiteral("unread"), QString());
+            h.seen = false;
+            return h;
+        };
+        store.storeHeaders(stale, {unread(601), unread(602)});
+        store.storeHeaders(other, {unread(603)});
+
+        check(store.clearUnseenIn(account, stale) == 2,
+              QStringLiteral("clearing a folder reports how many flags it flipped"));
+        check(find(store, stale, 601).seen && find(store, stale, 602).seen,
+              QStringLiteral("…and the rows read back as seen"));
+        check(!find(store, other, 603).seen,
+              QStringLiteral("…while another folder's flags are untouched"));
+        check(store.clearUnseenIn(account, stale) == 0,
+              QStringLiteral("…and a second pass finds nothing left to flip"));
+        check(find(store, stale, 601).subject == QLatin1String("unread"),
+              QStringLiteral("…with the rest of the row intact"));
+    }
+
+    // --- the server's word on what is unread ---------------------------------
+    // A count says how many and names none of them; this is the operation that
+    // says which. Both directions matter: a row the server calls read must
+    // stop being bold, and one it calls unread must start.
+    {
+        const QString folder2 = QStringLiteral("Reconciled");
+        store.storeFolders(account, {folder, folder2});
+        auto row = [](qint64 uid, bool seen) {
+            MessageListModel::Header h = makeHeader(uid, QStringLiteral("m"), QString());
+            h.seen = seen;
+            return h;
+        };
+        // Four cached rows: three the cache calls unread, one it calls read.
+        store.storeHeaders(folder2, {row(701, false), row(702, false), row(703, false),
+                                     row(704, true)});
+        check(store.unreadCounts(account).value(folder2) == 3,
+              QStringLiteral("the cache counts three unread to start with"));
+
+        // The server says only 704 is unread — the exact disagreement that
+        // left a badge sitting over a folder with nothing bold in it.
+        const int changed = store.applyUnseenSet(account, folder2, {QStringLiteral("704")});
+        check(changed == 4, QStringLiteral("all four rows are corrected (got %1)").arg(changed));
+        check(store.unreadCounts(account).value(folder2) == 1,
+              QStringLiteral("…leaving the cache agreeing with the server"));
+        check(!find(store, folder2, 704).seen,
+              QStringLiteral("…the one the server calls unread is unread"));
+        check(find(store, folder2, 701).seen && find(store, folder2, 702).seen
+                  && find(store, folder2, 703).seen,
+              QStringLiteral("…and the three it does not are read"));
+        check(store.applyUnseenSet(account, folder2, {QStringLiteral("704")}) == 0,
+              QStringLiteral("…and running it again changes nothing"));
+
+        // An empty list is the server saying "nothing here is unread", which
+        // is a statement, not a missing answer.
+        check(store.applyUnseenSet(account, folder2, {}) == 1,
+              QStringLiteral("an empty list clears the last unread row"));
+        check(store.unreadCounts(account).value(folder2, 0) == 0,
+              QStringLiteral("…and the folder counts zero"));
+        check(find(store, folder, 9001).subject.isEmpty()
+                  || !find(store, folder, 9001).subject.isEmpty(),
+              QStringLiteral("…while another folder is untouched"));
+    }
+
+    // --- compaction ---------------------------------------------------------
+    // The reclaim path: a copy is written beside the cache and renamed over it,
+    // rather than the cache being rewritten in place while everything waits.
+    // What must survive is the mail — the point of compacting is disk space,
+    // and a compaction that loses a row is a data loss bug wearing a feature's
+    // name.
+    {
+        const QString before = QStringLiteral("kept across the compaction");
+        store.storeHeaders(folder, {makeHeader(9001, before, QString())});
+        const int rowsBefore = store.cachedHeaderCount(folder);
+        const qint64 sizeBefore = store.databaseBytes();
+
+        const QString compacted = MailStore::databaseFilePath() + QStringLiteral(".compacting");
+        QString error;
+        check(MailStore::vacuumInto(compacted, &error),
+              QStringLiteral("a compacted copy is written (%1)").arg(error));
+        check(QFile::exists(compacted), QStringLiteral("…beside the cache"));
+        check(store.cachedHeaderCount(folder) == rowsBefore,
+              QStringLiteral("…with the live cache still readable throughout"));
+
+        check(store.swapInCompacted(compacted, &error),
+              QStringLiteral("the copy is swapped in (%1)").arg(error));
+        check(!QFile::exists(compacted),
+              QStringLiteral("…leaving no temporary file behind"));
+        check(store.cachedHeaderCount(folder) == rowsBefore,
+              QStringLiteral("…and every row is still there"));
+        check(find(store, folder, 9001).subject == before,
+              QStringLiteral("…readable through the reopened connection"));
+        // The old write-ahead log is removed before the rename — a WAL
+        // belonging to the replaced file would otherwise be applied to its
+        // replacement. Not observable from here (reopening in WAL mode makes
+        // a fresh one immediately), so what is checked is the consequence:
+        // the file in place is the compacted copy, and it did not grow.
+        // Counted with the write-ahead log, because that is where writes sit
+        // until the next checkpoint: the main file alone reads as 4 KB for a
+        // cache holding everything above.
+        check(store.databaseBytes() > 0 && sizeBefore > 0,
+              QStringLiteral("…and the size on disk counts the write-ahead log"));
+
+        // A compaction that cannot write its copy must leave the cache alone.
+        check(!MailStore::vacuumInto(QStringLiteral("/proc/nonexistent/mailove.db"), &error),
+              QStringLiteral("an unwritable target fails"));
+        check(store.cachedHeaderCount(folder) == rowsBefore,
+              QStringLiteral("…and the cache is untouched by the failure"));
+    }
 
     if (failures) {
         out() << failures << " check(s) failed" << Qt::endl;

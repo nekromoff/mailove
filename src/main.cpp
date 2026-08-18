@@ -5,6 +5,9 @@
 #include <QElapsedTimer>
 #include <QGuiApplication>
 #include <QStyleHints>
+#include <QFile>
+#include <QFileInfo>
+#include <QStandardPaths>
 #include <QIcon>
 #include <QTimer>
 #include <QQmlApplicationEngine>
@@ -15,6 +18,8 @@
 
 #include "advancedconfig.h"
 #include "avatarprovider.h"
+#include "diagnosticslog.h"
+#include "settingsbackup.h"
 #include "documenthandler.h"
 #include "mailclient.h"
 #include "messagecontext.h"
@@ -58,6 +63,16 @@ static void filterMailHtmlNoise(QtMsgType type, const QMessageLogContext &contex
     if (message.contains(QLatin1String("ToolBarPageHeader.qml"))
         && message.contains(QLatin1String("Unable to assign [undefined] to bool")))
         return;
+    // Everything that survives the filter above is kept, whether or not
+    // anyone is watching a terminal — running mailove from a launcher is the
+    // normal case, and "reproduce it with logging on" is not something a
+    // crash lets you do. See diagnosticslog.h: this only copies a string.
+    DiagnosticsLog::instance().append(type, context, message);
+    // The terminal's share. With detailed logging off it gets what it always
+    // got — critical and worse — while the lines above it go to the log in
+    // Settings, which is the half a GUI-only user can actually read.
+    if (MailClient::consoleQuiet() && type != QtCriticalMsg && type != QtFatalMsg)
+        return;
     if (g_previousHandler)
         g_previousHandler(type, context, message);
     else
@@ -82,6 +97,11 @@ int main(int argc, char *argv[])
     // instead — no Places sidebar, and colors of their own rather than the
     // desktop's. Nothing else here uses a widget.
     QApplication app(argc, argv);
+    // The mirror on disk. Here and not earlier only because the writer thread
+    // and the drain timer both need an event dispatcher on this thread, which
+    // is what QApplication brings; everything logged before this point is
+    // already buffered and lands in the first batch.
+    DiagnosticsLog::instance().start();
     QGuiApplication::setOrganizationName(QStringLiteral("mailove"));
     QGuiApplication::setApplicationName(QStringLiteral("mailove"));
     QGuiApplication::setApplicationVersion(QStringLiteral(MAILOVE_VERSION));
@@ -90,6 +110,14 @@ int main(int argc, char *argv[])
     // desktop entry's basename, not the application name. X11 uses the window
     // icon instead, so set both.
     QGuiApplication::setDesktopFileName(QStringLiteral("org.mailove.Mailove"));
+
+    // The settings file as it stands before this session touches it, written
+    // back out at exit only if the session changed it. See settingsbackup.h
+    // for why a copy taken at startup would be worthless.
+    const QString settingsPath =
+        QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)
+        + QStringLiteral("/mailove/mailove.conf");
+    const QByteArray settingsAtStart = SettingsBackup::snapshot(settingsPath);
     // Press-and-hold reveals secondary actions (the Forward button's
     // "as attachment"); the platform default of 800ms reads as "nothing is
     // happening". Snappier, still long past any click.
@@ -179,6 +207,8 @@ int main(int argc, char *argv[])
     qCDebug(logTrace, "boot: PgpEngine %lld ms", boot.restart());
     client.setPgpEngine(&pgp);
 
+    int rc = 0;
+    {
     QQmlApplicationEngine engine;
     qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "Mail", &client);
     qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "Pgp", &pgp);
@@ -186,6 +216,9 @@ int main(int argc, char *argv[])
     // the values it edits are read from every corner of the client, and there
     // is exactly one file behind them.
     qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "Advanced", &AdvancedConfig::instance());
+    // The log viewer's model, and the three things it can do with the text.
+    qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "Diagnostics",
+                                 &DiagnosticsLog::instance());
     // Sender pictures. Registered only when they are switched on, so with the
     // default off there is not even a provider for an image://gravatar URL to
     // reach — and no fetcher thread standing by for one.
@@ -206,9 +239,17 @@ int main(int argc, char *argv[])
     engine.loadFromModule("Mailove", "Main");
     qCDebug(logTrace, "boot: Main.qml %lld ms", boot.restart());
 
-    const int rc = app.exec();
+    rc = app.exec();
     // Bracket the teardown: if the window disappears but the process does not,
     // this says whether the event loop even returned before the destructors ran.
     qCDebug(logTrace, "shutdown: event loop returned %d", rc);
+    } // the QML engine dies here, and with it the last flush of QML Settings
+
+    // Now the file is final, so "did this session change it" can be answered.
+    SettingsBackup::writeIfChanged(settingsPath, settingsAtStart);
+
+    // Last, so the shutdown trail above is on disk like every other line: the
+    // half of a hang report that says whether the event loop returned at all.
+    DiagnosticsLog::instance().stop();
     return rc;
 }

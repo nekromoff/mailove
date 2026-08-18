@@ -89,6 +89,10 @@ public:
     /// Connected is ready: HTTP does not serialize requests, so background
     /// work needs no connection of its own and there is nothing to prepare.
     bool ensureBackgroundReady() override { return isConnected(); }
+    void fetchUnseenIds(
+        const QString &folder,
+        const std::function<void(Error, const QStringList &ids,
+                                 const QString &message)> &done) override;
     void folderUnreadCounts(
         const QStringList &folders,
         const std::function<void(Error, const QHash<QString, int> &counts,

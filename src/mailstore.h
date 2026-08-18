@@ -5,11 +5,15 @@
 
 #include <QAtomicInt>
 #include <QByteArray>
+#include <QCoreApplication>
 #include <QHash>
 #include <QList>
 #include <QSet>
 #include <QSqlDatabase>
+#include <QSqlQuery>
 #include <QString>
+#include <QStringList>
+#include <QVariantList>
 
 #include <functional>
 #include <tuple>
@@ -32,16 +36,42 @@
  */
 class MailStore
 {
+    // Not a QObject, but the migration labels below are shown to the user.
+    Q_DECLARE_TR_FUNCTIONS(MailStore)
 public:
     bool open();
 
     /// Scopes all folder-keyed operations below to this account ("user@host").
     void setAccountKey(const QString &key);
     QString accountKey() const { return m_accountKey; }
-    /// One-time migration: claims cache rows written before accounts were
-    /// separated (unscoped folder keys, global folder list) for \a account.
-    /// No-op once the legacy rows are gone.
-    void adoptLegacyCache(const QString &account);
+
+    // --- deferred one-time migrations --------------------------------------
+    //
+    // Every migration that has to walk a large table is kept out of open() and
+    // run on a worker behind the progress modal instead — see
+    // MaintenanceScheduler::startCacheMigrations(). Inline they cost a launch
+    // that got slower the more mail was cached, with a frozen window and
+    // nothing on screen saying why: a full sweep of `bodies` on a multi-gigabyte
+    // cache is minutes, and the user was made to wait for it before seeing a
+    // single message. Cheap flag flips and the schema statements stay in
+    // open(), which must finish before the first query can run at all.
+    struct Migration {
+        QString flag;  ///< meta_flags key recording it done
+        QString label; ///< what the modal says while it runs
+    };
+    /// The migrations still outstanding on the open cache, in the order they
+    /// must run. \a account is whose the pre-multi-account rows are to become;
+    /// empty skips that step (a local archive's key postdates the migration and
+    /// must not adopt another account's leftovers).
+    QList<Migration> pendingMigrations(const QString &account) const;
+    /// Runs one of them on \a db, a worker connection. \a progress reports
+    /// 0-100 for steps that can count their work; the rest leave the bar
+    /// indeterminate. \a cancelled is polled between slices — a step that stops
+    /// early leaves its flag unset and resumes from the start next launch, so
+    /// every one of them is written to be safe to re-run.
+    static void runMigration(QSqlDatabase &db, const Migration &step, const QString &account,
+                             const std::function<void(int)> &progress,
+                             const std::function<bool()> &cancelled);
 
     QStringList cachedFolders(const QString &account);
     void storeFolders(const QString &account, const QStringList &folders);
@@ -170,6 +200,12 @@ public:
     /// Marks a cached header as read, so the state survives a restart even
     /// before the next header sync confirms it from the server.
     void setSeen(const QString &folder, qint64 uid);
+    /// Marks every cached row of \a folder read, and returns how many changed.
+    /// For reconciling with the server: mail read on another device changes a
+    /// folder's unseen count but not its size, and no sync path re-reads old
+    /// flags — so when the server reports a folder fully read, this is how the
+    /// cache is made to agree.
+    int clearUnseenIn(const QString &account, const QString &folder);
     /// One cached message named both ways at once: the local key the cache and
     /// the list model use, and the id a MailBackend operation takes.
     struct AgedMessage {
@@ -253,6 +289,30 @@ public:
     /// partial index it relies on, and that is a full pass over `messages`:
     /// MailClient drives this on a worker, never on the GUI thread.
     static QHash<QString, int> unreadCountsOn(QSqlDatabase &db, const QString &account);
+    /// Same on the GUI connection, for a caller comparing the cache against
+    /// what a server just reported.
+    QHash<QString, int> unreadCounts(const QString &account) const;
+    /// How many rows are cached per folder — not how many are unread. Tells a
+    /// count of zero that means "read" apart from one that means "this folder
+    /// has never been cached", which are the same number and opposite facts.
+    QHash<QString, int> cachedRowCounts(const QString &account) const;
+    /// Makes \a folder's cached rows agree with the server's own list of
+    /// unread ids: everything in \a unseenIds becomes unread, everything else
+    /// in that folder becomes read. Returns how many rows changed.
+    ///
+    /// The only operation that can settle a disagreement about *which* mail is
+    /// unread. A count says how many and names none of them, which is why a
+    /// badge could sit at ten over a folder whose every row was read.
+    int applyUnseenSet(const QString &account, const QString &folder,
+                       const QStringList &unseenIds);
+
+    /// The one-time-work marker every deferred migration already uses, for the
+    /// two callers outside this file. \a db is a worker connection.
+    static bool workDoneOn(QSqlDatabase &db, const QString &flag);
+    static void markWorkDoneOn(QSqlDatabase &db, const QString &flag);
+    /// Same question on the GUI connection, so a caller can decide whether
+    /// there is any reason to start a worker at all.
+    bool workDone(const QString &flag) const;
 
     /// Deletes at most \a limit cached messages (header + body + search rows)
     /// of \a scopedFolder, using \a db. Returns how many were removed; 0 means
@@ -272,11 +332,25 @@ public:
     qint64 databaseBytes() const;
     qint64 reclaimableBytes();
     /// Rebuilds the database file, releasing free pages. Blocks for minutes on
-    /// a large cache and locks out every other connection, so callers run it
-    /// on a worker thread (see MailClient::reclaimDiskSpace). Opens its own
-    /// connection, and so is the one store call safe to make off the GUI
-    /// thread. Needs free disk space of roughly the current file size.
-    static bool vacuum(QString *error = nullptr);
+
+    /// Where the cache file lives. One definition, because the compaction
+    /// below has to name it from three places.
+    static QString databaseFilePath();
+    /// Writes a compacted copy of the cache to \a target — SQLite's
+    /// VACUUM INTO, which reads the live database rather than rewriting it.
+    /// Safe to run for minutes on a worker thread: it takes no lock the GUI
+    /// connection waits on, so the client stays usable throughout. Needs free
+    /// space of roughly the current file size. Returns false and leaves the
+    /// cache untouched on failure — including "disk full", which the in-place
+    /// VACUUM could only report after having already stopped everything.
+    static bool vacuumInto(const QString &target, QString *error = nullptr);
+    /// Puts \a compacted in place of the live cache and reopens the
+    /// connection. GUI thread only, and only with every worker stopped: it
+    /// closes the one connection the client reads through, replaces the file
+    /// with a rename, and opens it again. The rename is the only moment the
+    /// cache is unavailable, and it is a single filesystem operation rather
+    /// than the minutes an in-place VACUUM held everything for.
+    bool swapInCompacted(const QString &compacted, QString *error = nullptr);
 
     /// Newest-first uids of cached headers that have no cached body yet —
     /// the work list for the idle-time body backfill.
@@ -395,6 +469,11 @@ public:
     /// place; the index has to be copied into a new table. Noted at open(),
     /// carried out by MailClient on a worker.
     bool ftsNeedsRebuild() const { return m_ftsRebuildNeeded; }
+    /// Re-answers that from the schema. The deferred fts_rowid migration
+    /// replaces the whole index with one that already folds diacritics, so the
+    /// answer noted at open() is stale the moment it has run — and acting on
+    /// the stale answer costs a second full copy of the index for nothing.
+    void refreshFtsRebuildNeeded();
     /// Creates the folded index if it is not there yet.
     static bool beginFtsRebuild(QSqlDatabase &db);
     /// Where a previous run stopped (0 = nothing copied yet).
@@ -521,11 +600,200 @@ public:
     /// must never become one long scan.
     int backfillMessageIds(int limit);
 
+    /// Subjects of the given cached messages, in the order asked and at most
+    /// \a limit of them; a message whose row has gone yields an empty string.
+    /// Point lookups on the (folder, uid) primary key — for naming a handful
+    /// of messages in a report, never for listing a folder.
+    QStringList subjectsOf(const QString &folder, const QList<qint64> &uids, int limit = 3);
+
     /// Every cached copy of \a msgid, as (folder, uid). More than one is normal:
     /// the same message commonly exists in a folder and in All Mail.
     QList<QPair<QString, qint64>> locateByMessageId(const QString &msgid);
 
+    // --- soft delete --------------------------------------------------------
+    //
+    // A message the user has deleted or moved away is hidden, not destroyed:
+    // the row, its body and its attachments stay until the server confirms,
+    // which is what a failed change is rolled back from. Every read above
+    // filters these out; only confirmation purges them (removeMessages).
+
+    /// Hides \a uids of \a folder — the local half of a move or a delete.
+    void softDeleteMessages(const QString &folder, const QList<qint64> &uids);
+    /// Puts them back, for a change that was given up on.
+    void restoreSoftDeleted(const QString &folder, const QList<qint64> &uids);
+    /// Every provisionally deleted row of \a account, by unscoped folder.
+    /// Reads the tiny `WHERE soft_deleted = 1` index, so it is cheap enough to
+    /// ask on every start — which is when the reconcile needs it.
+    QHash<QString, QList<qint64>> softDeletedIn(const QString &account) const;
+
+    // --- the journal --------------------------------------------------------
+    //
+    // Every mutation the server has still to be told about, in the order it was
+    // made. See doc/OFFLINE_FIRST_ROADMAP.md: the cache is written immediately
+    // and an op is appended here, and replay is the only thing that calls the
+    // backend. That makes offline the ordinary path rather than a special case,
+    // and it makes a change durable — before this, everything but "mark folder
+    // read" was simply dropped when the connection was down.
+
+    /// One recorded change. \a op is the kind; which fields carry meaning
+    /// depends on it (see the op table in the roadmap).
+    struct JournalOp {
+        qint64 id = 0;          ///< replay order; never reused (AUTOINCREMENT)
+        QString account;
+        QString op;             ///< flag | move | delete | folder_rename | folder_delete
+        QString folder;         ///< source mailbox, unscoped
+        QStringList remoteIds;  ///< what the backend names the messages by
+        QList<qint64> uids;     ///< the same messages as the cache names them,
+                                ///< so the change can be rolled back locally
+        QString target;         ///< destination mailbox / new path
+        QStringList flagsAdd;
+        QStringList flagsDel;
+        qint64 queuedAt = 0;    ///< seconds since the epoch
+        int tries = 0;
+        QString lastError;
+        bool retired = false;   ///< given up on, rolled back, kept for the user
+    };
+
+    /// Appends \a op and returns its id (0 on failure). \a op.account and
+    /// \a op.queuedAt are filled in from the open account and the clock when
+    /// left empty.
+    qint64 appendJournalOp(JournalOp op);
+    /// Live ops of \a account, oldest first — the replay work list.
+    QList<JournalOp> journalOps(const QString &account) const;
+    /// Ops of \a account that were given up on, newest first.
+    QList<JournalOp> retiredJournalOps(const QString &account) const;
+    /// How many of each there are, without reading the rows.
+    int journalOpCount(const QString &account, bool retired = false) const;
+    /// Folders of \a account holding a live op. A folder in this list must not
+    /// be synced until it drains — invariant 3.
+    QSet<QString> journalFolders(const QString &account) const;
+    /// Records one failed attempt, keeping the op live.
+    void recordJournalFailure(qint64 id, const QString &error);
+    /// Gives up on an op: it stops being replayed, keeps its row and its error,
+    /// and the caller rolls its local change back.
+    void retireJournalOp(qint64 id, const QString &error);
+    /// Forgets an op outright — confirmed, discarded, or invalidated.
+    void dropJournalOp(qint64 id);
+    /// Puts a retired op back in the queue with a clean slate ("Retry").
+    void reviveJournalOp(qint64 id);
+    /// Forgets every retired op of \a account ("Discard all").
+    void clearRetiredJournalOps(const QString &account);
+    /// Forgets every op of \a account, retired or not (account removal).
+    void dropAccountJournal(const QString &account);
+    /// Forgets live ops of \a account queued before \a cutoffSecs, returning
+    /// them so the caller can roll them back. Retired ops are exempt: they are
+    /// the record the user has still to read.
+    QList<JournalOp> takeStaleJournalOps(const QString &account, qint64 cutoffSecs);
+    /// Live ops of \a account naming \a folder — what a UIDVALIDITY reset has
+    /// to discard, since every id in them has just been declared meaningless.
+    QList<JournalOp> journalOpsFor(const QString &account, const QString &folder) const;
+    /// Rewrites a live op after the world moved under it: used to follow a
+    /// message to the folder a preceding move put it in, and to follow a
+    /// renamed folder. Only ops after \a afterId are touched.
+    void rewriteJournalFolder(const QString &account, qint64 afterId, const QString &from,
+                              const QString &to, QChar separator);
+    /// Where one moved message ended up, as the destination server named it.
+    struct MovedMessage {
+        QString remoteId;
+        qint64 uid = 0;
+    };
+    /// Same, for the messages one move relocated: later ops of \a account naming
+    /// any of \a moved's keys in \a from are re-pointed at \a to and renamed to
+    /// what the destination calls them. A message with no entry can no longer be
+    /// named at all — the ops naming it are returned so the caller retires them.
+    QList<JournalOp> rewriteJournalIds(const QString &account, qint64 afterId,
+                                       const QString &from, const QString &to,
+                                       const QHash<QString, MovedMessage> &moved);
+
+    // --- the outbox ---------------------------------------------------------
+    //
+    // Messages waiting to be sent, as final wire bytes — persisted before the
+    // network is attempted, so a quit, crash or dead connection never loses a
+    // pressed Send. See doc/OUTBOX_ROADMAP.md. Deliberately its own table, not
+    // a folder in `messages`: these rows have no uid and no server identity,
+    // and they are meant to disappear. The wire stays one blob — an outbox row
+    // is written once, lives for seconds to hours, and must be byte-exact when
+    // it goes out, so nothing here goes through stripAttachments().
+
+    /// One queued send.  wire is post-crypto: exactly what sendMessage()
+    /// will be handed.  encrypted is remembered because it decides what the
+    /// UI may offer — ciphertext cannot be re-opened for editing.  subject
+    /// and  envelope are display copies; the authoritative ones ride inside
+    /// the wire.
+    struct OutboxMessage {
+        qint64 id = 0;          ///< send order; never reused (AUTOINCREMENT)
+        QString account;
+        QByteArray wire;        ///< assembled bytes, post-crypto
+        QStringList envelope;   ///< flat recipient list, as sendMessage() takes it
+        QString sender;         ///< envelope sender
+        QString subject;        ///< for the queue list; "" for an encrypted subject
+        qint64 created = 0;     ///< seconds since the epoch
+        int attempts = 0;
+        QString lastError;
+        qint64 nextTry = 0;     ///< seconds since the epoch; 0 = now
+        int state = Queued;
+        bool encrypted = false;
+        /// The wire carries attachments (or inline images). Like \a encrypted
+        /// it gates Edit: re-opening the composer from the wire reconstructs
+        /// only addresses, subject and body, and silently dropping the rest
+        /// would be data loss dressed as a feature.
+        bool hasAttachments = false;
+    };
+    /// OutboxMessage::state. Failed rows are kept for the user, like retired
+    /// journal ops: they stop being tried until "Retry now" revives them.
+    enum OutboxState { Queued = 0, Sending = 1, Failed = 2 };
+
+    /// Appends  msg and returns its id (0 on failure).  msg.account and
+    ///  msg.created are filled in from the open account and the clock when
+    /// left empty.
+    qint64 enqueueOutbox(OutboxMessage msg);
+    /// Every row of  account in send order — the Outbox list, wire included.
+    QList<OutboxMessage> outboxMessages(const QString &account) const;
+    /// One row by id, for acting on a list entry. id 0 on a row that is gone.
+    OutboxMessage outboxMessage(qint64 id) const;
+    /// The next row due to go out: the oldest Queued one whose nextTry has
+    /// passed. id 0 when nothing is due.
+    OutboxMessage nextOutboxMessage(const QString &account, qint64 nowSecs) const;
+    /// How many rows the account has, without reading the blobs. Failed rows
+    /// count too — the badge is "mail that has not gone out", not "mail that
+    /// is about to".
+    int outboxCount(const QString &account) const;
+    /// When the earliest Queued row may go out, or 0 with none queued — what
+    /// the drain worker arms its backoff timer from.
+    qint64 outboxNextTry(const QString &account) const;
+    /// Marks a row Sending before its network attempt starts.
+    void markOutboxSending(qint64 id);
+    /// Records one failed attempt: back to Queued with  nextTry, or straight
+    /// to Failed when  permanent — a server that has said no will keep
+    /// saying it.
+    void recordOutboxFailure(qint64 id, const QString &error, qint64 nextTry, bool permanent);
+    /// Puts a Sending row back to Queued without spending an attempt — the
+    /// connection died under it, not the message's fault.
+    void deferOutboxMessage(qint64 id);
+    /// Forgets a row outright — sent and filed, or cancelled by the user.
+    void dropOutboxMessage(qint64 id);
+    /// Puts a Failed row back in the queue with a clean slate ("Retry now").
+    void reviveOutboxMessage(qint64 id);
+    /// Rows still marked Sending are from a process that died mid-send —
+    /// whether the message left is unknowable, so they become Failed with
+    ///  note rather than being silently resent. Returns how many there were.
+    int recoverStaleOutbox(const QString &account, const QString &note);
+    /// Forgets every row of  account (account removal).
+    void dropAccountOutbox(const QString &account);
+
 private:
+    /// Reads an OutboxMessage out of the current row of  q, which must have
+    /// selected the columns in kOutboxColumns order.
+    static OutboxMessage outboxRowOf(const QSqlQuery &q);
+    /// Shared body of the outbox reads above.
+    QList<OutboxMessage> outboxSelect(const QString &where, const QVariantList &binds) const;
+
+    /// Reads a JournalOp out of the current row of \a q, which must have
+    /// selected the columns in kJournalColumns order.
+    static JournalOp journalRowOf(const QSqlQuery &q);
+    /// Shared body of journalOps()/retiredJournalOps()/journalOpsFor().
+    QList<JournalOp> journalSelect(const QString &where, const QVariantList &binds) const;
+
     /// Folder key as stored in messages/bodies/fts: "account\x1ffolder".
     QString scoped(const QString &folder) const;
     /// scoped() against an account named outright rather than the open one.

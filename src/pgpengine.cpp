@@ -729,8 +729,10 @@ namespace
 /// Turns GpgME's verdict into the one the UI states, and names the signer from
 /// the key we hold. The mapping is where the honesty rule lives: Red — the
 /// signature did not check out — becomes NotVerified rather than "invalid",
-/// because our copy of the signed octets is a re-serialisation and may not be
-/// the bytes that were signed.
+/// because the signed octets are not always reproducible byte for byte: a
+/// cached message whose attachments were restored is a re-serialisation
+/// (see PgpMime::signedOctets), and "invalid" is a claim only exact bytes
+/// can earn.
 PgpSignatureInfo convertSignature(const GpgME::Signature &sig, const QList<PgpKey> &keys)
 {
     PgpSignatureInfo out;

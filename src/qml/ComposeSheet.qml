@@ -1353,105 +1353,111 @@ Item {
 
         // Discard on the left; a spacer pushes Send to the right, where it
         // occupies exactly half the row width (the primary action).
-        RowLayout {
-            id: buttonRow
+        // The row's opaque backing. A Rectangle *inside* the layout with
+        // anchors.fill was undefined behaviour — a layout manages the geometry
+        // of every visible child, and Qt says so once per pass — so the fill is
+        // the parent now and the row is anchored inside it.
+        //
+        // Opaque, and above the preview in stacking order: the quote preview
+        // renders out-of-process, and a mid-resize frame sized for the old
+        // geometry must repaint over panel background, never over the
+        // Send/Save buttons.
+        Rectangle {
             Layout.fillWidth: true
-            spacing: Kirigami.Units.smallSpacing
-            // Above the preview in stacking order, with its own opaque fill:
-            // the quote preview renders out-of-process, and a mid-resize
-            // frame sized for the old geometry must repaint over panel
-            // background, never over the Send/Save buttons.
+            Layout.preferredHeight: buttonRow.implicitHeight
+                                    + Kirigami.Units.smallSpacing * 2
             z: 1
+            color: sheet.panelColor
 
-            Rectangle {
-                anchors.fill: parent
-                anchors.margins: -Kirigami.Units.smallSpacing
-                z: -1
-                color: sheet.panelColor
-            }
-
-            // Two equal-stretch halves rather than a width computed from
-            // buttonRow.width — a child sized from its own layout's width is
-            // a rearrange cycle ("Detected recursive rearrange"), and every
-            // aborted pass re-lays the whole sheet out, body editor included.
             RowLayout {
-                Layout.fillWidth: true
-                Layout.preferredWidth: 1
-                spacing: 0
+                id: buttonRow
+                anchors.fill: parent
+                anchors.margins: Kirigami.Units.smallSpacing
+                spacing: Kirigami.Units.smallSpacing
 
-                QQC2.Button {
-                    id: saveDraftButton
-                    // Discarding now lives on the window's close button, which
-                    // closed without asking anyway — this slot is worth more
-                    // as the action that keeps the message.
-                    text: "Save as draft"
-                    icon.name: "document-save"
-                    enabled: Mail.hasDraftsFolder && !sheet.sending
-                    QQC2.ToolTip.text: Mail.hasDraftsFolder
-                        ? "Store this message in the Drafts folder"
-                        : "No Drafts folder on this account"
-                    QQC2.ToolTip.visible: hovered
-                    onClicked: sheet.saveDraftNow()
-                }
-                Item { Layout.fillWidth: true } // spacer takes the remaining left space
-            }
-
-            // Right half: the Send button, or — while sending — a spinner and
-            // "Sending…" label in its place (the button is hidden, not greyed).
-            Item {
-                Layout.fillWidth: true
-                Layout.preferredWidth: 1
-                Layout.preferredHeight: sendButton.implicitHeight
-
-                QQC2.Button {
-                    id: sendButton
-                    anchors.fill: parent
-                    visible: !sheet.sending
-                    text: "Send"
-                    icon.name: "document-send"
-                    enabled: toField.text.trim().length > 0
-                    onClicked: sheet.doSend()
-                    QQC2.ToolTip.text: "Send (" +
-                        (sheet.ui ? sheet.ui.shortcutSend : "Ctrl+Return") + ")"
-                    QQC2.ToolTip.visible: hovered
-                }
-
+                // Two equal-stretch halves rather than a width computed from
+                // buttonRow.width — a child sized from its own layout's width is
+                // a rearrange cycle ("Detected recursive rearrange"), and every
+                // aborted pass re-lays the whole sheet out, body editor included.
                 RowLayout {
-                    anchors.centerIn: parent
-                    visible: sheet.sending
-                    spacing: Kirigami.Units.smallSpacing
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 1
+                    spacing: 0
 
-                    // Plain blue arc spinner (same as the main window) — the
-                    // desktop-style BusyIndicator draws a cogwheel.
-                    Item {
-                        id: sendSpinner
-                        Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
-                        Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
+                    QQC2.Button {
+                        id: saveDraftButton
+                        // Discarding now lives on the window's close button, which
+                        // closed without asking anyway — this slot is worth more
+                        // as the action that keeps the message.
+                        text: "Save as draft"
+                        icon.name: "document-save"
+                        enabled: Mail.hasDraftsFolder && !sheet.sending
+                        QQC2.ToolTip.text: Mail.hasDraftsFolder
+                            ? "Store this message in the Drafts folder"
+                            : "No Drafts folder on this account"
+                        QQC2.ToolTip.visible: hovered
+                        onClicked: sheet.saveDraftNow()
+                    }
+                    Item { Layout.fillWidth: true } // spacer takes the remaining left space
+                }
 
-                        Canvas {
-                            anchors.fill: parent
-                            anchors.margins: 2
-                            onPaint: {
-                                const ctx = getContext("2d")
-                                ctx.reset()
-                                const w = width / 2
-                                ctx.beginPath()
-                                ctx.arc(w, height / 2, w - 1.5, 0, Math.PI * 1.5)
-                                ctx.strokeStyle = Kirigami.Theme.highlightColor
-                                ctx.lineWidth = 3
-                                ctx.lineCap = "round"
-                                ctx.stroke()
-                            }
-                            RotationAnimator on rotation {
-                                running: sheet.sending
-                                from: 0
-                                to: 360
-                                duration: 900
-                                loops: Animation.Infinite
+                // Right half: the Send button, or — while sending — a spinner and
+                // "Sending…" label in its place (the button is hidden, not greyed).
+                Item {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 1
+                    Layout.preferredHeight: sendButton.implicitHeight
+
+                    QQC2.Button {
+                        id: sendButton
+                        anchors.fill: parent
+                        visible: !sheet.sending
+                        text: "Send"
+                        icon.name: "document-send"
+                        enabled: toField.text.trim().length > 0
+                        onClicked: sheet.doSend()
+                        QQC2.ToolTip.text: "Send (" +
+                            (sheet.ui ? sheet.ui.shortcutSend : "Ctrl+Return") + ")"
+                        QQC2.ToolTip.visible: hovered
+                    }
+
+                    RowLayout {
+                        anchors.centerIn: parent
+                        visible: sheet.sending
+                        spacing: Kirigami.Units.smallSpacing
+
+                        // Plain blue arc spinner (same as the main window) — the
+                        // desktop-style BusyIndicator draws a cogwheel.
+                        Item {
+                            id: sendSpinner
+                            Layout.preferredWidth: Kirigami.Units.iconSizes.smallMedium
+                            Layout.preferredHeight: Kirigami.Units.iconSizes.smallMedium
+
+                            Canvas {
+                                anchors.fill: parent
+                                anchors.margins: 2
+                                onPaint: {
+                                    const ctx = getContext("2d")
+                                    ctx.reset()
+                                    const w = width / 2
+                                    ctx.beginPath()
+                                    ctx.arc(w, height / 2, w - 1.5, 0, Math.PI * 1.5)
+                                    ctx.strokeStyle = Kirigami.Theme.highlightColor
+                                    ctx.lineWidth = 3
+                                    ctx.lineCap = "round"
+                                    ctx.stroke()
+                                }
+                                RotationAnimator on rotation {
+                                    running: sheet.sending
+                                    from: 0
+                                    to: 360
+                                    duration: 900
+                                    loops: Animation.Infinite
+                                }
                             }
                         }
+                        QQC2.Label { text: "Sending…" }
                     }
-                    QQC2.Label { text: "Sending…" }
                 }
             }
         }

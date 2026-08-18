@@ -923,6 +923,13 @@ void JmapBackend::downloadNextBody()
                 // no displayable text part. IMAP never hit this because KIMAP
                 // hands back a message that is already parsed.
                 message->setContent(KMime::CRLFtoLF(raw));
+                // Frozen before the parse, so encodedContent() answers with
+                // these octets rather than KMime's re-assembly of them — which
+                // inserts a blank line at a tight nested boundary (KDE bug
+                // 523826) and fails the DKIM body hash on mail Gmail-style
+                // senders produce. The blob is the message as it travelled;
+                // freezing keeps it that way (see ImapBackend::buildMessage).
+                message->setFrozen(true);
                 message->parse();
                 Q_EMIT bodyFetched(body.folder, body.remoteId, message);
             }
@@ -1013,6 +1020,52 @@ void JmapBackend::folderUnreadCounts(
         }
         if (done)
             done(Error::None, counts, QString());
+    });
+}
+
+void JmapBackend::fetchUnseenIds(
+    const QString &folder,
+    const std::function<void(Error, const QStringList &, const QString &)> &done)
+{
+    const QString id = mailboxId(folder);
+    if (id.isEmpty()) {
+        done(Error::NotFound, {}, tr("No such mailbox: %1").arg(folder));
+        return;
+    }
+    JmapRequest *request = newRequest();
+    if (!request) {
+        done(Error::Auth, {}, tr("Not connected to a JMAP server."));
+        return;
+    }
+    // Ids only — the flags are the question, not the messages.
+    request->addCall(
+        QStringLiteral("Email/query"),
+        QJsonObject{{QStringLiteral("accountId"), m_session->mailAccountId()},
+                    {QStringLiteral("filter"),
+                     QJsonObject{{QStringLiteral("inMailbox"), id},
+                                 {QStringLiteral("notKeyword"), QStringLiteral("$seen")}}}});
+    request->send([request, done](Error error, const QList<JmapRequest::Response> &responses,
+                                  const QString &message) {
+        request->deleteLater();
+        if (error != Error::None) {
+            done(error, {}, message);
+            return;
+        }
+        const JmapRequest::Response failed = JmapRequest::firstError(responses);
+        if (!failed.method.isEmpty()) {
+            done(JmapRequest::errorForType(failed.errorType()), {},
+                 QStringLiteral("Email/query failed (%1)").arg(failed.errorType()));
+            return;
+        }
+        QStringList ids;
+        for (const JmapRequest::Response &response : responses) {
+            if (response.method != QLatin1String("Email/query"))
+                continue;
+            const QJsonArray arr = response.arguments.value(QLatin1String("ids")).toArray();
+            for (const QJsonValue &v : arr)
+                ids.append(v.toString());
+        }
+        done(Error::None, ids, QString());
     });
 }
 

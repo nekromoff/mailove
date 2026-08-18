@@ -1,3 +1,125 @@
+mailove (3.0) unstable; urgency=medium
+
+  * Activity log in Settings (Ctrl+Shift+L): the last 5000 lines Mailove
+    logged, copyable into a bug report with addresses masked, mirrored to a
+    self-recycling file that never needs clearing. Backed up settings are
+    saved on change at exit, so a bad write no longer loses your labels,
+    shortcuts and layout.
+  * Unread badges finally tell the truth. The server is asked which mail is
+    actually unread - per folder, on the open account and in the background -
+    so a folder read elsewhere loses its pill without being clicked, and a
+    subfolder gains one before you open it.
+  * IMAP correctness: writes and reads now select their folder atomically,
+    fixing a spam-delete that ran against the inbox and searches that read
+    the wrong mailbox; the folder-sync pass no longer loops forever; push
+    reconnects cleanly instead of churning.
+  * Reclaim disk space no longer freezes the app - it compacts a copy and
+    swaps it in, off the GUI thread. Startup migrations stop re-running once
+    done.
+  * Fixes: message-list selection survives arrow/page keys and extends with
+    Shift; log lines collapse repeats and cap length; several QML errors
+    (TabBar, folder click, tooltips) silenced; tooltips instant and only
+    where they add something.
+  * Problems are written down now. Settings keeps the last 5000 lines
+    Mailove logged (Ctrl+Shift+L) and hands them to the clipboard or a file
+    for a bug report, with email addresses masked on the way out. The same
+    lines are mirrored to one file under ~/.local/state/mailove, which
+    recycles in place at 5000 lines: no rotation, no second copy, and
+    nothing to remember to delete.
+  * Nothing waits for the network any more. Deleting, moving, filing spam,
+    renaming a folder and marking mail read all happen the moment you ask,
+    online or off, and are pushed to the server afterwards. The five
+    commands that used to answer "Not connected" and do nothing now simply
+    work on a train.
+  * Changes are made as transactions rather than hoped for. Nothing is
+    destroyed locally until the server agrees it is gone, so a change the
+    server refuses is undone: the message reappears, the folder reverts to
+    its old name, the deleted folder comes back with its mail. A
+    breadcrumb says so at the time, and Settings keeps a "Failed changes"
+    list naming the mail, the reason and when - each row with Retry and
+    Discard - so "why did that come back" still has an answer an hour
+    later.
+  * A message read on another device no longer keeps its unread badge here
+    for good - the "12 new messages, nothing new inside" inbox. Opening a
+    folder now asks the server about the messages it still counts as
+    unread, and corrects the ones that were read elsewhere. It asks about
+    the unread mail rather than the folder, so the cost is the size of the
+    badge, not the size of the mailbox.
+  * A folder you move mail into says so while the move is still queued -
+    "3 messages moved here - will appear when you reconnect" - so mail
+    filed offline is accounted for rather than seeming to vanish between
+    the folder it left and the one it has not reached yet.
+  * A folder is never synced while it still owes the server a change,
+    which closes the window where a refresh could read the old state back
+    and quietly undo what you had just done.
+  * DKIM and OpenPGP verify the message that travelled, not KMime's
+    re-assembly of it. KMime inserts a blank line where a nested MIME part
+    closes tight against its parent boundary (KDE bug 523826) - the shape
+    Gmail produces on replies with attachments - so the body no longer
+    hashed to what the sender signed and good mail was reported as
+    "modified after signing". Bodies now arrive as two octet-exact halves
+    over the existing IMAP session (headers and text are fetched
+    separately, which sidesteps the re-assembly entirely) and are parsed
+    frozen, so the bytes that get hashed are the bytes off the wire. The
+    same freeze covers JMAP blobs and whole cached bodies.
+  * On first start after the upgrade, cached bodies from the last month are
+    re-fetched once and their authentication verdicts and spam scores
+    recomputed against the faithful bytes. Older mail keeps its stored
+    verdict; imported archives and your own spam/not-spam answers are
+    never touched.
+  * "Modified after signing" is now trustworthy: when the badge appears on
+    freshly fetched mail, the body really does differ from what was signed
+    - typically a forwarder or list re-encoding it, which the ARC seals
+    beside it will corroborate.
+  * When a message carries several DKIM signatures - the sender's plus a
+    forwarder's - the verdict shown is the most informative one, not
+    whichever signature happened to be listed last: a valid signature
+    outranks a body mismatch, a mismatch outranks a failure, a failure
+    outranks a key that cannot be fetched. Ties go to the sender's own
+    signature.
+  * A body fetch that yields only half a message is dropped and re-fetched
+    instead of being shown (or cached, or spam-scored) as a headerless
+    message; the cache refuses headerless bodies outright and heals any it
+    finds.
+  * fidelitytool now measures the exact fetch path the app uses and prints
+    wire-vs-fetched octet comparisons per message; rawfidelitytest asserts
+    the frozen round-trip offline and reports when a fixed KMime makes the
+    workaround unnecessary.
+  * One-time cache upgrades no longer hold up the launch. They used to run
+    before the window appeared, which on a large cache meant minutes of
+    apparently nothing happening; they now run afterwards in a dialog that
+    names the step, counts it off, and says roughly how much longer it
+    needs. Background syncing pauses while they run and resumes by itself,
+    and a run interrupted by a quit picks up where it left off.
+  * Mark read/unread has a shortcut of its own (M), and spam is now one key
+    in both directions (J) instead of two. Both follow the message they act
+    on: the key marks read when it is unread and unread when it is read,
+    spam when it is not and not spam when it is. The right-click menu shows
+    each command's key beside it.
+  * Sending survives the connection now. A message written offline is kept
+    as the exact bytes that will go on the wire and sent when you reconnect,
+    so quitting, crashing or a dead connection can no longer lose a pressed
+    Send - and a send interrupted mid-flight says "may already have been
+    sent" rather than quietly going out twice. Online, sending is unchanged:
+    it goes straight out, with no queue and no Outbox appearing for a
+    moment. The Outbox shows up in the folder list only while something is
+    waiting in it, offering Cancel, Retry now, and Edit for the messages the
+    composer can rebuild (not encrypted mail or attachments). Retrying knows
+    the difference between "try later" and "no": a dead connection or a busy
+    server backs off and tries again, an address the server rejected fails
+    once and waits for you.
+  * Undo send, off by default (Settings - General). Turned on, each message
+    is held for a few seconds before it goes: an "Undo send" button counts
+    the hold down beside Compose, Ctrl+Z does the same from anywhere, and
+    the message comes back into the composer as if Send had never been
+    pressed. The delay is adjustable in Advanced, and the key is rebindable
+    like every other one.
+  * Wording: counts now read "1 moved to trash" rather than "1 message(s)
+    moved to trash", and Settings no longer claims the Advanced page saves
+    itself - that page has always had its own Apply button.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Mon, 18 Aug 2026 17:30:00 +0200
+
 mailove (2.8) unstable; urgency=medium
 
   * A new spam rule: mail from a top-level domain your own sent mail never

@@ -31,6 +31,12 @@ public:
         QString mailBox; // full IMAP path, e.g. "INBOX/Archive"
         int level = 0;
         bool selectable = true;
+
+        bool operator==(const Folder &other) const
+        {
+            return displayName == other.displayName && mailBox == other.mailBox
+                && level == other.level && selectable == other.selectable;
+        }
     };
 
     using QAbstractListModel::QAbstractListModel;

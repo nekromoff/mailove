@@ -4,6 +4,7 @@
 #pragma once
 
 #include <QAtomicInt>
+#include <QElapsedTimer>
 #include <QHash>
 #include <QMutex>
 #include <QObject>
@@ -66,6 +67,7 @@ public:
 
     // --- vacuum ----------------------------------------------------------
     bool reclaiming() const { return m_reclaiming; }
+
     /// Whether a rebuild would actually hand anything back.
     bool reclaimWorthwhile() const;
     /// Human-readable cache size, e.g. "13.4 GB (6.2 GB reclaimable)".
@@ -123,21 +125,40 @@ public:
     QString migrationLabel() const { return m_migrationLabel; }
     /// 0-100, or -1 while the total is not known yet (indeterminate bar).
     int migrationPercent() const { return m_migrationPercent; }
+    /// Roughly how much longer the running step needs, e.g. "about 2 minutes
+    /// left" — measured, not guessed: the elapsed time against the fraction
+    /// done. Empty until the step has reported enough to say anything, which is
+    /// what the modal shows "Estimating…" for.
+    QString migrationEta() const { return m_migrationEta; }
+    /// Which of how many steps is running (1-based; 0 when there is only one).
+    /// The bar restarts at every step, and without these that reads as no
+    /// progress at all.
+    int migrationStep() const { return m_migrationStep; }
+    int migrationStepCount() const { return m_migrationSteps; }
 
-    /// Fills in the To column of mail cached before that column existed, by
-    /// reading the header back out of the cached message. Offline: everything
-    /// it needs is already on disk. Returns without doing anything when there
-    /// is nothing to fill in, which is the normal case after the first run.
-    /// \a isOutgoing decides, from a folder key alone, whether that folder
-    /// shows recipients. A predicate rather than a list of folders because the
-    /// folders are enumerated from the cache on the worker: they belong to
-    /// every account, and the caller can only see the open one's.
-    void startRecipientBackfill(std::function<bool(const QString &)> isOutgoing);
+    /// Runs every cache migration still outstanding, one after another on a
+    /// single worker, behind one modal. Returns having done nothing when there
+    /// is none — the normal case on every launch after the first.
+    ///
+    /// \a account is whose the pre-multi-account cache rows become (empty for a
+    /// local archive). \a isOutgoing decides, from a folder key alone, whether
+    /// that folder shows recipients, for the To-column backfill: a predicate
+    /// rather than a list because the folders are enumerated from the cache on
+    /// the worker — they belong to every account, and the caller can only see
+    /// the open one's.
+    ///
+    /// Emits cacheMigrationsFinished() when the last one is done, which is what
+    /// the background jobs wait for: the search-index rebuild reads the very
+    /// index one of these steps replaces.
+    void startCacheMigrations(const QString &account,
+                              std::function<bool(const QString &)> isOutgoing);
 
     /// Announces a migration's progress from a worker thread. Public so that a
     /// future migration living elsewhere can drive the same modal; always call
     /// them through QMetaObject::invokeMethod, they touch GUI-thread state.
-    void beginMigration(const QString &label);
+    /// \a step and \a stepCount place this one in a run of several (1-based);
+    /// leave them at 0 when it stands alone.
+    void beginMigration(const QString &label, int step = 0, int stepCount = 0);
     void reportMigration(int percent);
     void endMigration();
     /// Arms the drip-feed repair of the body search index.
@@ -175,6 +196,9 @@ Q_SIGNALS:
     void migrationChanged();
     /// The search-index rebuild reached its end (successfully or not).
     void indexRebuildFinished();
+    /// Every outstanding cache migration has run (or there were none). Nothing
+    /// that touches the cache in bulk may start before this.
+    void cacheMigrationsFinished();
     /// A vacuum is about to take the exclusive lock — stop every other writer.
     void syncPauseRequested();
     /// It is done; background syncing may resume.
@@ -207,6 +231,11 @@ private:
     /// One tiny batch of search-index repair (bodies queued in fts_pending):
     /// parses the raw message and writes its text into the FTS index.
     void reindexPendingBodies();
+    /// The To-column backfill, on the migration worker's connection and thread.
+    /// Returns how many rows it filled in (0 = there was nothing to do, and the
+    /// modal was never opened for it).
+    int runRecipientBackfill(QSqlDatabase &db,
+                             const std::function<bool(const QString &)> &isOutgoing);
     void startUnreadRecount();
     /// Runs the pending sorted-page request, if there is one and no worker
     /// holds the slot.
@@ -237,6 +266,9 @@ private:
     QAtomicInt m_folderOpCancel;
 
     QThread *m_vacuumThread = nullptr;
+    /// Wall clock of the whole reclaim, including the wait for writers — the
+    /// number a "why did that take so long" question is actually about.
+    QElapsedTimer m_reclaimTimer;
     bool m_reclaiming = false; ///< a VACUUM is running on a worker thread
 
     QThread *m_indexThread = nullptr; ///< diacritics rebuild of the FTS index
@@ -252,6 +284,10 @@ private:
     bool m_migrationRunning = false;
     QString m_migrationLabel;
     int m_migrationPercent = -1;
+    QString m_migrationEta;
+    QElapsedTimer m_migrationClock; ///< since the running step's first slice
+    int m_migrationStep = 0;
+    int m_migrationSteps = 0;
 
     QThread *m_unreadThread = nullptr;  ///< unread-count recount for the sidebar
     bool m_unreadRecountQueued = false; ///< a request arrived while one was running

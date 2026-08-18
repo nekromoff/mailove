@@ -53,6 +53,17 @@ public:
     /// Whether something user-triggered is in flight. Background work waits
     /// for it rather than competing with it.
     void setBusyProvider(std::function<bool()> busy) { m_isBusy = std::move(busy); }
+    /// Answers "does this folder still hold changes the server has not been
+    /// told about". A folder is never synced while it does: a merge landing
+    /// between an op's local write and its push would read the server's
+    /// untouched state back and undo the user's change. Waiting is a far
+    /// simpler rule than making every merge path individually aware of the
+    /// queue, and it is short — the drain runs before the header sync on every
+    /// connect. See doc/OFFLINE_FIRST_ROADMAP.md.
+    void setPendingOpsProvider(std::function<bool(const QString &)> pending)
+    {
+        m_hasPendingOps = std::move(pending);
+    }
 
     // --- opening and resuming ---------------------------------------------
     /// Clears the per-folder sync cursors and stops the backfill. Called when
@@ -201,12 +212,17 @@ private:
     void onBackfillTick();
     bool connected() const;
     bool busy() const { return m_isBusy && m_isBusy(); }
+    bool pendingOps(const QString &folder) const
+    {
+        return m_hasPendingOps && m_hasPendingOps(folder);
+    }
 
     MailStore &m_store;
     MessageListModel &m_messages;
     FolderModel &m_folders;
     MailBackend *m_backend = nullptr;
     std::function<bool()> m_isBusy;
+    std::function<bool(const QString &)> m_hasPendingOps;
 
     QString m_selectedFolder;
     bool m_searchActive = false;
@@ -238,7 +254,11 @@ private:
     bool m_backfillOpenPending = false;
     qint64 m_backfillFolderCount = -1;      ///< its size (-1 = not asked yet)
     qint64 m_backfillFetchedFromNewest = 0; ///< its own newest-fetched cursor
-    bool m_folderBackfillPassDone = false;  ///< all folders visited this connect
+    bool m_folderBackfillPassDone = false; ///< all folders visited this connect
+    /// Whether this pass's queue has been filled. Distinguishes an empty queue
+    /// that has not started from one that has finished — without it the pass
+    /// refills itself and runs forever. See continueFolderBackfill().
+    bool m_folderPassPrimed = false;
     /// "All folders synced" already said since this connect. The poll timer
     /// re-arms the pass every interval, and a breadcrumb that re-announces the
     /// same thing every few minutes is noise; a real (re)connect clears it.

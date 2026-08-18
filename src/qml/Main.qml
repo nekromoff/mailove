@@ -55,6 +55,17 @@ Kirigami.ApplicationWindow {
         defaultLogLevel: LoggingCategory.Fatal
     }
 
+    // The pill's own voice. Every number that reaches a badge says so here,
+    // from the delegate that draws it — the last link in a chain whose other
+    // end (the cache recount, the server counts, the on-open verification) is
+    // logged in C++. Two trees draw pills, from two different sources, and
+    // only the drawing end can say which one produced what is on screen.
+    LoggingCategory {
+        id: unreadLog
+        name: "mailove.unread"
+        defaultLogLevel: LoggingCategory.Fatal
+    }
+
     // Persisted UI state (column order, sorting, collapsed account nodes)
     Settings {
         id: uiSettings
@@ -89,8 +100,11 @@ Kirigami.ApplicationWindow {
         property real composeQuoteSplitForward: 0
         // Definable shortcuts (Look settings); QKeySequence strings.
         property string shortcutDelete: "Del"
+        // Read/unread and spam/not-spam are one key each, not two: the state of
+        // the row the selection starts at decides which way it goes, exactly as
+        // the context menu's single flipping entry does.
+        property string shortcutToggleRead: "M"
         property string shortcutJunk: "J"
-        property string shortcutNotSpam: "Shift+J"
         property string shortcutCompose: "C"
         property string shortcutReply: "R"
         property string shortcutForward: "F"
@@ -98,9 +112,17 @@ Kirigami.ApplicationWindow {
         // Compose-window shortcuts (full QKeySequence strings with modifiers).
         property string shortcutAttach: "Ctrl+Shift+A"
         property string shortcutSend: "Ctrl+Return"
+        // Window-wide, not a compose key: it acts after Send, when the
+        // composer is already gone. Fires only while undo send is enabled and
+        // no text editor has focus (there Ctrl+Z stays text undo).
+        property string shortcutUndoSend: "Ctrl+Z"
         // Message-viewer shortcuts (reading pane and detached message window).
         property string shortcutFind: "Ctrl+F"
         property string shortcutSource: "Ctrl+U"
+        // Window-wide, and deliberately not one of the single-letter mail keys:
+        // the log is opened while something is going wrong, which is exactly
+        // when the focus could be anywhere.
+        property string shortcutLog: "Ctrl+Shift+L"
         // Color scale 1–5: shortcut + color per slot, both "" = undefined.
         // A slot with a shortcut but no color clears the mark instead.
         // Slot 0 is "no label" — it has no color to define, it only takes the
@@ -124,6 +146,15 @@ Kirigami.ApplicationWindow {
         return uiSettings["scaleColor" + i]
     }
 
+    /// " (M)" for a menu entry whose command also has a key, "" when that key
+    /// has been cleared. Read from the setting rather than written into the
+    /// label so a rebound key is right everywhere without anyone remembering to
+    /// update the menu — and so the menu is where the keys are discovered,
+    /// which is the only place a reader looks before the settings page.
+    function keyHint(sequence) {
+        return sequence !== "" ? " (" + sequence + ")" : ""
+    }
+
     // Mail-list row height from the density setting
     readonly property real listRowHeight:
         Kirigami.Units.gridUnit * [1.15, 1.4, 1.9][uiSettings.rowDensity]
@@ -142,6 +173,10 @@ Kirigami.ApplicationWindow {
     // — the split's orientation, the column header, the row delegate, the sort
     // menu — to be worth naming once here.
     readonly property bool previewBeside: uiSettings.messageLayout === 1
+    // The Outbox open in the list pane. Not a folder: outbox rows are local
+    // queue entries with no server identity, so the pane swaps the message
+    // list for a list of its own rather than pretending they are mail.
+    property bool showingOutbox: false
     readonly property color panelColor: uiSettings.bgColor !== ""
         ? uiSettings.bgColor : Kirigami.Theme.backgroundColor
 
@@ -225,14 +260,14 @@ Kirigami.ApplicationWindow {
         onActivated: messageList.requestDelete()
     }
     Shortcut {
-        sequence: uiSettings.shortcutJunk
+        sequence: uiSettings.shortcutToggleRead
         enabled: sequence !== "" && root.shortcutsLive
-        onActivated: messageList.requestJunk()
+        onActivated: messageList.toggleRead()
     }
     Shortcut {
-        sequence: uiSettings.shortcutNotSpam
+        sequence: uiSettings.shortcutJunk
         enabled: sequence !== "" && root.shortcutsLive
-        onActivated: messageList.requestNotSpam()
+        onActivated: messageList.toggleJunk()
     }
     Shortcut {
         sequence: uiSettings.shortcutSelect
@@ -471,10 +506,70 @@ Kirigami.ApplicationWindow {
     // currentIndex) and ComposeSheet a full editor — for UI that many sessions
     // never open. Both are one-at-a-time, so a handle is kept: reopening while
     // the tab is already up must reuse it, not stack a second one.
+    // One instance, here rather than inside Settings: the shortcut below has
+    // to reach it without Settings being open, and two windows showing the
+    // same log would be two windows to close.
+    LogSheet { id: logSheet }
+
+    // Undoing the send just made. One function so the toolbar button and the
+    // shortcut are the same gesture — they act on the same remembered message
+    // and can never drift apart.
+    function undoLastSend() {
+        const r = Mail.undoLastSend()
+        if (r.mode === "reopen") {
+            // The message comes straight back into the composer, hold
+            // cancelled — as if Send had not been pressed.
+            r.uid = -1 // not a Drafts message
+            composeSheet().openDraft(r)
+        } else if (r.mode === "kept") {
+            // Ciphertext or attachments: nothing the composer could
+            // reconstruct, so the message stays in the Outbox un-sent.
+            root.showingOutbox = true
+            root.showPassiveNotification("Send undone — the message is in the Outbox", "long")
+        } else {
+            root.showPassiveNotification("Nothing to undo", "short")
+        }
+    }
+
+    /// Seconds left on the current hold, 0 when there is nothing to undo.
+    /// Ticked once a second only while a hold is running — the button is
+    /// on screen for a few seconds at a time, and nothing else reads this.
+    property int undoSecondsLeft: 0
+    function refreshUndoCountdown() {
+        const left = Mail.undoSendDeadline - Math.floor(Date.now() / 1000)
+        root.undoSecondsLeft = Mail.undoSendDeadline > 0 && left > 0 ? left : 0
+    }
+    Connections {
+        target: Mail
+        function onUndoSendDeadlineChanged() { root.refreshUndoCountdown() }
+    }
+    Timer {
+        running: Mail.undoSendDeadline > 0
+        interval: 250 // sub-second so the first tick is not a stale number
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: root.refreshUndoCountdown()
+    }
+
+    Shortcut {
+        sequence: uiSettings.shortcutUndoSend
+        enabled: sequence !== "" && Mail.undoSend && !root.textFieldFocused
+        onActivated: root.undoLastSend()
+    }
+
+    Shortcut {
+        sequence: uiSettings.shortcutLog
+        // No shortcutsLive gate: unlike the mail keys this is not about the
+        // message under the cursor, and the moment it is wanted is the moment
+        // something else has the focus.
+        enabled: sequence !== ""
+        onActivated: logSheet.open()
+    }
+
     property var accountDialog: null
     Component {
         id: accountComponent
-        AccountSheet { ui: uiSettings }
+        AccountSheet { ui: uiSettings; logWindow: logSheet }
     }
     function accountSheet() {
         if (!accountDialog) {
@@ -661,7 +756,8 @@ Kirigami.ApplicationWindow {
         QQC2.MenuItem {
             readonly property bool unread: messageMenu.rowCount > 0
                                            && !Mail.messageModel.seenAt(messageMenu.rows[0])
-            text: unread ? "Mark read" : "Mark unread"
+            text: (unread ? "Mark read" : "Mark unread")
+                  + root.keyHint(uiSettings.shortcutToggleRead)
             icon.name: unread ? "mail-mark-read" : "mail-mark-unread"
             onTriggered: unread ? Mail.markMessagesRead(messageMenu.rows)
                                 : Mail.markMessagesUnread(messageMenu.rows)
@@ -674,7 +770,8 @@ Kirigami.ApplicationWindow {
             readonly property bool spam: messageMenu.rowCount > 0
                                          && (Mail.viewingJunk
                                              || Mail.messageModel.spamAt(messageMenu.rows[0]))
-            text: spam ? "Not spam" : "Mark as spam"
+            text: (spam ? "Not spam" : "Mark as spam")
+                  + root.keyHint(uiSettings.shortcutJunk)
             icon.name: spam ? "mail-mark-notjunk" : "mail-mark-junk"
             onTriggered: spam ? messageList.requestNotSpam() : messageList.requestJunk()
         }
@@ -697,8 +794,9 @@ Kirigami.ApplicationWindow {
         }
         QQC2.MenuSeparator {}
         QQC2.MenuItem {
-            text: messageMenu.rowCount > 1
-                  ? "Delete " + messageMenu.rowCount + " messages" : "Delete"
+            text: (messageMenu.rowCount > 1
+                   ? "Delete " + messageMenu.rowCount + " messages" : "Delete")
+                  + root.keyHint(uiSettings.shortcutDelete)
             icon.name: "edit-delete"
             onTriggered: messageList.requestDelete()
         }
@@ -809,6 +907,16 @@ Kirigami.ApplicationWindow {
         contentItem: ColumnLayout {
             spacing: Kirigami.Units.largeSpacing
 
+            // "Step 2 of 5" — the bar restarts at every step, and without this
+            // five full sweeps read as one that keeps losing its progress.
+            QQC2.Label {
+                Layout.fillWidth: true
+                visible: Mail.migrationStepCount > 1
+                text: qsTr("Step %1 of %2").arg(Mail.migrationStep)
+                                           .arg(Mail.migrationStepCount)
+                opacity: 0.7
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
             QQC2.Label {
                 Layout.fillWidth: true
                 Layout.maximumWidth: Kirigami.Units.gridUnit * 22
@@ -824,13 +932,26 @@ Kirigami.ApplicationWindow {
                 to: 100
                 value: Math.max(0, Mail.migrationPercent)
             }
-            QQC2.Label {
+            // Percentage on the left, time remaining on the right. The estimate
+            // is the question actually being asked here — "can I go and make
+            // coffee" — so it is never hidden: until there has been enough
+            // progress to measure a rate it says so rather than disappearing,
+            // which would otherwise look like the migration itself stopping.
+            RowLayout {
                 Layout.fillWidth: true
-                horizontalAlignment: Text.AlignRight
-                visible: Mail.migrationPercent >= 0
-                text: Mail.migrationPercent + "%"
-                opacity: 0.7
-                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                QQC2.Label {
+                    text: Mail.migrationPercent >= 0 ? Mail.migrationPercent + "%" : ""
+                    opacity: 0.7
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                }
+                Item { Layout.fillWidth: true }
+                QQC2.Label {
+                    horizontalAlignment: Text.AlignRight
+                    text: Mail.migrationEta !== "" ? Mail.migrationEta
+                                                   : qsTr("estimating time left…")
+                    opacity: 0.7
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                }
             }
             QQC2.Label {
                 Layout.fillWidth: true
@@ -1033,10 +1154,34 @@ Kirigami.ApplicationWindow {
                 opacity: 0.8
                 // The label elides, so the older crumbs may be off-screen —
                 // right-click copies the full breadcrumb trail, and hovering
-                // shows it in a tooltip.
-                QQC2.ToolTip.text: Mail.statusText
-                QQC2.ToolTip.visible: statusHover.hovered && Mail.statusText.length > 0
+                // shows whatever the width cut off.
+                //
+                // The crumb itself only when something *was* cut off: a
+                // tooltip that repeats a line already fully readable
+                // underneath it covers the line it is quoting. Same rule the
+                // envelope header fields follow (SelectableValue.overflowing).
+                //
+                // The pointer to the log always, which is what makes hovering
+                // here worth doing at all: this line is where a failure is
+                // announced, and it has room for one sentence about something
+                // the log has the whole story of.
+                //
+                // HoverToolTip, not the attached QQC2.ToolTip: the stock one
+                // centres itself over the item it belongs to, and this item is
+                // the full width of the window — so the tooltip appeared in
+                // the middle of the screen, nowhere near the pointer that
+                // asked for it.
                 HoverHandler { id: statusHover }
+                HoverToolTip {
+                    hover: statusHover
+                    readonly property string logHint:
+                        "More info in the activity log."
+                        + (uiSettings.shortcutLog !== ""
+                           ? " (" + uiSettings.shortcutLog + ")" : "")
+                    text: statusLabel.truncated
+                          ? statusLabel.text + "\n\n" + logHint
+                          : logHint
+                }
                 TapHandler {
                     acceptedButtons: Qt.RightButton
                     onTapped: {
@@ -1046,6 +1191,22 @@ Kirigami.ApplicationWindow {
                         root.showPassiveNotification("Status copied", "short")
                     }
                 }
+            }
+            // The undo affordance for a send still inside its hold: large,
+            // labelled and counting down, because it is only worth anything
+            // for the few seconds it is there. Appears and disappears with
+            // the hold itself, so it never sits in the toolbar as dead
+            // furniture — the same message the shortcut acts on.
+            QQC2.Button {
+                visible: root.undoSecondsLeft > 0
+                text: "Undo send (" + root.undoSecondsLeft + ")"
+                icon.name: "edit-undo"
+                highlighted: true
+                onClicked: root.undoLastSend()
+                QQC2.ToolTip.text: "Bring the message back into the composer"
+                    + (uiSettings.shortcutUndoSend !== ""
+                       ? " (" + uiSettings.shortcutUndoSend + ")" : "")
+                QQC2.ToolTip.visible: hovered
             }
             QQC2.ToolButton {
                 icon.name: "mail-message-new"
@@ -1077,93 +1238,108 @@ Kirigami.ApplicationWindow {
             anchors.fill: parent
             spacing: 0
 
-            QQC2.TabBar {
-                id: tabBar
+            // Loaded only while there is a strip to draw, and destroyed when
+            // the last extra tab closes.
+            //
+            // Not merely hidden: org.kde.desktop's TabBar sizes itself from
+            // `contentModel.get(0).height`, and with no tabs that get()
+            // answers null — "TypeError: Cannot read property 'height' of
+            // null", re-evaluated for as long as the empty TabBar exists.
+            // Hiding it does not stop the binding; only not having one does.
+            Loader {
+                id: tabBarLoader
                 Layout.fillWidth: true
-                visible: root.tabPages.length > 1
-                // A hidden TabBar still reports its implicit height to the
-                // layout, which would leave a strip-sized gap above the mail
-                // view when there is nothing to show.
-                Layout.preferredHeight: visible ? implicitHeight : 0
+                Layout.preferredHeight: item ? item.implicitHeight : 0
+                active: root.tabPages.length > 1
+                sourceComponent: Component {
+                QQC2.TabBar {
+                    id: tabBar
+                    width: parent ? parent.width : 0
+                    // Mirrors tabStack on creation as well as on change: the strip
+                    // is built the moment a second tab appears, by which time the
+                    // stack may already be showing it.
+                    Component.onCompleted: currentIndex = tabStack.currentIndex
 
-                // TabBar sets its own currentIndex when a tab is clicked, so
-                // the two indices are mirrored rather than bound — a binding
-                // here would be overwritten by the first click. Assigning an
-                // unchanged int emits nothing, so this settles immediately.
-                onCurrentIndexChanged: tabStack.currentIndex = currentIndex
-                Connections {
-                    target: tabStack
-                    function onCurrentIndexChanged() {
-                        tabBar.currentIndex = tabStack.currentIndex
+                    // TabBar sets its own currentIndex when a tab is clicked, so
+                    // the two indices are mirrored rather than bound — a binding
+                    // here would be overwritten by the first click. Assigning an
+                    // unchanged int emits nothing, so this settles immediately.
+                    onCurrentIndexChanged: tabStack.currentIndex = currentIndex
+                    Connections {
+                        target: tabStack
+                        function onCurrentIndexChanged() {
+                            tabBar.currentIndex = tabStack.currentIndex
+                        }
+                    }
+
+                    Repeater {
+                        model: root.tabPages
+                        delegate: QQC2.TabButton {
+                            id: tabButton
+                            required property var modelData
+                            required property int index
+
+                            // The mail tab is the app itself — it has no close.
+                            readonly property bool closable: index > 0
+
+                            // Breathing room at the ends: the label ran straight
+                            // into the tab edge (and into the close button)
+                            // without it.
+                            leftPadding: Kirigami.Units.largeSpacing
+                            rightPadding: Kirigami.Units.largeSpacing
+
+                            // Every tab is always on screen: the strip never
+                            // scrolls, it divides itself up. Tabs take an even
+                            // share of the bar, capped so that two open tabs are
+                            // not two half-screen slabs, and with no floor — a
+                            // floor is what forces scrolling, and a title that has
+                            // elided away is still easier to reach than one that
+                            // has scrolled off. Floored to whole pixels: a
+                            // fraction over, repeated per tab, is enough to push
+                            // the last one out and start the strip scrolling.
+                            implicitWidth: Math.floor(
+                                Math.min(Kirigami.Units.gridUnit * 14,
+                                         tabBar.availableWidth
+                                             / Math.max(1, root.tabPages.length)))
+
+                            onClicked: tabStack.currentIndex = tabButton.index
+                            // Middle-click closes, as everywhere else with tabs.
+                            TapHandler {
+                                acceptedButtons: Qt.MiddleButton
+                                onTapped: {
+                                    if (tabButton.closable)
+                                        tabButton.modelData.close()
+                                }
+                            }
+
+                            contentItem: RowLayout {
+                                spacing: Kirigami.Units.smallSpacing
+                                QQC2.Label {
+                                    Layout.fillWidth: true
+                                    // Live: a compose tab retitles itself Reply or
+                                    // Draft, a message tab carries its subject.
+                                    text: tabButton.modelData.title
+                                    elide: Text.ElideRight
+                                    horizontalAlignment: Text.AlignHCenter
+                                    color: Kirigami.Theme.textColor
+                                }
+                                QQC2.ToolButton {
+                                    visible: tabButton.closable
+                                    icon.name: "window-close"
+                                    // Routed through the page, not straight to
+                                    // closeTab: the composer answers a close by
+                                    // asking about unsaved work first.
+                                    onClicked: tabButton.modelData.close()
+                                    implicitWidth: Kirigami.Units.iconSizes.small
+                                                  + Kirigami.Units.smallSpacing
+                                    implicitHeight: implicitWidth
+                                    icon.width: Kirigami.Units.iconSizes.small
+                                    icon.height: Kirigami.Units.iconSizes.small
+                                }
+                            }
+                        }
                     }
                 }
-
-                Repeater {
-                    model: root.tabPages
-                    delegate: QQC2.TabButton {
-                        id: tabButton
-                        required property var modelData
-                        required property int index
-
-                        // The mail tab is the app itself — it has no close.
-                        readonly property bool closable: index > 0
-
-                        // Breathing room at the ends: the label ran straight
-                        // into the tab edge (and into the close button)
-                        // without it.
-                        leftPadding: Kirigami.Units.largeSpacing
-                        rightPadding: Kirigami.Units.largeSpacing
-
-                        // Every tab is always on screen: the strip never
-                        // scrolls, it divides itself up. Tabs take an even
-                        // share of the bar, capped so that two open tabs are
-                        // not two half-screen slabs, and with no floor — a
-                        // floor is what forces scrolling, and a title that has
-                        // elided away is still easier to reach than one that
-                        // has scrolled off. Floored to whole pixels: a
-                        // fraction over, repeated per tab, is enough to push
-                        // the last one out and start the strip scrolling.
-                        implicitWidth: Math.floor(
-                            Math.min(Kirigami.Units.gridUnit * 14,
-                                     tabBar.availableWidth
-                                         / Math.max(1, root.tabPages.length)))
-
-                        onClicked: tabStack.currentIndex = tabButton.index
-                        // Middle-click closes, as everywhere else with tabs.
-                        TapHandler {
-                            acceptedButtons: Qt.MiddleButton
-                            onTapped: {
-                                if (tabButton.closable)
-                                    tabButton.modelData.close()
-                            }
-                        }
-
-                        contentItem: RowLayout {
-                            spacing: Kirigami.Units.smallSpacing
-                            QQC2.Label {
-                                Layout.fillWidth: true
-                                // Live: a compose tab retitles itself Reply or
-                                // Draft, a message tab carries its subject.
-                                text: tabButton.modelData.title
-                                elide: Text.ElideRight
-                                horizontalAlignment: Text.AlignHCenter
-                                color: Kirigami.Theme.textColor
-                            }
-                            QQC2.ToolButton {
-                                visible: tabButton.closable
-                                icon.name: "window-close"
-                                // Routed through the page, not straight to
-                                // closeTab: the composer answers a close by
-                                // asking about unsaved work first.
-                                onClicked: tabButton.modelData.close()
-                                implicitWidth: Kirigami.Units.iconSizes.small
-                                              + Kirigami.Units.smallSpacing
-                                implicitHeight: implicitWidth
-                                icon.width: Kirigami.Units.iconSizes.small
-                                icon.height: Kirigami.Units.iconSizes.small
-                            }
-                        }
-                    }
                 }
             }
 
@@ -1602,7 +1778,8 @@ Kirigami.ApplicationWindow {
                                                     required property int hiddenUnread
                                                     required property int index
 
-                                                    width: folderList.width
+                                                    width: folderDelegate.ListView.view
+                                                           ? folderDelegate.ListView.view.width : 0
                                                     implicitHeight: root.listRowHeight + 2
                                                     topPadding: 1
                                                     bottomPadding: 1
@@ -1657,6 +1834,13 @@ Kirigami.ApplicationWindow {
                                                             id: folderUnread
                                                             count: folderDelegate.unread
                                                             hiddenCount: folderDelegate.hiddenUnread
+                                                            // The connected account's tree.
+                                                            onCountChanged: if (count > 0)
+                                                                console.info(unreadLog,
+                                                                    "pill shown: connected tree, "
+                                                                    + folderDelegate.mailBox + " = "
+                                                                    + count + " (+" + hiddenCount
+                                                                    + " folded away)")
                                                             primary: folderPane.isInbox(folderDelegate.mailBox)
                                                         onHighlight: folderDelegate.highlighted
                                                             Layout.preferredWidth: implicitWidth
@@ -1680,6 +1864,7 @@ Kirigami.ApplicationWindow {
                                                             Mail.folderModel.toggleExpanded(index)
                                                             return
                                                         }
+                                                        root.showingOutbox = false
                                                         // Clicking a folder works its
                                                         // subtree like the arrow does:
                                                         // reveal it, and fold it away again
@@ -1696,12 +1881,32 @@ Kirigami.ApplicationWindow {
                                                             return // already open; nothing to re-fetch
                                                         }
                                                         Mail.folderModel.expandRow(index)
-                                                        folderList.currentIndex = index
-                                                        folderList.forceActiveFocus()
+                                                        // The view that owns this delegate,
+                                                        // rather than its id: an account
+                                                        // section being torn down takes the
+                                                        // id with it, and a click landing in
+                                                        // that window threw "folderList is
+                                                        // not defined" — abandoning the rest
+                                                        // of this handler, so the folder
+                                                        // opened without the list following.
+                                                        folderDelegate.ListView.view.currentIndex = index
+                                                        folderDelegate.ListView.view.forceActiveFocus()
                                                         // A click opens right away — drop
                                                         // the key-navigation debounce the
                                                         // currentIndex change just armed.
-                                                        folderOpenDebounce.stop()
+                                                        //
+                                                        // Guarded for the same reason the
+                                                        // view above is reached through the
+                                                        // attached property: this timer
+                                                        // belongs to the account section,
+                                                        // and a click landing while that
+                                                        // section is being rebuilt found it
+                                                        // already gone — "Cannot call method
+                                                        // 'stop' of undefined", and the rest
+                                                        // of the handler (the folder open
+                                                        // itself) never ran.
+                                                        if (folderOpenDebounce)
+                                                            folderOpenDebounce.stop()
                                                         messageList.currentIndex = -1
                                                         messageList.openedUid = -1
                                                         messageList.clearSelection()
@@ -1831,6 +2036,49 @@ Kirigami.ApplicationWindow {
                                                 }
                                             }
 
+                                            // The Outbox: local and synthetic, shown
+                                            // only while something is queued — an empty
+                                            // Outbox is a row about nothing.
+                                            QQC2.ItemDelegate {
+                                                id: outboxRow
+                                                visible: accountSection.open && accountSection.isCurrent
+                                                         && Mail.outboxCount > 0
+                                                Layout.fillWidth: true
+                                                implicitHeight: root.listRowHeight + 2
+                                                topPadding: 1
+                                                bottomPadding: 1
+                                                leftPadding: Kirigami.Units.smallSpacing
+                                                              + Kirigami.Units.gridUnit * 1.5
+                                                rightPadding: Kirigami.Units.smallSpacing
+                                                highlighted: root.showingOutbox
+                                                contentItem: RowLayout {
+                                                    spacing: Kirigami.Units.smallSpacing
+                                                    Kirigami.Icon {
+                                                        source: "mail-folder-outbox"
+                                                        Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                                                        Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                                                        color: outboxRow.highlighted
+                                                               ? Kirigami.Theme.highlightedTextColor
+                                                               : Qt.alpha(Kirigami.Theme.textColor, 0.55)
+                                                    }
+                                                    QQC2.Label {
+                                                        Layout.fillWidth: true
+                                                        text: "Outbox"
+                                                        elide: Text.ElideRight
+                                                        color: outboxRow.highlighted
+                                                               ? Kirigami.Theme.highlightedTextColor
+                                                               : Kirigami.Theme.textColor
+                                                    }
+                                                    UnreadPill {
+                                                        count: Mail.outboxCount
+                                                        onHighlight: outboxRow.highlighted
+                                                        Layout.preferredWidth: implicitWidth
+                                                        Layout.preferredHeight: implicitHeight
+                                                    }
+                                                }
+                                                onClicked: root.showingOutbox = true
+                                            }
+
                                             // Cached folder tree of an account that is
                                             // open in the panel but not connected.
                                             ColumnLayout {
@@ -1881,6 +2129,16 @@ Kirigami.ApplicationWindow {
                                                             UnreadPill {
                                                                 count: cachedFolderDelegate.modelData.unread || 0
                                                                 hiddenCount: cachedFolderDelegate.modelData.hiddenUnread || 0
+                                                                // A tree for an account that is
+                                                                // not the connected one — drawn
+                                                                // from remembered numbers, not
+                                                                // from the folder model.
+                                                                onCountChanged: if (count > 0)
+                                                                    console.info(unreadLog,
+                                                                        "pill shown: cached tree, "
+                                                                        + cachedFolderDelegate.modelData.mailBox
+                                                                        + " = " + count + " (+"
+                                                                        + hiddenCount + " folded away)")
                                                                 primary: folderPane.isInbox(cachedFolderDelegate.modelData.mailBox)
                                                                 // Nothing in a cached tree is the open folder — that
                                                                 // account is not the connected one.
@@ -1901,6 +2159,7 @@ Kirigami.ApplicationWindow {
                                                             // context where no id resolves —
                                                             // "messageList is not defined".
                                                             messageList.forceActiveFocus()
+                                                            root.showingOutbox = false
                                                             Mail.openFolderInAccount(accountSection.index,
                                                                                      modelData.mailBox)
                                                         }
@@ -1934,6 +2193,7 @@ Kirigami.ApplicationWindow {
                                                                 messageList.currentIndex = -1
                                                                 messageList.openedUid = -1
                                                                 messageList.clearSelection()
+                                                                root.showingOutbox = false
                                                                 Mail.openFolderInAccount(
                                                                     accountSection.index, box)
                                                                 folderMenu.mailBox = box
@@ -2280,7 +2540,7 @@ Kirigami.ApplicationWindow {
                                 // it owns the sort state and toggle(), which that
                                 // menu calls. (A Layout skips invisible children,
                                 // so this costs no height.)
-                                visible: !root.previewBeside
+                                visible: !root.previewBeside && !root.showingOutbox
 
                                 // model order: 0 date, 1 from, 2 subject, 3 attachment
                                 property int sortColumn: uiSettings.sortColumn
@@ -2443,7 +2703,163 @@ Kirigami.ApplicationWindow {
                                 Layout.fillWidth: true
                             }
 
+                            // Mail filed into this folder that the server has
+                            // not been told about yet. It has left the folder
+                            // it came from — the user watched it go — and it
+                            // cannot be listed here until the server names it,
+                            // so without this line it is simply nowhere. Which
+                            // offline means "until you reconnect", and that is
+                            // exactly when moving mail has to feel reliable.
+                            Kirigami.InlineMessage {
+                                Layout.fillWidth: true
+                                Layout.margins: Kirigami.Units.smallSpacing
+                                visible: Mail.incomingCount > 0 && !Mail.searching
+                                         && !root.showingOutbox
+                                type: Kirigami.MessageType.Information
+                                text: {
+                                    var n = Mail.incomingCount
+                                    var what = n === 1 ? "1 message" : n + " messages"
+                                    return Mail.connected
+                                        ? what + " moved here — arriving shortly"
+                                        : what + " moved here — will appear when you reconnect"
+                                }
+                            }
+
+                            // The Outbox view, in the message list's place. Its own
+                            // list: these are queue rows, not mail, and their commands
+                            // (Cancel, Edit, Retry now) exist nowhere else.
                             QQC2.ScrollView {
+                                visible: root.showingOutbox
+                                Layout.fillWidth: true
+                                Layout.fillHeight: true
+                                contentWidth: availableWidth
+                                clip: true
+
+                                ListView {
+                                    id: outboxView
+                                    property var rows: []
+                                    function reload() { rows = Mail.outboxList() }
+                                    model: rows
+                                    Component.onCompleted: reload()
+                                    Connections {
+                                        target: Mail
+                                        function onOutboxChanged() {
+                                            outboxView.reload()
+                                            // The queue drained (or was cancelled away):
+                                            // nothing left to show, back to the mail.
+                                            if (Mail.outboxCount === 0)
+                                                root.showingOutbox = false
+                                        }
+                                    }
+                                    // Undo-send holds count down to the second; repaint
+                                    // the "sending in N s" labels while any are live.
+                                    property real nowSecs: Date.now() / 1000
+                                    Timer {
+                                        running: root.showingOutbox
+                                        interval: 1000
+                                        repeat: true
+                                        onTriggered: outboxView.nowSecs = Date.now() / 1000
+                                    }
+
+                                    delegate: QQC2.ItemDelegate {
+                                        id: outboxDelegate
+                                        required property var modelData
+                                        width: ListView.view.width
+                                        hoverEnabled: false
+                                        down: false
+
+                                        contentItem: ColumnLayout {
+                                            spacing: Kirigami.Units.smallSpacing / 2
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                spacing: Kirigami.Units.smallSpacing
+                                                QQC2.Label {
+                                                    Layout.fillWidth: true
+                                                    text: outboxDelegate.modelData.subject
+                                                    font.bold: true
+                                                    elide: Text.ElideRight
+                                                }
+                                                QQC2.Label {
+                                                    text: Qt.formatDateTime(
+                                                              outboxDelegate.modelData.created,
+                                                              "hh:mm")
+                                                    opacity: 0.7
+                                                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                                                }
+                                            }
+                                            QQC2.Label {
+                                                Layout.fillWidth: true
+                                                text: "To: " + outboxDelegate.modelData.to
+                                                elide: Text.ElideRight
+                                                opacity: 0.8
+                                                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                                            }
+                                            QQC2.Label {
+                                                Layout.fillWidth: true
+                                                wrapMode: Text.Wrap
+                                                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                                                color: outboxDelegate.modelData.state === 2
+                                                       ? Kirigami.Theme.negativeTextColor
+                                                       : Kirigami.Theme.textColor
+                                                opacity: outboxDelegate.modelData.state === 2 ? 1 : 0.8
+                                                text: {
+                                                    const m = outboxDelegate.modelData
+                                                    if (m.state === 1)
+                                                        return "Sending…"
+                                                    if (m.state === 2)
+                                                        return m.error
+                                                    const hold = m.holdUntil - outboxView.nowSecs
+                                                    if (hold > 0)
+                                                        return "Sending in " + Math.ceil(hold) + " s"
+                                                    return Mail.connected
+                                                        ? "Waiting to send"
+                                                        : "Will be sent when the connection is back"
+                                                }
+                                            }
+                                            RowLayout {
+                                                spacing: Kirigami.Units.smallSpacing
+                                                QQC2.Button {
+                                                    text: "Cancel"
+                                                    visible: outboxDelegate.modelData.state !== 1
+                                                    onClicked: Mail.cancelOutboxMessage(
+                                                                   outboxDelegate.modelData.id)
+                                                }
+                                                QQC2.Button {
+                                                    text: "Edit"
+                                                    // Ciphertext cannot be re-opened, and a
+                                                    // message carrying attachments would lose
+                                                    // them — Cancel and recompose is the
+                                                    // honest offer there (OUTBOX_ROADMAP.md).
+                                                    visible: outboxDelegate.modelData.editable
+                                                             && outboxDelegate.modelData.state !== 1
+                                                    onClicked: {
+                                                        const d = Mail.outboxEditData(
+                                                                      outboxDelegate.modelData.id)
+                                                        if (d.subject === undefined)
+                                                            return
+                                                        d.uid = -1 // not a Drafts message
+                                                        composeSheet().openDraft(d)
+                                                        // Only once the composer has the
+                                                        // fields: a failed open loses nothing.
+                                                        Mail.cancelOutboxMessage(
+                                                            outboxDelegate.modelData.id)
+                                                    }
+                                                }
+                                                QQC2.Button {
+                                                    text: "Retry now"
+                                                    visible: outboxDelegate.modelData.state === 2
+                                                    onClicked: Mail.retryOutboxMessage(
+                                                                   outboxDelegate.modelData.id)
+                                                }
+                                            }
+                                            Kirigami.Separator { Layout.fillWidth: true }
+                                        }
+                                    }
+                                }
+                            }
+
+                            QQC2.ScrollView {
+                                visible: !root.showingOutbox
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
                                 clip: true
@@ -2590,6 +3006,41 @@ Kirigami.ApplicationWindow {
                                             return
                                         Mail.markAsNotSpam(rows)
                                         clearSelection()
+                                    }
+                                    // One key for both directions, on the same
+                                    // rule the context menu uses: the first
+                                    // selected row decides, and the whole
+                                    // selection follows it. Two keys meant one
+                                    // of them was always the no-op, and which
+                                    // one was not something the reader could
+                                    // see without checking the row first.
+                                    function toggleJunk() {
+                                        const rows = selectedIndexes()
+                                        if (rows.length === 0)
+                                            return
+                                        // Everything in the junk folder is spam
+                                        // by definition, whatever the flag on
+                                        // the row says.
+                                        if (Mail.viewingJunk
+                                                || Mail.messageModel.spamAt(rows[0]))
+                                            requestNotSpam()
+                                        else
+                                            requestJunk()
+                                    }
+                                    // Same rule again for read/unread. The
+                                    // selection is deliberately kept: unlike
+                                    // spam and delete, this does not take the
+                                    // rows out of the folder, and flipping a
+                                    // run of messages back and forth is a
+                                    // normal thing to want.
+                                    function toggleRead() {
+                                        const rows = selectedIndexes()
+                                        if (rows.length === 0)
+                                            return
+                                        if (Mail.messageModel.seenAt(rows[0]))
+                                            Mail.markMessagesUnread(rows)
+                                        else
+                                            Mail.markMessagesRead(rows)
                                     }
 
                                     // Row indexes shift on re-sort/search — selections
@@ -2846,14 +3297,22 @@ Kirigami.ApplicationWindow {
                                             // ordinary moves within the page cost nothing
                                             // and the view does not jump.
                                             positionViewAtIndex(currentIndex, ListView.Contain)
-                                            // Moving the cursor (keyboard or click) always
-                                            // collapses any multi-selection to that row —
-                                            // otherwise the clicked row stays highlighted
-                                            // while the arrow keys move a second one.
-                                            // Exception: the select-and-advance shortcut
-                                            // moves the cursor without dropping the set.
+                                            // Moving the cursor does NOT drop the
+                                            // selection. A set built with the select key
+                                            // survives arrowing and paging through the
+                                            // list; only leaving the folder or deselecting
+                                            // explicitly (another select press, a plain
+                                            // click) empties it. Collapsing here meant a
+                                            // run picked out over several rows was lost to
+                                            // the next Down press, which is the one moment
+                                            // it is most likely to be pressed.
+                                            //
+                                            // The anchor still follows the cursor, so a
+                                            // shift-click afterwards ranges from where the
+                                            // user actually is rather than from wherever
+                                            // the set was started.
                                             if (!preserveSelection)
-                                                selectSingle(currentIndex)
+                                                selectionAnchor = currentIndex
                                             // Record the pick now, not when the debounced
                                             // fetch fires: a reset landing inside those
                                             // 150 ms is exactly the case this exists for.
@@ -2923,6 +3382,17 @@ Kirigami.ApplicationWindow {
                                         const from = Math.max(0, currentIndex)
                                         let target = -1
                                         switch (event.key) {
+                                        case Qt.Key_Down:
+                                        case Qt.Key_Up:
+                                            // Only with Shift: without it these belong to
+                                            // the view's own key navigation, which does
+                                            // the same thing and keeps its own state.
+                                            if (!(event.modifiers & Qt.ShiftModifier))
+                                                return
+                                            target = event.key === Qt.Key_Down
+                                                     ? Math.min(count - 1, from + 1)
+                                                     : Math.max(0, from - 1)
+                                            break
                                         case Qt.Key_PageDown:
                                             target = Math.min(count - 1, from + page)
                                             break
@@ -2949,6 +3419,22 @@ Kirigami.ApplicationWindow {
                                             return // not ours — leave it to the ListView
                                         }
                                         event.accepted = true
+                                        // Shift extends the run from the anchor instead
+                                        // of just moving, the way every list in every
+                                        // file manager does. The move goes through
+                                        // preserveSelection so the anchor stays where the
+                                        // run started — re-anchoring on each step would
+                                        // keep the range one row long forever.
+                                        if (event.modifiers & Qt.ShiftModifier) {
+                                            const anchor = selectionAnchor >= 0
+                                                           ? selectionAnchor : from
+                                            selectionAnchor = anchor
+                                            preserveSelection = true
+                                            currentIndex = target
+                                            preserveSelection = false
+                                            selectRange(anchor, target)
+                                            return
+                                        }
                                         // onCurrentIndexChanged scrolls the cursor into
                                         // view — for every kind of move, not just these
                                         // keys — so there is nothing to do here.
