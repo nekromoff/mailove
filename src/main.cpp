@@ -20,6 +20,8 @@
 #include "avatarprovider.h"
 #include "diagnosticslog.h"
 #include "settingsbackup.h"
+#include "uisettings.h"
+#include "updatecheck.h"
 #include "documenthandler.h"
 #include "mailclient.h"
 #include "messagecontext.h"
@@ -88,6 +90,17 @@ int main(int argc, char *argv[])
     // overrides both.
     MailClient::applyLogFilterRules(false);
 
+    // --force-version=X makes the update check compare against X instead of
+    // this build's version, so the "update available" marker can be exercised
+    // without cutting a release. Scanned by hand rather than through
+    // QCommandLineParser: Qt has already taken its own arguments by now, and a
+    // parser here would start rejecting everything it did not recognise.
+    for (int i = 1; i < argc; ++i) {
+        const QLatin1StringView arg(argv[i]);
+        if (arg.startsWith(QLatin1StringView("--force-version=")))
+            UpdateCheck::setRunningVersion(QString::fromLocal8Bit(argv[i]).section(u'=', 1));
+    }
+
     ViewerSchemeHandler::registerScheme();
     QtWebEngineQuick::initialize();
 
@@ -111,13 +124,11 @@ int main(int argc, char *argv[])
     // icon instead, so set both.
     QGuiApplication::setDesktopFileName(QStringLiteral("org.mailove.Mailove"));
 
-    // The settings file as it stands before this session touches it, written
-    // back out at exit only if the session changed it. See settingsbackup.h
-    // for why a copy taken at startup would be worthless.
+    // Where the spare copy of the settings is taken from at exit. Nothing is
+    // read from the backup here or anywhere else — see settingsbackup.h.
     const QString settingsPath =
         QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)
         + QStringLiteral("/mailove/mailove.conf");
-    const QByteArray settingsAtStart = SettingsBackup::snapshot(settingsPath);
     // Press-and-hold reveals secondary actions (the Forward button's
     // "as attachment"); the platform default of 800ms reads as "nothing is
     // happening". Snappier, still long past any click.
@@ -216,6 +227,16 @@ int main(int argc, char *argv[])
     // the values it edits are read from every corner of the client, and there
     // is exactly one file behind them.
     qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "Advanced", &AdvancedConfig::instance());
+    qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "UiSettings", &UiSettings::instance());
+    // Whether a newer release exists. Its own singleton rather than three more
+    // properties on Mail: nothing about it touches mail, and it answers long
+    // after everything else has settled.
+    qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "Updates", &UpdateCheck::instance());
+    // A machine that was offline 30 seconds in still gets an answer once it has
+    // a network; the daily interval keeps reconnects from meaning re-checks.
+    QObject::connect(&client, &MailClient::connectedChanged, &UpdateCheck::instance(),
+                     &UpdateCheck::maybeCheck);
+    UpdateCheck::instance().start();
     // The log viewer's model, and the three things it can do with the text.
     qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "Diagnostics",
                                  &DiagnosticsLog::instance());
@@ -245,8 +266,9 @@ int main(int argc, char *argv[])
     qCDebug(logTrace, "shutdown: event loop returned %d", rc);
     } // the QML engine dies here, and with it the last flush of QML Settings
 
-    // Now the file is final, so "did this session change it" can be answered.
-    SettingsBackup::writeIfChanged(settingsPath, settingsAtStart);
+    // Now the file is final, so the spare copy is of the settings as they were
+    // actually left, not as they were found.
+    SettingsBackup::write(settingsPath);
 
     // Last, so the shutdown trail above is on disk like every other line: the
     // half of a hang report that says whether the event loop returned at all.

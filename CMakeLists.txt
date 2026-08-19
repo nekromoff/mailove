@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailove VERSION 3.0 LANGUAGES CXX)
+project(mailove VERSION 3.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,6 +13,7 @@ set(CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS
     WORLD_READ WORLD_EXECUTE)
 
 find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Network Qml Quick QuickControls2 Sql Widgets WebEngineQuick)
+find_package(KF6Codecs REQUIRED)
 find_package(KPim6IMAP REQUIRED)
 find_package(KPim6Mime REQUIRED)
 find_package(KPim6SMTP REQUIRED)
@@ -56,6 +57,10 @@ qt_add_executable(mailove
     src/diagnosticslog.h
     src/settingsbackup.cpp
     src/settingsbackup.h
+    src/uisettings.cpp
+    src/uisettings.h
+    src/updatecheck.cpp
+    src/updatecheck.h
     src/mailclient.cpp
     src/mailclient.h
     src/accountstore.cpp
@@ -170,6 +175,7 @@ target_link_libraries(mailove PRIVATE
     # Widgets: for KDE's native, widget-based file pickers only (see main.cpp).
     Qt6::Widgets
     Qt6::WebEngineQuick
+    KF6::Codecs
     KPim6::IMAP
     KPim6::Mime
     KPim6::SMTP
@@ -327,7 +333,35 @@ qt_add_executable(attachmenttest tests/attachmenttest.cpp
 target_link_libraries(attachmenttest PRIVATE Qt6::Core PkgConfig::ZSTD)
 
 qt_add_executable(viewertest tests/viewertest.cpp src/viewersecurity.cpp src/viewersecurity.h)
-target_link_libraries(viewertest PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::WebEngineQuick)
+target_link_libraries(viewertest PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::WebEngineQuick
+    KF6::Codecs)
+
+# What sender CSS can still fetch from inside a rendered message, measured
+# against a local server standing in for the attacker. See the file header and
+# doc/research/css-the-bomb-inside-your-inbox.md.
+qt_add_executable(cssegresstest tests/cssegresstest.cpp src/viewersecurity.cpp src/viewersecurity.h)
+target_link_libraries(cssegresstest PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Quick
+    Qt6::WebEngineQuick KF6::Codecs)
+
+# The URL-attribute half of sanitizeMessageHtml(), including the cases where the
+# source text and the URL the engine acts on differ. Fast: no WebEngine.
+# What the update check concludes from a redirect: tag parsing, host and scheme
+# checks, version ordering. Pure logic, no socket.
+qt_add_executable(updatechecktest tests/updatechecktest.cpp src/updatecheck.cpp
+    src/updatecheck.h src/advancedconfig.cpp src/advancedconfig.h)
+target_link_libraries(updatechecktest PRIVATE Qt6::Core Qt6::Network)
+target_compile_definitions(updatechecktest PRIVATE MAILOVE_VERSION="${PROJECT_VERSION}")
+
+# One real update check, with the update log category on. Diagnostic, not a
+# pass/fail test: it talks to the network, so it is not in _mailove_tests.
+qt_add_executable(updatechecktool tests/updatechecktool.cpp src/updatecheck.cpp
+    src/updatecheck.h src/advancedconfig.cpp src/advancedconfig.h)
+target_link_libraries(updatechecktool PRIVATE Qt6::Core Qt6::Network)
+target_compile_definitions(updatechecktool PRIVATE MAILOVE_VERSION="${PROJECT_VERSION}")
+
+qt_add_executable(sanitizertest tests/sanitizertest.cpp src/viewersecurity.cpp src/viewersecurity.h)
+target_link_libraries(sanitizertest PRIVATE Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick
+    Qt6::WebEngineQuick KF6::Codecs)
 
 # Checks DKIM canonicalization against the vectors published in RFC 6376 3.4.5.
 # Self-contained: no network, no fixtures. Exit 0 = all vectors match.
@@ -485,9 +519,9 @@ target_compile_definitions(jmapbackendtest PRIVATE
     JMAP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
 target_link_libraries(jmapbackendtest PRIVATE Qt6::Core Qt6::Network KPim6::Mime)
 
-set(_mailove_tests attachmenttest viewertest dkimtest dkimchecktool rawfidelitytest
+set(_mailove_tests attachmenttest viewertest cssegresstest sanitizertest updatechecktest dkimtest dkimchecktool rawfidelitytest
                  fidelitytool pgpmimetest securewipetest spamtool storetest migrationtest
-                 journaltest outboxtest diagnosticslogtest settingsbackuptest
+                 journaltest outboxtest diagnosticslogtest settingsbackuptest uisettingstest
                  jmapsessiontest jmaprequesttest jmapbackendtest)
 
 # Checks what SecureWipe guarantees, and pins the one thing it deliberately
@@ -553,6 +587,12 @@ qt_add_executable(settingsbackuptest tests/settingsbackuptest.cpp
 target_include_directories(settingsbackuptest PRIVATE src)
 target_link_libraries(settingsbackuptest PRIVATE Qt6::Core)
 set_target_properties(settingsbackuptest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)
+
+qt_add_executable(uisettingstest tests/uisettingstest.cpp
+    src/uisettings.cpp src/uisettings.h)
+target_include_directories(uisettingstest PRIVATE src)
+target_link_libraries(uisettingstest PRIVATE Qt6::Core Qt6::Qml)
+set_target_properties(uisettingstest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)
 
 qt_add_executable(securewipetest tests/securewipetest.cpp
     src/securewipe.cpp src/securewipe.h)

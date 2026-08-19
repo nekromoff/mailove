@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: (c) 2026 Daniel Duris, dusoft@staznosti.sk
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //
-// The settings backup, and the one property that makes it worth having: a
-// session that changes nothing must not be able to touch it. A copy taken at
-// startup fails exactly when it is needed — four launches after something has
-// emptied the colour labels, all four have dutifully backed up the emptied
-// file. What is checked here is that the good copy survives those four.
+// The settings backup: a spare copy of the settings file, taken at exit, that
+// the client itself never reads. What is checked here is that it copies what
+// is actually there, that it refuses to replace a good copy with an empty or
+// missing file, and that writing it leaves the settings file untouched — the
+// backup is the user's to restore by hand, and never writes back on its own.
 
 #include "settingsbackup.h"
 
@@ -50,49 +50,31 @@ int main(int argc, char **argv)
 
     const QByteArray good = "[ui]\nscaleColor1=#ff0000\nscaleKey1=1\n";
 
-    // A first run with no file yet must not create a backup of nothing.
-    check(!SettingsBackup::writeIfChanged(conf, SettingsBackup::snapshot(conf)),
-          QStringLiteral("no file, no backup"));
+    // A first run with no file yet has nothing to copy.
+    check(!SettingsBackup::write(conf), QStringLiteral("no file, no backup"));
     check(!QFile::exists(bak), QStringLiteral("…and none was written"));
 
-    // A session that changes nothing leaves no backup behind either.
+    // The ordinary case: the file as it stands at exit.
     write(conf, good);
-    {
-        const QByteArray before = SettingsBackup::snapshot(conf);
-        check(!SettingsBackup::writeIfChanged(conf, before),
-              QStringLiteral("a session that changes nothing writes no backup"));
-        check(!QFile::exists(bak), QStringLiteral("…so there is still none"));
-    }
+    check(SettingsBackup::write(conf), QStringLiteral("a settings file is copied"));
+    check(read(bak) == good, QStringLiteral("…exactly as it stands"));
+    check(read(conf) == good, QStringLiteral("…and the settings file is left alone"));
 
-    // The session that does the damage is the one that saves the good copy.
-    {
-        const QByteArray before = SettingsBackup::snapshot(conf);
-        write(conf, "[ui]\nscaleColor1=\nscaleKey1=\n"); // the labels, emptied
-        check(SettingsBackup::writeIfChanged(conf, before),
-              QStringLiteral("a session that changed the file writes a backup"));
-        check(read(bak) == good,
-              QStringLiteral("…and the backup holds what was there BEFORE the change"));
-    }
+    // Later runs move the copy on: it is one generation, not an archive.
+    write(conf, "[ui]\nscaleColor1=#00ff00\n");
+    check(SettingsBackup::write(conf), QStringLiteral("a later run copies the newer file"));
+    check(read(bak) == read(conf), QStringLiteral("…so the copy follows the settings"));
 
-    // The point of the whole exercise: launching four more times afterwards
-    // must not replace that copy with the damaged file.
-    for (int run = 0; run < 4; ++run) {
-        const QByteArray before = SettingsBackup::snapshot(conf);
-        SettingsBackup::writeIfChanged(conf, before);
-    }
-    check(read(bak) == good,
-          QStringLiteral("four launches after the damage leave the good copy intact"));
+    // An emptied file is what a truncated write leaves behind. Copying it over
+    // the spare would destroy the one thing the spare is for.
+    const QByteArray keep = read(bak);
+    write(conf, "");
+    check(!SettingsBackup::write(conf), QStringLiteral("an empty settings file is not copied"));
+    check(read(bak) == keep, QStringLiteral("…so the last good copy stands"));
 
-    // A later session that changes something legitimately does move it on —
-    // the backup is one generation, not an archive.
-    {
-        const QByteArray before = SettingsBackup::snapshot(conf);
-        write(conf, "[ui]\nscaleColor1=#00ff00\n");
-        check(SettingsBackup::writeIfChanged(conf, before),
-              QStringLiteral("a later change writes a new backup"));
-        check(read(bak) != good && read(bak) == before,
-              QStringLiteral("…of the state before that change"));
-    }
+    // Nothing here restores: the backup never writes back into the settings.
+    check(read(conf).isEmpty(),
+          QStringLiteral("the backup does not put itself back over the settings"));
 
     std::printf("%s\n", failures == 0 ? "all checks passed" : "FAILURES");
     return failures == 0 ? 0 : 1;

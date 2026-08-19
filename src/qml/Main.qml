@@ -66,79 +66,13 @@ Kirigami.ApplicationWindow {
         defaultLogLevel: LoggingCategory.Fatal
     }
 
-    // Persisted UI state (column order, sorting, collapsed account nodes)
-    Settings {
-        id: uiSettings
-        category: "ui"
-        property string columnOrder: "[]"
-        property int sortColumn: 0
-        property bool sortDescending: true
-        property string collapsedAccounts: "[]"
-        property int rowDensity: 1     // 0 compact, 1 medium, 2 wide
-        property string bgColor: ""    // "" = theme default
-        // Where the reading pane sits: 0 below the message list (the list runs
-        // the full width, columns and all), 1 beside it (list and viewer are
-        // full-height columns, and the list narrows to a two-line row).
-        property int messageLayout: 0
-        // Divider positions, one per layout: the list's height in "below" and
-        // its width in "beside". Kept apart on purpose — switching layouts and
-        // back has to put the divider where the user last left it *in that
-        // layout*, not carry one mode's number into the other, where it means
-        // a different thing entirely. 0 = never dragged, use the default.
-        property real splitBelowHeight: 0
-        property real splitBesideWidth: 0
-        // The folder pane's width, shared by both layouts (it is the same pane
-        // in the same place either way).
-        property real folderPaneWidth: 220
-        // Compose is the one view offered both ways; everything else is a tab.
-        property bool composeInWindow: false
-        // The composer's editor/quote-preview divider (deferred quotes), one
-        // per composer kind — replying is mostly writing, forwarding mostly
-        // checking what goes out, so the two earn different splits.
-        // 0 = never dragged, use the default.
-        property real composeQuoteSplitReply: 0
-        property real composeQuoteSplitForward: 0
-        // Definable shortcuts (Look settings); QKeySequence strings.
-        property string shortcutDelete: "Del"
-        // Read/unread and spam/not-spam are one key each, not two: the state of
-        // the row the selection starts at decides which way it goes, exactly as
-        // the context menu's single flipping entry does.
-        property string shortcutToggleRead: "M"
-        property string shortcutJunk: "J"
-        property string shortcutCompose: "C"
-        property string shortcutReply: "R"
-        property string shortcutForward: "F"
-        property string shortcutSelect: "Ins"
-        // Compose-window shortcuts (full QKeySequence strings with modifiers).
-        property string shortcutAttach: "Ctrl+Shift+A"
-        property string shortcutSend: "Ctrl+Return"
-        // Window-wide, not a compose key: it acts after Send, when the
-        // composer is already gone. Fires only while undo send is enabled and
-        // no text editor has focus (there Ctrl+Z stays text undo).
-        property string shortcutUndoSend: "Ctrl+Z"
-        // Message-viewer shortcuts (reading pane and detached message window).
-        property string shortcutFind: "Ctrl+F"
-        property string shortcutSource: "Ctrl+U"
-        // Window-wide, and deliberately not one of the single-letter mail keys:
-        // the log is opened while something is going wrong, which is exactly
-        // when the focus could be anywhere.
-        property string shortcutLog: "Ctrl+Shift+L"
-        // Color scale 1–5: shortcut + color per slot, both "" = undefined.
-        // A slot with a shortcut but no color clears the mark instead.
-        // Slot 0 is "no label" — it has no color to define, it only takes the
-        // mark off, and it is the one that comes with a key bound out of the box.
-        property string scaleKey0: "0"
-        property string scaleKey1: ""
-        property string scaleKey2: ""
-        property string scaleKey3: ""
-        property string scaleKey4: ""
-        property string scaleKey5: ""
-        property string scaleColor1: ""
-        property string scaleColor2: ""
-        property string scaleColor3: ""
-        property string scaleColor4: ""
-        property string scaleColor5: ""
-    }
+    // Persisted UI state (column order, sorting, collapsed account nodes,
+    // shortcuts, the colour labels). The keys, their defaults and the reading
+    // and writing all live in C++ now — see uisettings.h for why this is not
+    // QML's Settings type: that one rewrites its whole category from the values
+    // it loaded at startup, so anything changed in the file meanwhile (a second
+    // Mailove, an editor) was quietly reverted, colour labels included.
+    readonly property var uiSettings: UiSettings
 
     // Active color quick filter (0 = off), mirrored to Mail.filterByColor().
     property int colorFilter: 0
@@ -1105,6 +1039,112 @@ Kirigami.ApplicationWindow {
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
                 Layout.alignment: Qt.AlignBaseline
             }
+            // Only ever visible once a strictly newer release came back and
+            // parsed as a version — see updatecheck.cpp. A badge rather than
+            // coloured text: themed foreground colours sit on a panel that is
+            // near-white in one theme and near-black in the other, and amber
+            // text was unreadable against at least one of them. Fixed amber
+            // with fixed black on top is legible in both, and is the same pair
+            // regardless of what the desktop theme does.
+            Item {
+                id: updateBadge
+                visible: Updates.available
+                // Loud enough to be noticed once, then it stops shouting: the
+                // badge is worth a glance on the run you first see it, and is
+                // wallpaper by the tenth. Thirty seconds in, the fill goes
+                // and what is left is a line of text that says the same thing
+                // and opens the same page.
+                property bool highlighted: true
+                readonly property string fullText: "v" + Updates.latestVersion + " available"
+                // What is left once the badge has retreated: the notice is
+                // still there to click, but it costs the title row one glyph
+                // instead of a sentence. A plain lemon rather than the lime
+                // (U+1F34B ZWJ U+1F7E9) — a font without that sequence draws
+                // the two halves side by side, which is wider than the badge
+                // it replaces and undoes the point of shrinking.
+                readonly property string restingGlyph: "🍋"
+                /// Characters of fullText still on screen. Counts down to zero,
+                /// and then the glyph stands in for the whole thing.
+                property int shown: fullText.length
+
+                implicitWidth: updateMarker.implicitWidth + Kirigami.Units.smallSpacing * 2
+                implicitHeight: updateMarker.implicitHeight + 2
+                Layout.alignment: Qt.AlignVCenter
+                // The row reflows as this shrinks, so the space really does go
+                // back rather than being left blank.
+                Behavior on implicitWidth {
+                    NumberAnimation { duration: 90; easing.type: Easing.OutQuad }
+                }
+
+                // A later answer is news again: full text, full badge, and the
+                // thirty seconds start over.
+                onFullTextChanged: {
+                    shown = fullText.length
+                    highlighted = true
+                }
+
+                Timer {
+                    // Counts from the moment it goes on screen, which for a
+                    // cached answer is startup and otherwise is whenever the
+                    // reply landed.
+                    running: updateBadge.visible && updateBadge.highlighted
+                    interval: 30000
+                    onTriggered: updateBadge.highlighted = false
+                }
+
+                Timer {
+                    // The retreat itself: one character off the right end per
+                    // tick. A plain fade said "this is going away"; taking the
+                    // letters one at a time says it without the row jumping.
+                    running: updateBadge.visible && !updateBadge.highlighted
+                             && updateBadge.shown > 0
+                    interval: 70
+                    repeat: true
+                    onTriggered: updateBadge.shown--
+                }
+
+                // The fill tracks the text it sits behind, so the amber shrinks
+                // with the sentence and is gone by the time the glyph is alone.
+                // Opacity rather than a colour animation: interpolating a
+                // colour to "transparent" goes through transparent *black*, so
+                // the amber would visibly darken on its way out.
+                Rectangle {
+                    anchors.fill: parent
+                    radius: 3
+                    color: "#f5c211"
+                    opacity: updateBadge.shown > 0 ? 1.0 : 0.0
+                    Behavior on opacity {
+                        NumberAnimation { duration: 400; easing.type: Easing.InOutQuad }
+                    }
+                }
+
+                QQC2.Label {
+                    id: updateMarker
+                    anchors.centerIn: parent
+                    text: updateBadge.shown > 0
+                          ? updateBadge.fullText.substring(0, updateBadge.shown)
+                          : updateBadge.restingGlyph
+                    // Black only while there is amber underneath it.
+                    color: updateBadge.shown > 0 ? "black" : Kirigami.Theme.textColor
+                    font.bold: true
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    Behavior on color {
+                        ColorAnimation { duration: 400 }
+                    }
+                }
+                HoverHandler {
+                    id: updateHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: Mail.openExternalUrl(Updates.releaseUrl)
+                }
+                HoverToolTip {
+                    hover: updateHover
+                    text: "Mailove " + Updates.latestVersion
+                          + " has been released. Click to open the release page."
+                }
+            }
             // Plain arc spinner — the desktop-style BusyIndicator draws a
             // cogwheel, which reads as "settings" rather than "loading".
             Item {
@@ -1224,7 +1264,14 @@ Kirigami.ApplicationWindow {
             }
             QQC2.ToolButton {
                 icon.name: "settings-configure"
-                onClicked: accountSheet().open()
+                // Opening Settings is as good as asking whether this build is
+                // current, so the answer is refreshed while the sheet is up.
+                // Rate-limited in updatecheck.cpp; opening it repeatedly does
+                // not mean a request each time.
+                onClicked: {
+                    Updates.checkNow()
+                    accountSheet().open()
+                }
                 QQC2.ToolTip.text: "Settings"
                 QQC2.ToolTip.visible: hovered
             }

@@ -33,6 +33,33 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.1" date="2026-08-19" type="stable">
+      <description>
+        <ul>
+          <li>Enabling remote content for a message now loads images and
+              nothing else. Remote stylesheets and web fonts stay blocked,
+              closing the channel a sender could use to rewrite a message's
+              CSS after delivery or read character widths off the screen.</li>
+          <li>Link sanitizing reads a URL the way the browser does: character
+              references and tabs hidden inside a scheme no longer slip past,
+              a '&gt;' in a quoted attribute no longer cuts a tag short, and
+              schemes are allow-listed rather than blocked by name.</li>
+          <li>Mailove says when a newer version exists - one request to the
+              release page, at most once a day, sending nothing but the
+              version already in the User-Agent, and switched off with
+              update/checkEnabled in Advanced settings.</li>
+          <li>Settings backup fixes: the spare copy lagged a session behind
+              because it was written from the file as read at startup, and it
+              now follows the settings; an empty file is never copied over a
+              good spare; and it is never read back or restored on its
+              own.</li>
+          <li>Fixed labels, shortcuts and layout silently reverting when a
+              second Mailove or a text editor had changed them. UI state is
+              now written one key at a time instead of rewriting the whole
+              file from memory.</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.0" date="2026-08-18" type="stable">
       <description>
         <ul>

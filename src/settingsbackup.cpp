@@ -8,25 +8,16 @@
 namespace SettingsBackup
 {
 
-QByteArray snapshot(const QString &settingsPath)
+bool write(const QString &settingsPath)
 {
-    QFile file(settingsPath);
-    if (!file.open(QIODevice::ReadOnly))
-        return {};
-    return file.readAll();
-}
-
-bool writeIfChanged(const QString &settingsPath, const QByteArray &before)
-{
-    // Nothing to protect: no file at startup means a first run, and the empty
-    // "before" it would save is worse than no backup at all.
-    if (before.isEmpty())
-        return false;
     QFile now(settingsPath);
     if (!now.open(QIODevice::ReadOnly))
-        return false; // the file went away; the last good backup stands
-    if (now.readAll() == before)
-        return false; // this session changed nothing
+        return false; // no settings yet, or unreadable; the last copy stands
+    const QByteArray current = now.readAll();
+    // An empty file is what a truncated write leaves behind. Copying it over
+    // the spare would destroy the one thing the spare is for.
+    if (current.isEmpty())
+        return false;
 
     const QString backupPath = settingsPath + QStringLiteral(".bak");
     const QString temp = backupPath + QStringLiteral(".tmp");
@@ -34,7 +25,7 @@ bool writeIfChanged(const QString &settingsPath, const QByteArray &before)
     QFile out(temp);
     if (!out.open(QIODevice::WriteOnly))
         return false;
-    const bool whole = out.write(before) == before.size();
+    const bool whole = out.write(current) == current.size();
     out.close();
     if (!whole) {
         QFile::remove(temp);

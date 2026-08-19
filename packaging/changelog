@@ -1,3 +1,42 @@
+mailove (3.1) unstable; urgency=medium
+
+  * Hostile CSS in a message can no longer reach the network the way it could.
+    Enabling remote content for a message now loads images and nothing else:
+    remote stylesheets (<link>, @import) and web fonts stay blocked, closing
+    the channel that lets a sender rewrite a message's CSS after it was
+    delivered and read character widths back off the screen. No real mail
+    uses either - the major clients strip them - so nothing legitimate is
+    lost.
+  * Link sanitizing now reads a URL the way the browser does. Character
+    references and stray tabs or newlines inside a scheme
+    ("&#106;avascript:", "java&Tab;script:") used to slip past the check that
+    reads the raw text, and a '>' inside a quoted attribute cut a tag short so
+    the rest of it went unexamined. Schemes are now allow-listed rather than
+    blocked by name, and mailove: is refused in sender markup.
+  * Mailove tells you when a newer version exists: one HEAD request to the
+    project's release page, 30 seconds after launch and when Settings is
+    opened, at most once a day. It sends nothing but the version already in
+    the User-Agent, the answer is remembered so the marker shows at once on
+    the next start, and the whole thing is off with one switch in Advanced
+    settings (update/checkEnabled).
+  * Settings backup fixes. The spare copy was written from the settings file
+    as it was read at *startup*, so it lagged a session behind what you had
+    actually configured; it now follows the file and is taken as the client
+    shuts down. An empty settings file - which is what a truncated write
+    leaves behind - is no longer copied over a good spare. And the backup is
+    never read back: Mailove will not restore from it on its own, so the
+    spare can no longer write itself over a live config. Putting it back is a
+    deliberate act with a file manager.
+  * Fixed labels, shortcuts and layout silently reverting. Window and UI state
+    used QML's Settings type, which holds every key in memory from startup and
+    rewrites all of them on any one change - so anything a second Mailove or a
+    text editor had altered meanwhile was quietly put back to whatever that
+    run started with. Each key is now written on its own, read-modify-written
+    against the file as it stands, and a key this build does not know is left
+    untouched.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Wed, 19 Aug 2026 19:00:00 +0200
+
 mailove (3.0) unstable; urgency=medium
 
   * Activity log in Settings (Ctrl+Shift+L): the last 5000 lines Mailove

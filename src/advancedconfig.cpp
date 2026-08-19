@@ -90,6 +90,11 @@ const GroupDoc kGroups[] = {
     {"sync", "Sync pacing",
      "How fast mail is fetched and how the client backs off when a server says "
      "no. Raise the pauses for a provider that rate-limits."},
+    {"update", "Update check",
+     "Whether Mailove asks the project's release page if a newer version exists. "
+     "One HEAD request, 30 seconds after launch and when Settings is opened, at "
+     "most once a day. It sends nothing but the version already in the "
+     "User-Agent, and turning it off means no request is made at all."},
     {"view", "Reading",
      "What happens while a message is open: when it counts as read, and how much "
      "of a very large body is rendered."},
@@ -449,6 +454,25 @@ const AdvancedConfig::Knob kSchema[] = {
      "HTML taken for the text preview before it is truncated."},
     {"view/maxTextBodyBytes", Type::Int, 1048576, 4096, 67108864, Reload::Live,
      "Largest plain-text body rendered whole."},
+
+    // --- update ---------------------------------------------------------------
+    {"update/checkEnabled", Type::Bool, true, {}, {}, Reload::Live,
+     "Check whether a newer Mailove has been released: one HEAD request, 30 "
+     "seconds after launch and when Settings is opened. Sends nothing but the "
+     "version already in the User-Agent. Off here means no request is ever made."},
+    {"update/checkUrl", Type::String,
+     QStringLiteral("https://github.com/nekromoff/mailove/releases/latest"), {}, {},
+     Reload::Live,
+     "Release endpoint the check sends HEAD to; the version is read from the "
+     "redirect it answers with. https only — anything else is refused."},
+    {"update/releaseUrl", Type::String,
+     QStringLiteral("https://github.com/nekromoff/mailove/releases/tag/%1"), {}, {},
+     Reload::Live,
+     "Page the 'update available' marker opens, with %1 replaced by the version. "
+     "Built here rather than taken from the response, so a tampered redirect "
+     "cannot choose where the browser is sent."},
+    {"update/checkIntervalHours", Type::Int, 24, 1, 8760, Reload::Live,
+     "Least time between automatic update checks."},
 };
 
 constexpr int kSchemaCount = int(std::size(kSchema));
