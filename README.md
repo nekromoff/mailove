@@ -122,10 +122,6 @@ cmake --build build --target packages      # the .deb and the AppImage
 - Advanced settings: `~/.config/mailove/advanced.conf` (no secrets)
 - Passwords and OAuth refresh tokens: KWallet, service `mailove`
 
-## Known issues
-
-- **KMime nested-boundary artifact** ([KDE bug 523826](https://bugs.kde.org/show_bug.cgi?id=523826)) - on messages whose inner MIME part closes tight against the parent boundary, a shape Gmail produces on replies with attachments, KMime inserts a blank line the original did not have. The body no longer hashes to what the sender signed, so DKIM and OpenPGP report such a message as *modified after signing* when nothing modified it. Upstream defect, not worked around here: the byte the parser discarded cannot be recovered downstream.
-
 ## Status
 
 Working and in daily use. Multiple accounts, OAuth for Gmail and Microsoft 365, imported offline archives, and caches into the tens of gigabytes.
