@@ -389,7 +389,7 @@ int main(int argc, char **argv)
     });
 
     MessageListModel::Header settled = makeHeader(301, QStringLiteral("rescued"), QString());
-    settled.spamState = 3; // the user said "not spam"
+    settled.spamState = MessageListModel::SpamExempt;
     store.storeHeaders(junk, {makeHeader(300, QStringLiteral("unscored"), QString()), settled});
     store.storeHeaders(folder, {makeHeader(302, QStringLiteral("ordinary"), QString())});
 
@@ -399,7 +399,7 @@ int main(int argc, char **argv)
     check(inJunk.spamDetail.contains(QLatin1String("Junk folder")),
           QStringLiteral("…and says why: \"%1\"").arg(inJunk.spamDetail.section('\n', 0, 0)));
 
-    check(find(store, junk, 301).spamState == 3,
+    check(find(store, junk, 301).spamState == MessageListModel::SpamExempt,
           QStringLiteral("a verdict the user settled is left alone"));
     check(find(store, folder, 302).spamScore == 0,
           QStringLiteral("rows outside the junk folder are untouched"));
@@ -420,6 +420,87 @@ int main(int argc, char **argv)
             sortedMarked = false;
     }
     check(sortedMarked, QStringLiteral("and so does the sorted path"));
+
+    // --- a rescue outliving the move that performed it --------------------
+    //
+    // Dragging a message out of the junk folder deletes it there and re-creates
+    // it in the inbox under a new uid, so the verdict keyed on (folder, uid) is
+    // left behind by the very act it records. The Message-ID is what carries
+    // it across, and the outgoing copy is soft-deleted while the move is in
+    // flight — so the lookup has to see soft-deleted rows or the answer is lost
+    // in exactly the window it is needed.
+    {
+        MessageListModel::Header rescued =
+            makeHeader(310, QStringLiteral("false positive"), QString());
+        rescued.msgid = QStringLiteral("rescued@example.com");
+        MessageListModel::Header exempt =
+            makeHeader(311, QStringLiteral("known contact"), QString());
+        exempt.msgid = QStringLiteral("exempt@example.com");
+        exempt.spamState = MessageListModel::SpamExempt;
+        store.storeHeaders(junk, {rescued, exempt});
+        store.setSpamVerdict(junk, 310, SpamHeuristics::UserNotSpamWeight,
+                             MessageListModel::SpamUserCleared, QString());
+
+        const QSet<QString> both = {QStringLiteral("rescued@example.com"),
+                                    QStringLiteral("exempt@example.com")};
+        check(store.userClearedMessageIds(both)
+                  == QSet<QString>{QStringLiteral("rescued@example.com")},
+              QStringLiteral("the user's own answer is found by Message-ID"));
+
+        store.softDeleteMessages(junk, {310});
+        check(store.userClearedMessageIds(both)
+                  == QSet<QString>{QStringLiteral("rescued@example.com")},
+              QStringLiteral("…and still is while the move is in flight"));
+
+        // The arriving copy: a new folder and a new uid, marked junk by nothing
+        // but its own history. Storing it must not resurrect the mark, which is
+        // MailClient's job — what the store owes is the lookup that tells it so.
+        check(!store.userClearedMessageIds({QStringLiteral("exempt@example.com")}).contains(
+                  QStringLiteral("exempt@example.com")),
+              QStringLiteral("the Rule 0 exemption is not mistaken for the user's answer"));
+
+        // …and what the Message-ID alone could not survive. Confirming the move
+        // hard-deletes the row it was written on (MailClient::confirmJournalOp),
+        // which is normally over before the arriving copy is ever fetched — so
+        // the answer has to be recorded about the person as well, on a list of
+        // its own that no message row owns.
+        store.removeMessages(junk, {310});
+        check(store.userClearedMessageIds(both).isEmpty(),
+              QStringLiteral("confirming the move destroys the per-message record"));
+
+        // A sender of its own: clearSpamVerdictsFrom() is per-person, and every
+        // other row in this file shares makeHeader()'s one address.
+        const QString rescuedFrom = QStringLiteral("kino@sender.test");
+        store.setNotSpamSender(rescuedFrom, true);
+        check(store.notSpamSenders({rescuedFrom}).contains(rescuedFrom),
+              QStringLiteral("…so the rescue is remembered about the sender instead"));
+        check(store.notSpamSenders({QStringLiteral("Kino+list@Sender.TEST")})
+                  .contains(rescuedFrom),
+              QStringLiteral("…matched the way the allowlist is, case and +tag folded"));
+
+        // Their mail that is already cached and already marked, which is what
+        // the user is looking at when they press the button.
+        MessageListModel::Header marked =
+            makeHeader(320, QStringLiteral("newsletter"), QString());
+        marked.from = QStringLiteral("Kino Lumiere <Kino@Sender.test>");
+        marked.spamScore = 100;
+        marked.spamState = MessageListModel::SpamFromHeaders;
+        marked.spamDetail = QStringLiteral("+60 forged");
+        store.storeHeaders(folder, {marked});
+        check(store.clearSpamVerdictsFrom(rescuedFrom) > 0,
+              QStringLiteral("a rescue reaches their mail in other folders"));
+        const MessageListModel::Header after = find(store, folder, 320);
+        check(after.spamState == MessageListModel::SpamUserCleared
+                  && after.spamScore < SpamHeuristics::spamThreshold(),
+              QStringLiteral("…and it comes back unmarked (state %1, score %2)")
+                  .arg(after.spamState)
+                  .arg(after.spamScore));
+
+        // Putting their mail in the junk folder withdraws it again.
+        store.setNotSpamSender(rescuedFrom, false);
+        check(store.notSpamSenders({rescuedFrom}).isEmpty(),
+              QStringLiteral("marking one as junk takes the sender back off the list"));
+    }
 
     // An account the predicate calls local: its junk folder must stay unmarked.
     // This is the shape MailClient uses to keep imported archives out of spam

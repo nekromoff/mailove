@@ -761,12 +761,53 @@ QString encodedWordCharset(const QString &value)
 /// refusing to decode it is a way of not noticing it. Anything that fails to
 /// decode is left as it was, which can only cost a rule that would have fired.
 ///
-/// Charsets: UTF-8 and ASCII are decoded properly; everything else falls back
-/// to Latin-1, because Qt 6 ships no legacy codecs. That is mojibake for a
-/// genuine gb2312 subject, but the safe kind: high bytes stay non-ASCII (which
-/// is what charset-mismatch needs to know) and the mojibake is all Latin
-/// script, so the confusable rules — which require two scripts inside one
-/// word — cannot misfire on it.
+/// Charsets: UTF-8, ASCII and windows-1251 are decoded properly; everything
+/// else falls back to Latin-1, because Qt 6 ships no legacy codecs. That is
+/// mojibake for a genuine gb2312 subject, but the safe kind: high bytes stay
+/// non-ASCII (which is what charset-mismatch needs to know) and the mojibake
+/// is all Latin script, so the confusable rules — which require two scripts
+/// inside one word — cannot misfire on it.
+///
+/// windows-1251 gets a real decoder because a Latin-1 fallback is precisely
+/// the wrong kind of mojibake for it: Cyrillic letters come out as accented
+/// Latin, and the cyrillic-script rule — which exists for the Russian bulk
+/// mail that windows-1251 is the signature charset of — reads its own target
+/// as ordinary European text. koi8-r would deserve the same but its letter
+/// order is a permutation that needs a table; windows-1251 is a linear range.
+QString fromWindows1251(const QByteArray &bytes)
+{
+    QString out;
+    out.reserve(bytes.size());
+    for (const char raw : bytes) {
+        const uchar b = uchar(raw);
+        if (b >= 0xC0) {
+            // А..я, one linear run.
+            out += QChar(0x0410 + (b - 0xC0));
+        } else {
+            // The named letters outside the run: Ё/ё and the Ukrainian and
+            // Belarusian set. The rest of 0x80-0xBF is typography (dashes,
+            // quotes, №) — Latin-1 is wrong about some of it, but nothing
+            // that judges scripts or words can be misled by punctuation.
+            switch (b) {
+            case 0xA8: out += QChar(0x0401); break; // Ё
+            case 0xB8: out += QChar(0x0451); break; // ё
+            case 0xAA: out += QChar(0x0404); break; // Є
+            case 0xBA: out += QChar(0x0454); break; // є
+            case 0xB2: out += QChar(0x0406); break; // І
+            case 0xB3: out += QChar(0x0456); break; // і
+            case 0xAF: out += QChar(0x0407); break; // Ї
+            case 0xBF: out += QChar(0x0457); break; // ї
+            case 0xA5: out += QChar(0x0490); break; // Ґ
+            case 0xB4: out += QChar(0x0491); break; // ґ
+            case 0xA1: out += QChar(0x040E); break; // Ў
+            case 0xA2: out += QChar(0x045E); break; // ў
+            default: out += QLatin1Char(raw); break;
+            }
+        }
+    }
+    return out;
+}
+
 QString decodeEncodedWords(const QString &raw)
 {
     if (!raw.contains(QLatin1String("=?")))
@@ -813,6 +854,8 @@ QString decodeEncodedWords(const QString &raw)
         }
         if (charset.startsWith(QLatin1String("utf-8")) || charset == QLatin1String("utf8"))
             out += QString::fromUtf8(bytes);
+        else if (charset == QLatin1String("windows-1251") || charset == QLatin1String("cp1251"))
+            out += fromWindows1251(bytes);
         else
             out += QString::fromLatin1(bytes); // see the charset note above
         last = m.capturedEnd();
@@ -1256,11 +1299,22 @@ Score score(const Message &msg, const Context &ctx)
     };
 
     // ------------------------------------------------------------------
-    // Rule -1: the message is in the junk folder. Evaluated before Rule 0,
-    // because it beats it: a known correspondent whose mail the user moved to
-    // Junk anyway has been judged by the person the exemption exists to serve.
+    // Rule -2: the user took this message out of the junk folder, or said
+    // "Not spam" about it. The same kind of fact as Rule -1 and the exact
+    // reverse of it, so it is weighted the same and opposite, and it is
+    // evaluated first because it suppresses that rule: a rescued message whose
+    // copy is still filed as junk is precisely the disagreement the user was
+    // settling, and answering it with "but it is in your Junk folder" is the
+    // filter overruling the person it works for.
+    //
+    // Scoring continues past it, like Rule -1, so the tooltip can still say
+    // what the message would have tripped. Nothing it can find gets anywhere
+    // near the threshold from -999.
     // ------------------------------------------------------------------
-    if (ctx.inJunkFolder) {
+    if (ctx.userNotSpam) {
+        hit("user-not-spam", UserNotSpamWeight,
+            QStringLiteral("You took this message out of the spam folder"));
+    } else if (ctx.inJunkFolder) {
         hit("junk-folder", JunkFolderWeight,
             QStringLiteral("This message is in your Junk folder — you or your mail server "
                            "put it there"));
@@ -1785,6 +1839,32 @@ Score score(const Message &msg, const Context &ctx)
                     QStringLiteral("Subject was encoded as %1 despite containing only plain "
                                    "text, which hides it from simple filters").arg(charset));
             }
+        }
+    }
+
+    // Cyrillic in the subject or the sender's name. Decisive at the default
+    // threshold on purpose, unlike every other script-shaped rule here: this
+    // is a per-mailbox judgement, not a linguistic one. For a mailbox that
+    // never corresponds in Cyrillic, an unsolicited Russian-language offer is
+    // the single most reliable spam shape there is — authenticated, DKIM-clean
+    // bulk from a domain the spammer owns, which the auth rules structurally
+    // cannot catch. A mailbox that does correspond in Cyrillic turns the
+    // weight down (or off) via its [spamrules] key like any other rule, and a
+    // known correspondent writing in Cyrillic never reaches this code at all —
+    // Rule 0 has already exempted them.
+    {
+        const auto cyrillicIn = [](const QString &s) {
+            for (const QChar c : s) {
+                if (c.script() == QChar::Script_Cyrillic)
+                    return true;
+            }
+            return false;
+        };
+        const bool inSubject = cyrillicIn(subject);
+        if (inSubject || cyrillicIn(displayName)) {
+            hit("cyrillic-script", 50,
+                inSubject ? QStringLiteral("The subject is written in Cyrillic")
+                          : QStringLiteral("The sender's name is written in Cyrillic"));
         }
     }
 

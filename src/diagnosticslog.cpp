@@ -282,6 +282,24 @@ void DiagnosticsLog::setMinimumSeverity(int severity)
     Q_EMIT minimumSeverityChanged();
 }
 
+void DiagnosticsLog::setOnlyCategory(const QString &category)
+{
+    if (category == m_onlyCategory)
+        return;
+    m_onlyCategory = category;
+    rebuildView();
+    Q_EMIT onlyCategoryChanged();
+}
+
+void DiagnosticsLog::setHiddenCategory(const QString &category)
+{
+    if (category == m_hiddenCategory)
+        return;
+    m_hiddenCategory = category;
+    rebuildView();
+    Q_EMIT hiddenCategoryChanged();
+}
+
 void DiagnosticsLog::setRedact(bool redact)
 {
     if (redact == m_redact)
@@ -294,12 +312,21 @@ void DiagnosticsLog::setRedact(bool redact)
     Q_EMIT redactChanged();
 }
 
+bool DiagnosticsLog::passesFilter(const Entry &entry) const
+{
+    if (!m_onlyCategory.isEmpty() && entry.category != m_onlyCategory)
+        return false;
+    if (!m_hiddenCategory.isEmpty() && entry.category == m_hiddenCategory)
+        return false;
+    return entry.severity >= m_minimumSeverity;
+}
+
 void DiagnosticsLog::rebuildView()
 {
     beginResetModel();
     m_view.clear();
     for (int i = 0; i < m_rows.size(); ++i) {
-        if (m_rows.at(i).severity >= m_minimumSeverity)
+        if (passesFilter(m_rows.at(i)))
             m_view.append(i);
     }
     endResetModel();
@@ -342,7 +369,7 @@ void DiagnosticsLog::drainToModel()
     QList<int> added;
     added.reserve(batch.size());
     for (int i = 0; i < batch.size(); ++i) {
-        if (batch.at(i).severity >= m_minimumSeverity)
+        if (passesFilter(batch.at(i)))
             added.append(int(m_rows.size()) + i);
     }
     if (added.isEmpty()) {

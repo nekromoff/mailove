@@ -7,6 +7,7 @@
 #include <QMutex>
 #include <QWaitCondition>
 #include <QDateTime>
+#include <QList>
 #include <QObject>
 #include <QPointer>
 #include <QSet>
@@ -1107,12 +1108,15 @@ private:
     void harvestRecipients(const KMime::Message *msg, const QString &folder, qint64 uid);
     /// Fills in the spam fields of \a h from its raw \a head. \a knownSenders
     /// and \a orgHistory are the pre-resolved allowlist and sender-domain
-    /// history for the whole batch (see appendScoredHeaders).
+    /// history for the whole batch (see appendScoredHeaders), and \a userCleared
+    /// the Message-IDs the user has already answered "not spam" about.
     void scoreHeader(MessageListModel::Header &h, const QString &folder,
                      const QByteArray &head,
                      const QSet<QString> &knownSenders,
                      const QHash<QString, MailStore::DomainHistory> &orgHistory,
                      const QSet<QString> &knownMsgIds,
+                     const QSet<QString> &userCleared,
+                     const QSet<QString> &notSpamSenders,
                      const MailStore::SentTldProfile &tldProfile);
     /// Scores a message again now that its body is in hand, and stores the
     /// result as verdict state 2.
@@ -1120,7 +1124,7 @@ private:
     /// The list-time score sees only headers, so every attachment, link and
     /// body rule is silent there. This is the second look — the same scorer,
     /// the same context, with the parts of the message that had not arrived
-    /// yet. Never called for a message the user has settled (state 3).
+    /// yet. Never called for a message the user has settled (state 3 or 4).
     void rescoreWithBody(const QString &folder, qint64 uid, KMime::Message *msg);
     /// The scoring context for one message, built from the store and the
     /// account. Shared by the header pass and the body pass so the two cannot
@@ -1214,6 +1218,23 @@ private:
     /// Obtains a fresh access token (refresh grant or browser sign-in), then
     /// re-enters connectAccount().
     void acquireTokenAndConnect();
+    /// Runs \a done once the account holds a usable access token: immediately
+    /// when it already does (and always, for password auth), otherwise after a
+    /// renewal. \a done receives false and the reason when the renewal failed.
+    ///
+    /// Connecting is not the only thing a live token is needed for. SMTP
+    /// authenticates per message out of the copy the backend took when it
+    /// connected, so a client left open past the token's hour would send with
+    /// a token that expired long ago while the IMAP session it belonged to was
+    /// still perfectly up.
+    void ensureAccessToken(std::function<void(bool, const QString &)> done);
+    /// Mints an access token and hands the outcome to every waiter. Callers
+    /// that arrive while one acquisition is in flight join it rather than
+    /// starting a second — two browser windows for one expiry is not a thing
+    /// anyone wants to see.
+    void acquireToken(std::function<void(bool, const QString &)> done);
+    /// Drains m_tokenWaiters with \a ok / \a error.
+    void finishTokenWaiters(bool ok, const QString &error);
     /// The account's server settings and secrets, as the backend wants them.
     MailBackend::Credentials backendCredentials() const;
     /// The network half of fetchMessage(): asks the backend for one body and
@@ -1243,6 +1264,9 @@ private:
     /// itself persisted.
     AccountStore m_accounts;
     OAuthHelper *m_oauth = nullptr;
+    /// Continuations parked on the acquisition in flight; empty when none is.
+    QList<std::function<void(bool, const QString &)>> m_tokenWaiters;
+    bool m_tokenInFlight = false;
     bool m_connectWhenReady = false; ///< connect was requested before the secret arrived
     int m_cachedFolderRevision = 0; ///< see cachedFolderRevision property
 

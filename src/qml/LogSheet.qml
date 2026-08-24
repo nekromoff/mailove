@@ -100,16 +100,36 @@ Window {
             QQC2.Label { text: "Show:" }
             QQC2.ComboBox {
                 id: severityBox
-                // Indexes line up with DiagnosticsLog's 0..4 severities, with
-                // the two nobody filters on (Info, Fatal) left out of the
-                // list rather than given a row that reads the same as its
-                // neighbour.
-                model: ["Everything", "Activity and problems", "Problems only",
-                        "Errors only"]
-                property var severities: [0, 1, 2, 3]
+                // Severities line up with DiagnosticsLog's 0..4, with the two
+                // nobody filters on (Info, Fatal) left out of the list rather
+                // than given a row that reads the same as its neighbour.
+                //
+                // The spam verdicts get a row of their own and are kept out of
+                // the ones below it: they are one or two Info lines per
+                // message scored, which is enough to bury everything else the
+                // client has to say. "Everything" still means everything.
+                readonly property string spamCategory: "mailove.spam"
+                model: [
+                    { label: "Everything", severity: 0, only: "", hidden: "" },
+                    { label: "Activity and problems", severity: 1, only: "",
+                      hidden: spamCategory },
+                    { label: "Problems", severity: 2, only: "",
+                      hidden: spamCategory },
+                    { label: "Errors", severity: 3, only: "",
+                      hidden: spamCategory },
+                    { label: "Spam decisions", severity: 0, only: spamCategory,
+                      hidden: "" },
+                ]
+                textRole: "label"
                 currentIndex: 1
-                onActivated: Diagnostics.minimumSeverity = severities[currentIndex]
-                Component.onCompleted: Diagnostics.minimumSeverity = severities[currentIndex]
+                function applyFilter() {
+                    const choice = model[currentIndex]
+                    Diagnostics.minimumSeverity = choice.severity
+                    Diagnostics.onlyCategory = choice.only
+                    Diagnostics.hiddenCategory = choice.hidden
+                }
+                onActivated: applyFilter()
+                Component.onCompleted: applyFilter()
             }
 
             QQC2.Label {
@@ -269,14 +289,6 @@ Window {
                 opacity: 0.6
                 font.family: "monospace"
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
-            }
-            QQC2.Button {
-                text: "Clear"
-                icon.name: "edit-clear-history"
-                // Emptying both halves is the point: it is what someone does
-                // just before reproducing a bug, so the file holds that and
-                // nothing else.
-                onClicked: Diagnostics.clear()
             }
             QQC2.Button {
                 text: "Save as…"

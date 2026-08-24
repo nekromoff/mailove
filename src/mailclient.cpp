@@ -267,6 +267,18 @@ QString describeCounts(const QHash<QString, int> &counts)
 /// address: what is being queued is the user's mail.
 Q_LOGGING_CATEGORY(logJournal, "mailove.journal")
 
+/// One line per spam verdict, exempt from quiet mode like mailove.unread and
+/// for the same reason: "why was this not marked as spam" (or "why was it")
+/// is unanswerable after the fact without a trail of which rules fired and
+/// what they added up to. A line is written only when a message is actually
+/// scored — on header fetch and again when a body arrives — so cached mail
+/// costs nothing and the volume is bounded by new mail.
+///
+/// Sender organizational domain and rule ids with weights only, never a
+/// subject or a full address: enough to recognise the message being asked
+/// about, not enough to reconstruct the mail from the log.
+Q_LOGGING_CATEGORY(logSpam, "mailove.spam")
+
 /// Condense a verbose/multi-line error (often a raw server or KJob string)
 /// into a terse status crumb: first line only, trailing punctuation trimmed,
 /// and clipped so it never bloats the status line.
@@ -1145,6 +1157,7 @@ void MailClient::applyLogFilterRules(bool on)
                                                          "mailove.maintenance.info=true\n"
                                                          "mailove.unread.info=true\n"
                                                          "mailove.journal.info=true\n"
+                                                         "mailove.spam.info=true\n"
                                                          "js.debug=true\n"
                                                          "js.info=true\n"
                                                          "js.warning=true\n"
@@ -1157,6 +1170,7 @@ void MailClient::applyLogFilterRules(bool on)
                                                          "mailove.unread.info=true\n"
                                                          "mailove.journal.info=true\n"
                                                          "mailove.journal.warning=true\n"
+                                                         "mailove.spam.info=true\n"
                                                          "js.critical=false"));
 }
 
@@ -2383,13 +2397,29 @@ void MailClient::applyOutgoingCrypto(const std::shared_ptr<KMime::Message> &msg,
     }
     auto *conn = new QMetaObject::Connection;
     *conn = connect(m_pgp, &PgpEngine::signFinished, this,
-                    [this, conn, job, parts, encrypt, encryptStep, done](
+                    [this, conn, job, plain, parts, encrypt, encryptStep, done](
                         quint64 id, const QByteArray &signature, const QString &micalg,
-                        const QString &error) {
+                        const QString &error, bool cancelled) {
                         if (id != job)
                             return;
                         disconnect(*conn);
                         delete conn;
+                        // A dismissed pinentry means "not this time", not "the
+                        // send is broken" — the mail goes out unsigned rather
+                        // than bouncing the user back into the same prompt.
+                        // Encryption never needed the passphrase, so that half
+                        // still happens when it was asked for.
+                        if (cancelled) {
+                            setStatus(encrypt
+                                          ? tr("Signing cancelled — sending encrypted "
+                                               "but unsigned")
+                                          : tr("Signing cancelled — sending unsigned"));
+                            if (encrypt)
+                                encryptStep(parts);
+                            else
+                                done(plain);
+                            return;
+                        }
                         if (!error.isEmpty() || signature.isEmpty()) {
                             Q_EMIT sendFailed(error.isEmpty()
                                                   ? tr("The message could not be signed.")
@@ -2506,53 +2536,76 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &b
     // belongs in the Outbox, not in an error dialog.
     if (connected() && !m_undoSend) {
         setBusy(true);
-        m_backend->sendMessage(wire, fromAddr, row.envelope,
-                               [this, row](MailBackend::Error error, const QString &message) {
-            setBusy(false);
-            switch (error) {
-            case MailBackend::Error::None:
-                for (const QString &addr : row.envelope)
-                    m_store.addRecipient(addr);
-                Q_EMIT mailSent(); // compose window closes on this
-                // Whether a Sent copy has to be filed by hand is the
-                // protocol's business: IMAP needs an APPEND, JMAP files it as
-                // part of the submission.
-                if (!m_backend->sentCopyIsAutomatic()) {
-                    appendToSentFolder(row.wire);
-                } else if (!m_sentFolder.isEmpty() && m_selectedFolder == m_sentFolder) {
-                    // The server filed the copy, but nothing told the open
-                    // folder about it; that is push's job, and push may not be
-                    // established.
-                    refreshCurrentFolder();
-                }
-                break;
-            case MailBackend::Error::Auth:
-            case MailBackend::Error::Connection:
-            case MailBackend::Error::Throttled: {
-                // Transport, not the message's fault — the same cases the
-                // drain defers on. Queued rather than bounced back into the
-                // composer: connected() was answering for a session that was
-                // already gone.
-                MailStore::OutboxMessage queued = row;
-                if (error == MailBackend::Error::Throttled)
-                    queued.nextTry = QDateTime::currentSecsSinceEpoch() + 15;
-                if (m_store.enqueueOutbox(queued) == 0) {
-                    Q_EMIT sendFailed(message); // durability cannot be promised
+        // SMTP dials and authenticates per message out of the token the
+        // backend took when it connected. On a client left open past the
+        // token's hour that copy is dead, and the send fails with an account
+        // that otherwise looks entirely healthy — so renew before dialling.
+        // A renewal that fails still sends: SMTP then reports Auth, and the
+        // Auth branch below is exactly where that belongs.
+        ensureAccessToken([this, wire, fromAddr, row](bool, const QString &) {
+            if (!connected()) {
+                // The renewal took long enough for the connection to go; the
+                // outbox is where mail goes when there is nothing to send it over.
+                if (m_store.enqueueOutbox(row) == 0) {
+                    setBusy(false);
+                    Q_EMIT sendFailed(tr("Not connected."));
                     return;
                 }
+                setBusy(false);
                 Q_EMIT mailSent();
                 setStatus(tr("Queued — will be sent when the connection is back"));
                 refreshOutboxCount();
                 armOutboxTimer();
-                break;
+                return;
             }
-            case MailBackend::Error::NotFound:
-            case MailBackend::Error::Protocol:
-                // The server said no to this message. Keep the compose window
-                // open and show the full error there.
-                Q_EMIT sendFailed(message);
-                break;
-            }
+            m_backend->sendMessage(wire, fromAddr, row.envelope,
+                                   [this, row](MailBackend::Error error, const QString &message) {
+                setBusy(false);
+                switch (error) {
+                case MailBackend::Error::None:
+                    for (const QString &addr : row.envelope)
+                        m_store.addRecipient(addr);
+                    Q_EMIT mailSent(); // compose window closes on this
+                    // Whether a Sent copy has to be filed by hand is the
+                    // protocol's business: IMAP needs an APPEND, JMAP files it as
+                    // part of the submission.
+                    if (!m_backend->sentCopyIsAutomatic()) {
+                        appendToSentFolder(row.wire);
+                    } else if (!m_sentFolder.isEmpty() && m_selectedFolder == m_sentFolder) {
+                        // The server filed the copy, but nothing told the open
+                        // folder about it; that is push's job, and push may not be
+                        // established.
+                        refreshCurrentFolder();
+                    }
+                    break;
+                case MailBackend::Error::Auth:
+                case MailBackend::Error::Connection:
+                case MailBackend::Error::Throttled: {
+                    // Transport, not the message's fault — the same cases the
+                    // drain defers on. Queued rather than bounced back into the
+                    // composer: connected() was answering for a session that was
+                    // already gone.
+                    MailStore::OutboxMessage queued = row;
+                    if (error == MailBackend::Error::Throttled)
+                        queued.nextTry = QDateTime::currentSecsSinceEpoch() + 15;
+                    if (m_store.enqueueOutbox(queued) == 0) {
+                        Q_EMIT sendFailed(message); // durability cannot be promised
+                        return;
+                    }
+                    Q_EMIT mailSent();
+                    setStatus(tr("Queued — will be sent when the connection is back"));
+                    refreshOutboxCount();
+                    armOutboxTimer();
+                    break;
+                }
+                case MailBackend::Error::NotFound:
+                case MailBackend::Error::Protocol:
+                    // The server said no to this message. Keep the compose window
+                    // open and show the full error there.
+                    Q_EMIT sendFailed(message);
+                    break;
+                }
+            });
         });
         return;
     }
@@ -3523,15 +3576,72 @@ MailClient::spamContextFor(const QString &folder, const QString &fromValue,
     return ctx;
 }
 
+/// The mailove.spam line for one verdict: which rules fired (ids and signed
+/// weights, never the evidence text — that can quote the message), the sum,
+/// and what was decided about it. `pass` names which scoring pass produced
+/// it, because the same message legitimately logs twice with two different
+/// totals: the body rules cannot fire before the body exists.
+static void logSpamVerdict(const char *pass, const QString &folder, qint64 uid,
+                           const QString &fromAddr, const SpamHeuristics::Score &s)
+{
+    // The whole address, not only the domain the rules keyed on: a report is
+    // read against the messages it is about, and those are found by sender.
+    // The organizational domain still comes along when it is not simply the
+    // address's own domain, because that is what the reputation rules looked
+    // up and it is not always guessable from the address. Both halves are
+    // masked by the viewer's redaction like every other address in the log.
+    const QString org = SpamHeuristics::organizationalDomainOf(fromAddr);
+    const QString domain = fromAddr.section(QLatin1Char('@'), -1);
+    QString sender = fromAddr.isEmpty() ? QStringLiteral("(no address)") : fromAddr;
+    if (!org.isEmpty() && org != domain)
+        sender += QStringLiteral(" (") + org + QLatin1Char(')');
+    if (s.exempt) {
+        qCInfo(logSpam).noquote()
+            << QStringLiteral("%1 %2 uid=%3 from=%4: exempt — %5")
+                   .arg(QLatin1String(pass), folder.section(QChar(0x1f), -1),
+                        QString::number(uid), sender, s.exemptReason);
+        return;
+    }
+    QStringList rules;
+    for (const SpamHeuristics::Hit &hit : s.hits) {
+        rules.append(QStringLiteral("%1%2 %3")
+                         .arg(hit.weight > 0 ? QStringLiteral("+") : QString())
+                         .arg(hit.weight)
+                         .arg(hit.id));
+    }
+    const QString verdict = s.verdict == SpamHeuristics::Verdict::Spam
+        ? QStringLiteral("marked as spam")
+        : s.verdict == SpamHeuristics::Verdict::Unsure
+        ? QStringLiteral("unsure, not marked")
+        : QStringLiteral("not marked");
+    qCInfo(logSpam).noquote()
+        << QStringLiteral("%1 %2 uid=%3 from=%4: %5 = %6 of %7 -> %8")
+               .arg(QLatin1String(pass), folder.section(QChar(0x1f), -1),
+                    QString::number(uid), sender,
+                    rules.isEmpty() ? QStringLiteral("no rules fired")
+                                    : rules.join(QLatin1String(", ")),
+                    QString::number(s.total),
+                    QString::number(SpamHeuristics::spamThreshold()), verdict);
+}
+
 void MailClient::scoreHeader(MessageListModel::Header &h, const QString &folder,
                              const QByteArray &head,
                              const QSet<QString> &knownSenders,
                              const QHash<QString, MailStore::DomainHistory> &orgHistory,
                              const QSet<QString> &knownMsgIds,
+                             const QSet<QString> &userCleared,
+                             const QSet<QString> &notSpamSenders,
                              const MailStore::SentTldProfile &tldProfile)
 {
     SpamHeuristics::Context ctx = spamContextFor(folder, h.from, head, knownSenders,
                                                  orgHistory, knownMsgIds, tldProfile);
+    // Either half is the user's own answer: this message by its Message-ID,
+    // or this sender by an earlier rescue. The sender half is what survives
+    // the move — confirmJournalOp() destroys the row the Message-ID was
+    // recorded on as soon as the server agrees the message left the folder.
+    ctx.userNotSpam = (!h.msgid.isEmpty() && userCleared.contains(h.msgid))
+        || notSpamSenders.contains(SpamHeuristics::normalizeAddress(
+               SpamHeuristics::addressOf(h.from)));
     ctx.authInfo = h.authInfo;
     // Re-derived rather than read off h.suspicious: the marker deliberately
     // does not grade (soft or hard, it shows), while the scorer must — only
@@ -3543,20 +3653,28 @@ void MailClient::scoreHeader(MessageListModel::Header &h, const QString &folder,
     ctx.crypto = h.crypto;
     const SpamHeuristics::Score s = SpamHeuristics::score({head, {}, {}}, ctx);
     h.spamScore = s.total;
-    h.spamState = s.exempt ? 3 : 1;
+    // Recorded as the user's answer rather than as a header-stage guess that
+    // happens to agree with it: this copy of the message now carries the
+    // decision itself, so it keeps working once the rescued copy it was
+    // matched against has been purged.
+    h.spamState = ctx.userNotSpam ? MessageListModel::SpamUserCleared
+        : s.exempt                ? MessageListModel::SpamExempt
+                                  : MessageListModel::SpamFromHeaders;
     h.spamDetail = s.exempt ? s.exemptReason : s.explanation();
+    logSpamVerdict("head", folder, h.uid, SpamHeuristics::addressOf(h.from), s);
 }
 
 void MailClient::rescoreWithBody(const QString &folder, qint64 uid, KMime::Message *msg)
 {
     if (!msg || uid <= 0 || !scoresSpamIn(folder))
         return;
-    // The user's own answer outranks anything a re-score can find. Only the
-    // model knows it for a listed message; for one in another folder the store
-    // is asked instead, so a prefetch cannot resurrect a cleared mark.
+    // The user's own answer, and the exemption, outrank anything a re-score can
+    // find. Only the model knows it for a listed message; for one in another
+    // folder the store is asked instead, so a prefetch cannot resurrect a
+    // cleared mark.
     const int state = folder == m_selectedFolder ? m_messageModel.spamStateOf(uid)
                                                  : m_store.spamStateOf(folder, uid);
-    if (state == 3)
+    if (state >= MessageListModel::SpamExempt)
         return;
 
     SpamHeuristics::Message m;
@@ -3586,8 +3704,21 @@ void MailClient::rescoreWithBody(const QString &folder, qint64 uid, KMime::Messa
     ctx.authSoftFailed = SpamHeuristics::authResultsSoftFailed(authInfo);
     ctx.crypto = PgpMime::storedKind(PgpMime::kindFromHead(m.head));
 
+    // A copy of a message the user rescued elsewhere — the same test the header
+    // pass makes, repeated because a body scored from the prefetch may be the
+    // first time this folder's copy is looked at at all.
+    if (const auto *mid = std::as_const(*msg).messageID(); mid && !mid->isEmpty()) {
+        const QString msgid = QString::fromLatin1(mid->identifier());
+        ctx.userNotSpam = !m_store.userClearedMessageIds({msgid}).isEmpty();
+    }
+    if (!fromAddr.isEmpty() && !m_store.notSpamSenders({fromAddr}).isEmpty())
+        ctx.userNotSpam = true;
+
     const SpamHeuristics::Score s = SpamHeuristics::score(m, ctx);
-    const int newState = s.exempt ? 3 : 2;
+    logSpamVerdict("body", folder, uid, fromAddr, s);
+    const int newState = ctx.userNotSpam ? MessageListModel::SpamUserCleared
+        : s.exempt                       ? MessageListModel::SpamExempt
+                                         : MessageListModel::SpamWithBody;
     const QString detail = s.exempt ? s.exemptReason : s.explanation();
     m_store.setSpamVerdict(folder, uid, s.total, newState, detail);
     if (folder == m_selectedFolder)
@@ -3707,14 +3838,14 @@ void MailClient::appendScoredHeaders(QList<MessageListModel::Header> &out,
     };
 
     if (!scoresSpamIn(folder)) {
-        // Still becomes rows — just unscored ones, settled at state 3 so
+        // Still becomes rows — just unscored ones, settled at SpamExempt so
         // nothing downstream reads the untouched zero as a verdict.
         for (const auto &info : infos) {
             if (!info.message || info.uid <= 0)
                 continue;
             MessageListModel::Header h =
                 withRecipients(headerFromBackend(info, authDomains), info);
-            h.spamState = 3;
+            h.spamState = MessageListModel::SpamExempt;
             out.append(h);
         }
         return;
@@ -3725,6 +3856,7 @@ void MailClient::appendScoredHeaders(QList<MessageListModel::Header> &out,
     QSet<QString> senders;
     QSet<QString> orgs;
     QSet<QString> references;
+    QSet<QString> msgids;
     for (const auto &info : infos) {
         if (!info.message || info.uid <= 0)
             continue;
@@ -3735,6 +3867,8 @@ void MailClient::appendScoredHeaders(QList<MessageListModel::Header> &out,
         if (const QString org = SpamHeuristics::organizationalDomainOf(addr); !org.isEmpty())
             orgs.insert(org);
         references += referencedMessageIds(heads.constLast());
+        if (!batch.constLast().msgid.isEmpty())
+            msgids.insert(batch.constLast().msgid);
     }
     if (batch.isEmpty())
         return;
@@ -3745,9 +3879,15 @@ void MailClient::appendScoredHeaders(QList<MessageListModel::Header> &out,
     const QSet<QString> known = m_store.knownCorrespondents(senders);
     const auto orgHistory = m_store.senderDomainHistory(orgs);
     const QSet<QString> knownMsgIds = m_store.knownMessageIds(references);
+    // Which of these the user has already rescued. Same batching, same reason:
+    // a folder being listed for the first time delivers thousands of headers.
+    const QSet<QString> userCleared = m_store.userClearedMessageIds(msgids);
+    const QSet<QString> notSpam = m_store.notSpamSenders(senders);
     const auto tldProfile = m_store.sentTldProfile();
-    for (qsizetype i = 0; i < batch.size(); ++i)
-        scoreHeader(batch[i], folder, heads.at(i), known, orgHistory, knownMsgIds, tldProfile);
+    for (qsizetype i = 0; i < batch.size(); ++i) {
+        scoreHeader(batch[i], folder, heads.at(i), known, orgHistory, knownMsgIds,
+                    userCleared, notSpam, tldProfile);
+    }
     out += batch;
 }
 
@@ -3913,6 +4053,49 @@ void MailClient::refreshCurrentFolder()
 
 void MailClient::acquireTokenAndConnect()
 {
+    acquireToken([this](bool ok, const QString &) {
+        if (ok)
+            connectAccount();
+    });
+}
+
+void MailClient::ensureAccessToken(std::function<void(bool, const QString &)> done)
+{
+    // Password auth has nothing that expires, and a local archive never
+    // authenticates against anything at all.
+    if (m_acct.authType == 0 || m_acct.local) {
+        done(true, QString());
+        return;
+    }
+    // The common case, and deliberately synchronous: a send must not acquire
+    // an async hop per message for a token that is in date.
+    if (!m_accounts.accessToken().isEmpty()
+        && m_accounts.accessTokenExpiry() > QDateTime::currentDateTimeUtc()) {
+        done(true, QString());
+        return;
+    }
+    acquireToken(std::move(done));
+}
+
+void MailClient::finishTokenWaiters(bool ok, const QString &error)
+{
+    // Taken by value first: a waiter is free to ask for another token, and
+    // appending to the list being walked is how that becomes a crash.
+    const auto waiters = m_tokenWaiters;
+    m_tokenWaiters.clear();
+    for (const auto &waiter : waiters)
+        waiter(ok, error);
+}
+
+void MailClient::acquireToken(std::function<void(bool, const QString &)> done)
+{
+    if (done)
+        m_tokenWaiters.append(std::move(done));
+    // One acquisition answers every waiter parked on it. Without this a send
+    // and a reconnect racing the same expiry would open two browser windows.
+    if (m_tokenInFlight)
+        return;
+    m_tokenInFlight = true;
     if (!m_oauth) {
         m_oauth = new OAuthHelper(this);
         connect(m_oauth, &OAuthHelper::tokensReady, this,
@@ -3927,7 +4110,19 @@ void MailClient::acquireTokenAndConnect()
                         write->setTextData(refreshToken);
                         write->start();
                     }
-                    connectAccount();
+                    // A connected backend holds the credentials it was
+                    // given when it dialled; without this its copy stays at
+                    // the token that just expired, which is what the SMTP leg
+                    // would go on presenting for every message.
+                    if (m_backend)
+                        m_backend->updateAccessToken(accessToken);
+                    m_tokenInFlight = false;
+                    // Whatever the spinner was for ends here. A waiter that
+                    // goes on to connect turns it straight back on; one that
+                    // only wanted a token to send with would otherwise leave
+                    // it spinning over nothing.
+                    setBusy(false);
+                    finishTokenWaiters(true, QString());
                 });
         connect(m_oauth, &OAuthHelper::failed, this, [this](const QString &message) {
             setBusy(false);
@@ -3940,6 +4135,8 @@ void MailClient::acquireTokenAndConnect()
                 del->start();
             }
             setStatus(tr("Sign-in failed"));
+            m_tokenInFlight = false;
+            finishTokenWaiters(false, message);
             Q_EMIT errorOccurred(message);
         });
     }
@@ -4518,10 +4715,19 @@ void MailClient::markAsNotSpam(const QVariantList &rows)
         // the rule was wrong about the person; correcting only the one message
         // would let the next one from them be marked all over again.
         const QString sender = SpamHeuristics::addressOf(m_messageModel.fromAt(row));
-        if (!sender.isEmpty())
+        if (!sender.isEmpty()) {
             m_store.addRecipient(sender);
+            // And on the list that an authentication failure cannot revoke.
+            // Being a known correspondent is evidence; this is the answer.
+            m_store.setNotSpamSender(sender, true);
+            // Reaching the mail of theirs that is already marked, here and in
+            // every other folder — see clearSpamVerdictsFrom().
+            m_store.clearSpamVerdictsFrom(sender);
+            m_messageModel.clearSpamFrom(sender);
+        }
         m_messageModel.clearSpam(uid);
-        m_store.setSpamVerdict(m_selectedFolder, uid, 0, 3, QString());
+        m_store.setSpamVerdict(m_selectedFolder, uid, SpamHeuristics::UserNotSpamWeight,
+                               MessageListModel::SpamUserCleared, QString());
         ++cleared;
     }
     if (cleared > 0)
@@ -4537,6 +4743,15 @@ void MailClient::markAsJunk(const QVariantList &rows)
     }
     if (m_selectedFolder == junk)
         return;
+    // Withdraws any standing "not spam" for these senders first. The two
+    // gestures are the same statement in opposite directions, and an override
+    // that could only ever be granted would turn one rescue into a permanent
+    // blind spot — the user has to be able to change their mind.
+    for (const QVariant &v : rows) {
+        const QString sender = SpamHeuristics::addressOf(m_messageModel.fromAt(v.toInt()));
+        if (!sender.isEmpty())
+            m_store.setNotSpamSender(sender, false);
+    }
     // The local verdict is not journalled: it is mailove's own opinion about
     // the message, has never been sent anywhere, and already worked offline.
     // Only the move is something the server has to be told about.
@@ -4582,8 +4797,34 @@ void MailClient::moveMessagesTo(const QVariantList &rows, const QString &targetF
     // statement about a person, made by the user pressing the button — it is
     // not conditional on the server accepting the move, and a move that is
     // later rolled back does not make the sender spam again.
-    for (const QString &sender : std::as_const(rescuedSenders))
+    for (const QString &sender : std::as_const(rescuedSenders)) {
         m_store.addRecipient(sender);
+        m_store.setNotSpamSender(sender, true);
+        // Their mail elsewhere, which is where the user will look next: the
+        // copy being rescued is about to leave this folder, and the inbox it
+        // lands in may already hold others of theirs wearing the mark.
+        m_store.clearSpamVerdictsFrom(sender);
+        m_messageModel.clearSpamFrom(sender);
+    }
+
+    // And about this message, which is the narrower and stronger half of it:
+    // the sender allowlist yields to an authentication failure by design, so on
+    // its own it would let the rescued message be marked all over again the
+    // moment it landed in its new folder. Written onto the outgoing rows before
+    // journalRemoval() soft-deletes them — they are the only copy that exists
+    // until the server confirms the move, and their Message-ID is what
+    // MailStore::userClearedMessageIds() matches the arriving copy against.
+    if (rescuedFromJunk) {
+        for (const QVariant &v : rows) {
+            const int row = v.toInt();
+            const qint64 uid = m_messageModel.uidAt(row);
+            if (uid <= 0)
+                continue;
+            m_messageModel.clearSpam(uid);
+            m_store.setSpamVerdict(m_selectedFolder, uid, SpamHeuristics::UserNotSpamWeight,
+                                   MessageListModel::SpamUserCleared, QString());
+        }
+    }
 
     const int count = journalRemoval(rows, QStringLiteral("move"), targetFolder);
     if (count <= 0)
@@ -6582,14 +6823,30 @@ void MailClient::drainOutbox()
     Q_EMIT outboxChanged(); // the list shows "sending"
     qCInfo(logJournal) << "outbox: sending row" << msg.id << "to" << msg.envelope.size()
                        << "recipient(s)";
-    m_backend->sendMessage(msg.wire, msg.sender, msg.envelope,
-                           [this, msg](MailBackend::Error error, const QString &message) {
+    // Same reason as the direct send: SMTP authenticates per message, and a
+    // row that has been backing off for an hour is precisely the one whose
+    // token has expired underneath it.
+    ensureAccessToken([this, msg](bool ok, const QString &error) {
         if (m_outboxInFlight != msg.id)
             return; // the account was switched under it; the row stays Sending
                     // and startup recovery or the switch-back deals with it
-        m_outboxBusy = false;
-        m_outboxInFlight = 0;
-        finishOutboxSend(msg, error, message);
+        if (!ok || !m_backend || !connected()) {
+            // Nothing to send with. Auth, so the row backs off and comes
+            // round again rather than being bounced as a rejection.
+            m_outboxBusy = false;
+            m_outboxInFlight = 0;
+            finishOutboxSend(msg, MailBackend::Error::Auth,
+                             ok ? tr("Not connected.") : error);
+            return;
+        }
+        m_backend->sendMessage(msg.wire, msg.sender, msg.envelope,
+                               [this, msg](MailBackend::Error error, const QString &message) {
+            if (m_outboxInFlight != msg.id)
+                return; // as above
+            m_outboxBusy = false;
+            m_outboxInFlight = 0;
+            finishOutboxSend(msg, error, message);
+        });
     });
 }
 

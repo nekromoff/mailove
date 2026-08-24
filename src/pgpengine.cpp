@@ -900,7 +900,7 @@ quint64 PgpEngine::signDetached(const QByteArray &data, const QString &signerFin
 #ifdef MAILOVE_HAVE_OPENPGP
     const GpgME::Key signer = d->rawKey(signerFingerprint);
     if (data.isEmpty() || signer.isNull()) {
-        Q_EMIT signFinished(0, {}, {}, tr("The signing key is not in your keyring."));
+        Q_EMIT signFinished(0, {}, {}, tr("The signing key is not in your keyring."), false);
         return 0;
     }
     QGpgME::SignJob *job = QGpgME::openpgp()->signJob(true, true);
@@ -916,7 +916,8 @@ quint64 PgpEngine::signDetached(const QByteArray &data, const QString &signerFin
                         id, {}, {},
                         result.error().isCanceled()
                             ? tr("Signing was cancelled.")
-                            : QString::fromStdString(result.error().asStdString()));
+                            : QString::fromStdString(result.error().asStdString()),
+                        result.error().isCanceled());
                     return;
                 }
                 // RFC 3156 §5 wants the hash named on the multipart/signed, and
@@ -927,14 +928,15 @@ quint64 PgpEngine::signDetached(const QByteArray &data, const QString &signerFin
                     micalg = QStringLiteral("pgp-")
                         + QString::fromLatin1(created.front().hashAlgorithmAsString()).toLower();
                 }
-                Q_EMIT signFinished(id, signature, micalg, QString());
+                Q_EMIT signFinished(id, signature, micalg, QString(), false);
             });
     // Detached, armored, text mode: exactly what RFC 3156 specifies.
     const GpgME::Error err = job->start({signer}, data, GpgME::Detached);
     if (err) {
         jobFinished();
         job->deleteLater();
-        Q_EMIT signFinished(id, {}, {}, QString::fromStdString(err.asStdString()));
+        Q_EMIT signFinished(id, {}, {}, QString::fromStdString(err.asStdString()),
+                            err.isCanceled());
     }
     return id;
 #else

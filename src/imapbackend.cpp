@@ -262,6 +262,14 @@ void ImapBackend::disconnectAccount()
     setConnected(false);
 }
 
+/// The IMAP session authenticated once and stays authenticated, so nothing
+/// here disturbs it. This is for the SMTP leg, which authenticates per message
+/// out of exactly this copy — see sendMessage().
+void ImapBackend::updateAccessToken(const QString &accessToken)
+{
+    m_credentials.accessToken = accessToken;
+}
+
 void ImapBackend::connectAccount(const Credentials &credentials)
 {
     m_credentials = credentials;
@@ -1578,10 +1586,10 @@ void ImapBackend::sendMessage(const QByteArray &raw, const QString &from,
 
     // Called exactly once, however the attempt ends, and always closes the
     // session: an SMTP connection left open holds a socket for nothing.
-    auto finish = std::make_shared<std::function<void(const QString &)>>();
-    *finish = [session, done](const QString &error) {
+    auto finish = std::make_shared<std::function<void(Error, const QString &)>>();
+    *finish = [session, done](Error error, const QString &message) {
         if (done)
-            done(error.isEmpty() ? Error::None : Error::Protocol, error);
+            done(error, message);
         session->quit();
         session->deleteLater();
     };
@@ -1601,7 +1609,15 @@ void ImapBackend::sendMessage(const QByteArray &raw, const QString &from,
                 connect(login, &KJob::result, this,
                         [session, raw, from, recipients, finish](KJob *job) {
                             if (job->error()) {
-                                (*finish)(job->errorString());
+                                // Auth, not Protocol: an OAuth access token
+                                // expires within the hour while the IMAP
+                                // session it was minted with stays up, so a
+                                // refused SMTP login is far more often a stale
+                                // token than a refused message. Naming it
+                                // Protocol stranded the mail in the composer
+                                // as a permanent rejection; Auth sends it to
+                                // the outbox, which renews and retries.
+                                (*finish)(Error::Auth, job->errorString());
                                 return;
                             }
                             auto *send = new KSmtp::SendJob(session);
@@ -1610,8 +1626,11 @@ void ImapBackend::sendMessage(const QByteArray &raw, const QString &from,
                             // and Bcc must not reach a header.
                             send->setTo(recipients);
                             send->setData(raw);
+                            // The message itself was refused — that verdict
+                            // belongs in the composer, not the outbox.
                             connect(send, &KJob::result, session, [finish](KJob *job) {
-                                (*finish)(job->error() ? job->errorString() : QString());
+                                (*finish)(job->error() ? Error::Protocol : Error::None,
+                                          job->error() ? job->errorString() : QString());
                             });
                             send->start();
                         });

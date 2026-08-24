@@ -151,6 +151,13 @@ public:
     /// connected() follows; failure arrives as errorOccurred(Error::Auth or
     /// Error::Connection).
     virtual void connectAccount(const Credentials &credentials) = 0;
+    /// Replaces the OAuth access token without disturbing an established
+    /// connection. Credentials are taken once, at connectAccount(), but an
+    /// access token expires within the hour while the session it opened stays
+    /// up — and the SMTP leg dials afresh for every message, so a stale copy
+    /// here is a send that fails long after the account looked perfectly fine.
+    /// A no-op for password auth, which has nothing that expires.
+    virtual void updateAccessToken(const QString &accessToken) = 0;
     /// Closes everything and cancels work in flight. Safe to call when not
     /// connected. Emits no signal: the caller asked for this.
     virtual void disconnectAccount() = 0;

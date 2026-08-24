@@ -64,6 +64,17 @@ class DiagnosticsLog : public QAbstractListModel
                    NOTIFY minimumSeverityChanged)
     /// Rows the filter is currently hiding, for "showing 41 of 5000".
     Q_PROPERTY(int totalLines READ totalLines NOTIFY totalLinesChanged)
+    /// When set, the only logging category in the model; empty means every
+    /// category. Severity still applies on top, so a view of one category is
+    /// asked for with a minimumSeverity of 0.
+    Q_PROPERTY(QString onlyCategory READ onlyCategory WRITE setOnlyCategory
+                   NOTIFY onlyCategoryChanged)
+    /// A category kept out of the model, whatever its severity. The other half
+    /// of onlyCategory: a category that has a view of its own is noise in the
+    /// general ones, and per-message chatter like the spam verdicts is enough
+    /// of it to bury everything else.
+    Q_PROPERTY(QString hiddenCategory READ hiddenCategory WRITE setHiddenCategory
+                   NOTIFY hiddenCategoryChanged)
     /// Whether addresses are masked. Applies to what the viewer *shows*, not
     /// only to what it copies: a switch in the window's own header reads as a
     /// statement about the window, and one that quietly meant "later, on the
@@ -102,6 +113,10 @@ public:
     int minimumSeverity() const { return m_minimumSeverity; }
     void setMinimumSeverity(int severity);
     int totalLines() const { return int(m_rows.size()); }
+    QString onlyCategory() const { return m_onlyCategory; }
+    void setOnlyCategory(const QString &category);
+    QString hiddenCategory() const { return m_hiddenCategory; }
+    void setHiddenCategory(const QString &category);
     bool redact() const { return m_redact; }
     void setRedact(bool redact);
 
@@ -135,6 +150,8 @@ Q_SIGNALS:
     void minimumSeverityChanged();
     void totalLinesChanged();
     void redactChanged();
+    void onlyCategoryChanged();
+    void hiddenCategoryChanged();
 
 private:
     DiagnosticsLog();
@@ -163,6 +180,9 @@ private:
     /// Empties the file. Writer thread only, on a request from clear().
     void truncateFile();
     void setError(const QString &error);
+    /// Whether \a entry belongs in the view under the current filter. The one
+    /// place the filter is spelled out, for both the rebuild and the drain.
+    bool passesFilter(const Entry &entry) const;
     /// Recomputes m_view from m_rows. Called when the filter changes.
     void rebuildView();
 
@@ -195,6 +215,8 @@ private:
     QList<int> m_view;     ///< indices into m_rows passing the severity filter
     QTimer m_drainTimer;
     int m_minimumSeverity = 0;
+    QString m_onlyCategory;
+    QString m_hiddenCategory;
     bool m_redact = true;
     /// Last drop count the property reported, so the signal fires on change
     /// rather than on every tick.

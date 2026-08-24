@@ -161,7 +161,7 @@ public:
 
     /// Records a spam verdict for one message. \a state follows
     /// MessageListModel::Header::spamState — 1 headers only, 2 with the body,
-    /// 3 cleared by the user.
+    /// 3 exempt or not scored here, 4 answered by the user.
     void setSpamVerdict(const QString &folder, qint64 uid, int score, int state,
                         const QString &detail);
     /// One cached message's raw bytes, for the recipient backfill.
@@ -555,6 +555,38 @@ public:
     /// angle brackets stripped. Answers "is this a reply to something in my
     /// mailbox?" for a whole FETCH batch at once, over idx_messages_msgid.
     QSet<QString> knownMessageIds(const QSet<QString> &msgids);
+
+    /// Records — or withdraws — the user's explicit "this person is not spam".
+    ///
+    /// Set when they take a message out of the junk folder, cleared when they
+    /// put one of that sender's messages into it. Unlike the recipients
+    /// allowlist this is not revoked by an authentication failure: it exists to
+    /// overrule the filter, and the mail it is corrected against is very often
+    /// mail that fails SPF or DKIM for reasons of the sender's own (a newsletter
+    /// relayed through a service, a list that rewrites the envelope). The cost
+    /// is that a forgery of a rescued address is no longer caught by
+    /// known-contact-spoofed — accepted deliberately, because the alternative is
+    /// a "Not spam" button that does not work on the mail it is pressed on.
+    void setNotSpamSender(const QString &address, bool notSpam);
+    /// The subset of \a addresses on that list, normalized. Batched per FETCH
+    /// like knownCorrespondents(), which it is scored alongside.
+    QSet<QString> notSpamSenders(const QSet<QString> &addresses);
+    /// Unmarks every cached message from \a address, in every folder, and
+    /// records the user's answer on those rows. Returns how many changed.
+    /// Scans the messages table — a button press, never the sync path.
+    int clearSpamVerdictsFrom(const QString &address);
+
+    /// The subset of \a msgids the user has answered "not spam" about, in any
+    /// folder — spam_state 4, wherever that copy of the message now is or was.
+    ///
+    /// This is what carries a rescue across the move that performs it. Taking
+    /// a message out of the junk folder deletes it there and creates it in the
+    /// inbox under a new uid, so a verdict keyed on (folder, uid) is left
+    /// behind by the very act it was recording, and the arriving copy gets
+    /// scored from scratch as if nothing had been said. The Message-ID is the
+    /// one identifier the two copies share. Soft-deleted rows count, because
+    /// for the duration of the move the outgoing copy is exactly that.
+    QSet<QString> userClearedMessageIds(const QSet<QString> &msgids);
 
     /// How much of a history one sending organization has here.
     struct DomainHistory {

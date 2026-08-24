@@ -40,6 +40,23 @@ WebEngineView {
             view.loggedConsoleLines = ({}) // new document, fresh slate
     }
 
+    // Scripts are off and Chromium's status bubble does not exist here, so
+    // without this a reader has no way to see where a link goes before
+    // clicking it — and in hostile mail content the destination is exactly
+    // what they need to check. The engine reports the link under the pointer;
+    // the HoverHandler supplies the pointer position the tooltip follows.
+    property string hoveredLink: ""
+    onLinkHovered: function (hoveredUrl) {
+        view.hoveredLink = hoveredUrl.toString()
+    }
+    HoverHandler {
+        id: linkHover
+    }
+    HoverToolTip {
+        hover: linkHover
+        text: view.hoveredLink
+    }
+
     // Our own context menu in place of Chromium's default, whose entries
     // (Back, Reload, View page source…) do nothing useful inside a mail
     // sandbox. Only what acts on mail content: copying — plain, as Markdown

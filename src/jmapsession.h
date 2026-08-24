@@ -87,6 +87,11 @@ public:
     /// a new session object rather than a new password. Does nothing and emits
     /// failed(Error::Auth) if discover() was never called.
     void refresh();
+    /// Swaps in a freshly minted OAuth access token, so the next request — and
+    /// any refresh() after it — authenticates with the live one rather than
+    /// the token discover() was handed. Does nothing before discover(): there
+    /// are no credentials to amend yet.
+    void setAccessToken(const QString &accessToken);
     /// Abandons a discovery in flight. Emits nothing — the caller asked.
     void cancel();
 

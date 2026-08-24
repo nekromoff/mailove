@@ -178,6 +178,16 @@ void JmapSession::clear()
     m_limits = {};
 }
 
+void JmapSession::setAccessToken(const QString &accessToken)
+{
+    if (!m_haveCredentials)
+        return;
+    m_credentials.accessToken = accessToken;
+    // The header is derived once, at discovery, and cached — rederive it, or
+    // every request would keep presenting the token that just expired.
+    m_authorization = authorizationHeader(m_credentials);
+}
+
 QByteArray JmapSession::authorizationHeader(const MailBackend::Credentials &credentials)
 {
     if (!credentials.accessToken.isEmpty())

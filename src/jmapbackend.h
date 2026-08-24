@@ -60,6 +60,7 @@ public:
     }
 
     void connectAccount(const Credentials &credentials) override;
+    void updateAccessToken(const QString &accessToken) override;
     void disconnectAccount() override;
     bool isConnected() const override { return m_connected; }
 

@@ -57,6 +57,7 @@ public:
     }
 
     void connectAccount(const Credentials &credentials) override;
+    void updateAccessToken(const QString &accessToken) override;
     void disconnectAccount() override;
     /// The interactive connection has to exist as well as the login having
     /// succeeded: callers read this as "there is something to talk to", and a

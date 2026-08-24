@@ -284,9 +284,11 @@ Q_SIGNALS:
     void verifyFinished(quint64 id, const PgpSignatureInfo &signature);
     /// \a signature is the armored detached signature for job \a id, and
     /// \a micalg the hash it used ("pgp-sha256"), which RFC 3156 requires on
-    /// the multipart/signed. Empty with \a error set on failure.
+    /// the multipart/signed. Empty with \a error set on failure. \a cancelled
+    /// distinguishes a dismissed pinentry from a real failure — a cancel is
+    /// the user declining the passphrase prompt, not the key breaking.
     void signFinished(quint64 id, const QByteArray &signature, const QString &micalg,
-                      const QString &error);
+                      const QString &error, bool cancelled);
     /// \a cipherText is the armored ciphertext for job \a id.
     void encryptFinished(quint64 id, const QByteArray &cipherText, const QString &error);
 

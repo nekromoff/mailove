@@ -57,6 +57,12 @@ int spamThreshold();
 /// not an OpenPGP signature and a long correspondence together, may pull a
 /// message the user has thrown away back out of the marked state.
 inline constexpr int JunkFolderWeight = 999;
+/// The mirror of it, for the other fact of the same kind: the user took this
+/// message *out* of the junk folder, or pressed "Not spam" on it. Symmetrical
+/// on purpose — an explicit decision by the person the filter works for beats
+/// every rule in this file, in both directions, and nothing the scorer can
+/// find may add up to overturning one.
+inline constexpr int UserNotSpamWeight = -999;
 /// Below this, nothing is shown at all.
 inline constexpr int UnsureThreshold = 25;
 
@@ -167,6 +173,18 @@ struct Context {
     /// true answer to "why is this marked?" but a thin one, and the rules that
     /// would have caught it anyway are worth showing.
     bool inJunkFolder = false;
+
+    /// The user has already answered this exact message: they moved it out of
+    /// the junk folder, or pressed "Not spam" on it. Carried across the move by
+    /// the Message-ID, because a rescue changes the folder and the uid and
+    /// would otherwise be forgotten the moment it took effect — which is what
+    /// left a rescued message wearing the "!" in the inbox it had just been
+    /// dragged into.
+    ///
+    /// Outranks everything, \a inJunkFolder included: a copy still sitting in
+    /// the junk folder is the state the user was correcting, and re-asserting
+    /// it against them is the filter arguing with its owner.
+    bool userNotSpam = false;
 
     /// True to skip the known-correspondent short circuit and score the message
     /// anyway. Only for spamtool, which needs to see what a message would have

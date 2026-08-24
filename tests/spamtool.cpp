@@ -468,6 +468,11 @@ int main(int argc, char **argv)
             spamDirs.append(next());
         else if (arg == QLatin1String("--known"))
             known.insert(SpamHeuristics::normalizeAddress(next()));
+        // The user's own addresses, the way --known simulates the allowlist:
+        // without at least one, not-addressed-to-you can never fire and every
+        // BCC-delivered corpus message under-reports.
+        else if (arg == QLatin1String("--own"))
+            base.ownAddresses.append(SpamHeuristics::normalizeAddress(next()));
         else if (arg == QLatin1String("--always-score"))
             base.alwaysScore = true;
         else if (arg == QLatin1String("--auth-fail"))
@@ -524,6 +529,7 @@ int main(int argc, char **argv)
         && !sweepCache) {
         std::fprintf(stderr,
                      "usage: spamtool [--quiet] [--always-score] [--known ADDR]...\n"
+                     "                [--own ADDR]...\n"
                      "                [--auth-fail|--auth-pass] [--crypto 0|1|2|3]\n"
                      "                [--familiar-tld TLD]... [--sent-tld-sample N]\n"
                      "                [--cache] [--folder NAME] [--limit N]\n"

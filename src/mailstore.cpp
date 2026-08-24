@@ -176,6 +176,12 @@ bool MailStore::open()
     SlowGuard guard("open");
     QSqlQuery q(m_db);
     q.exec(QStringLiteral("PRAGMA journal_mode=WAL"));
+    // NORMAL, not the FULL default: FULL fsyncs the WAL on every commit, which
+    // put a disk sync inside every storeHeaders() on this thread — the single
+    // biggest source of "SLOW … on the GUI thread". In WAL mode NORMAL cannot
+    // corrupt the database; a power cut can only cost the last commits, and a
+    // cache of mail the server still has is exactly the data that can afford it.
+    q.exec(QStringLiteral("PRAGMA synchronous=NORMAL"));
     // The purge and vacuum workers write on their own connections. Without a
     // busy timeout this connection would fail its writes outright the moment
     // one of them held the lock, instead of waiting the few ms it takes.
@@ -249,6 +255,25 @@ bool MailStore::open()
     // Senders the user chose to always load remote content for.
     q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS remote_senders ("
                           " sender TEXT PRIMARY KEY)"));
+
+    // Senders the user has explicitly taken out of the spam folder.
+    //
+    // A table rather than a column on the message, because the message does
+    // not survive the statement: rescuing it moves it, and confirmJournalOp()
+    // hard-deletes the old row the moment the server agrees the move happened.
+    // Whatever records the decision has to outlive the row that expressed it,
+    // and the copy that arrives in the inbox afterwards is a different folder
+    // and a different uid with nothing linking it back.
+    //
+    // Keyed on the normalized address (lowercased, +tag stripped) and not
+    // scoped to an account, exactly like the recipients allowlist: it is a
+    // statement about a person, and the same person writing to another of the
+    // user's mailboxes is not a new question. Distinct from recipients
+    // precisely because that list is revocable by an authentication failure by
+    // design — this one is the user overruling that, which is the whole point
+    // of it and is why it cannot be inferred from mail having been sent.
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS not_spam_senders ("
+                          " addr_norm TEXT PRIMARY KEY, added INTEGER NOT NULL DEFAULT 0)"));
 
     // How much mail each sending organization has a history of here — the
     // spam scorer's familiarity signal (SpamHeuristics::Context::seenFromOrg).
@@ -329,9 +354,10 @@ bool MailStore::open()
     // Local spam verdict (see spamheuristics.h). The score is stored rather
     // than the verdict so that moving a threshold re-judges old mail instead of
     // freezing yesterday's opinion into the cache. spam_state says how much was
-    // known when it was computed — 0 never scored, 1 headers only, 2 with the
-    // body, 3 exempt under Rule 0 — which is what lets the score be refined
-    // when the body lands rather than treated as final.
+    // known when it was computed (MessageListModel::SpamState — 0 never
+    // scored, 1 headers only, 2 with the body, 3 exempt, 4 answered by the
+    // user), which is what lets the score be refined when the body lands
+    // rather than treated as final.
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN spam_score INTEGER DEFAULT 0"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN spam_state INTEGER DEFAULT 0"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN spam_detail TEXT DEFAULT ''"));
@@ -350,8 +376,8 @@ bool MailStore::open()
     //
     // Imported archives are left alone: their bodies came off disk, not
     // through the fetch, and there is no server to re-fetch from — deleting
-    // one would destroy the only copy. spam_state 3 survives because it is
-    // the user's own answer, not a derivation.
+    // one would destroy the only copy. spam_state 3 and 4 survive because they
+    // are the exemption and the user's own answer, not a derivation.
     //
     // Deferred: see pendingMigrations().
     //
@@ -731,7 +757,7 @@ void MailStore::runMigration(QSqlDatabase &db, const Migration &step, const QStr
             + QStringLiteral(" AND (dkim <> '' OR dkim_detail <> ''"
                              " OR dkim_trusted <> 0 OR arc <> '' OR arc_sealer <> ''"
                              " OR arc_detail <> '' OR spam_score <> 0 OR spam_detail <> ''"
-                             " OR spam_state NOT IN (0, 3))");
+                             " OR spam_state NOT IN (0, 3, 4))");
 
         qint64 total = countOf(db, QStringLiteral("SELECT COUNT(*) FROM bodies") + staleBodies)
             + countOf(db, QStringLiteral("SELECT COUNT(*) FROM messages") + unclearedVerdicts);
@@ -752,7 +778,7 @@ void MailStore::runMigration(QSqlDatabase &db, const Migration &step, const QStr
                     "UPDATE messages SET dkim = '', dkim_detail = '', dkim_trusted = 0,"
                     " arc = '', arc_sealer = '', arc_detail = '', spam_score = 0,"
                     " spam_detail = '',"
-                    " spam_state = CASE WHEN spam_state = 3 THEN 3 ELSE 0 END"
+                    " spam_state = CASE WHEN spam_state >= 3 THEN spam_state ELSE 0 END"
                     " WHERE rowid IN (SELECT rowid FROM messages%1 LIMIT ?)")
                                 .arg(unclearedVerdicts));
                 upd.addBindValue(kMigrationChunk);
@@ -1075,7 +1101,8 @@ void applyJunkVerdict(QList<MessageListModel::Header> &rows, const QString &scop
     if (!g_isJunkFolder(scopedFolder))
         return;
     for (MessageListModel::Header &h : rows) {
-        if (h.spamState == 3 || h.spamScore >= SpamHeuristics::spamThreshold())
+        if (h.spamState >= MessageListModel::SpamExempt
+            || h.spamScore >= SpamHeuristics::spamThreshold())
             continue;
         SpamHeuristics::Score s;
         s.verdict = SpamHeuristics::Verdict::Spam;
@@ -2075,6 +2102,10 @@ QSqlDatabase MailStore::openWorkerConnection(const QString &name)
     QSqlQuery pragma(db);
     // Several connections write now; each must wait rather than fail.
     pragma.exec(QStringLiteral("PRAGMA busy_timeout=%1").arg(AdvancedConfig::i("db/busyTimeoutMs")));
+    // synchronous is per-connection (WAL is per-file). Same NORMAL as the GUI
+    // connection: a FULL commit here fsyncs while holding the write lock, and
+    // the GUI thread is what ends up waiting on it.
+    pragma.exec(QStringLiteral("PRAGMA synchronous=NORMAL"));
     return db;
 }
 
@@ -2736,6 +2767,9 @@ void MailStore::purgeFolder(const QString &scopedFolder, const QAtomicInt &cance
             // The GUI thread is the other writer. Chunks are small enough that
             // it never waits long, but it must be willing to wait at all.
             pragma.exec(QStringLiteral("PRAGMA busy_timeout=%1").arg(AdvancedConfig::i("db/busyTimeoutMs")));
+            // NORMAL so each chunk's commit hands the write lock back without
+            // an fsync in the middle — see open() for why that is safe here.
+            pragma.exec(QStringLiteral("PRAGMA synchronous=NORMAL"));
             // 100 rows keeps a single write-lock hold to a few ms, so a folder
             // switch on the GUI thread is never stuck behind this.
             while (!cancel.loadRelaxed()) {
@@ -2862,6 +2896,7 @@ bool MailStore::swapInCompacted(const QString &compacted, QString *error)
     // who asked for disk space back.
     QSqlQuery q(m_db);
     q.exec(QStringLiteral("PRAGMA journal_mode=WAL"));
+    q.exec(QStringLiteral("PRAGMA synchronous=NORMAL"));
     q.exec(QStringLiteral("PRAGMA busy_timeout=%1").arg(AdvancedConfig::i("db/busyTimeoutMs")));
     q.exec(QStringLiteral("PRAGMA foreign_keys=ON"));
     return renamed;
@@ -3182,10 +3217,14 @@ QSet<QString> MailStore::knownCorrespondents(const QSet<QString> &addresses)
     return out;
 }
 
-QSet<QString> MailStore::knownMessageIds(const QSet<QString> &msgids)
+/// The subset of \a msgids that idx_messages_msgid finds a row for, with
+/// \a extraWhere ("" or " AND …") narrowing which rows count. Angle brackets
+/// are stripped from the needles, as they are in the column.
+static QSet<QString> lookupMessageIds(QSqlDatabase &db, const QSet<QString> &msgids,
+                                      const QString &extraWhere)
 {
     QSet<QString> out;
-    if (!m_db.isOpen() || msgids.isEmpty())
+    if (!db.isOpen() || msgids.isEmpty())
         return out;
     QStringList needles;
     needles.reserve(msgids.size());
@@ -3206,9 +3245,9 @@ QSet<QString> MailStore::knownMessageIds(const QSet<QString> &msgids)
         const QStringList slice = needles.mid(start, chunk);
         const QString placeholders =
             QStringList(slice.size(), QStringLiteral("?")).join(QLatin1Char(','));
-        QSqlQuery q(m_db);
-        q.prepare(QStringLiteral("SELECT DISTINCT msgid FROM messages WHERE msgid IN (%1)")
-                      .arg(placeholders));
+        QSqlQuery q(db);
+        q.prepare(QStringLiteral("SELECT DISTINCT msgid FROM messages WHERE msgid IN (%1)%2")
+                      .arg(placeholders, extraWhere));
         for (const QString &n : slice)
             q.addBindValue(n);
         if (!q.exec())
@@ -3217,6 +3256,114 @@ QSet<QString> MailStore::knownMessageIds(const QSet<QString> &msgids)
             out.insert(q.value(0).toString());
     }
     return out;
+}
+
+QSet<QString> MailStore::knownMessageIds(const QSet<QString> &msgids)
+{
+    return lookupMessageIds(m_db, msgids, QString());
+}
+
+void MailStore::setNotSpamSender(const QString &address, bool notSpam)
+{
+    if (!m_db.isOpen())
+        return;
+    const QString norm = SpamHeuristics::normalizeAddress(address);
+    if (norm.isEmpty() || !norm.contains(QLatin1Char('@')))
+        return;
+    QSqlQuery q(m_db);
+    if (notSpam) {
+        q.prepare(QStringLiteral("INSERT INTO not_spam_senders (addr_norm, added)"
+                                 " VALUES (?, ?) ON CONFLICT(addr_norm) DO UPDATE SET"
+                                 " added = excluded.added"));
+        q.addBindValue(norm);
+        q.addBindValue(QDateTime::currentSecsSinceEpoch());
+    } else {
+        // Moving their mail *to* spam is the same statement in reverse, and it
+        // has to be able to undo this one — an override the user cannot take
+        // back is a worse trap than the false positive it was fixing.
+        q.prepare(QStringLiteral("DELETE FROM not_spam_senders WHERE addr_norm = ?"));
+        q.addBindValue(norm);
+    }
+    q.exec();
+}
+
+int MailStore::clearSpamVerdictsFrom(const QString &address)
+{
+    if (!m_db.isOpen())
+        return 0;
+    const QString norm = SpamHeuristics::normalizeAddress(address);
+    if (norm.isEmpty() || !norm.contains(QLatin1Char('@')))
+        return 0;
+    // A rescue is about the person, so it has to reach the mail of theirs that
+    // is already cached and already marked — in the inbox, in every other
+    // folder, and in the message the user is looking at. Verdicts are computed
+    // once and stored; without this the answer would only apply to mail that
+    // arrives from now on, which is not what pressing the button looks like.
+    //
+    // A LIKE over the whole table, because `sender` holds a display value
+    // ("Name <addr>") and there is no index that can answer this. That is
+    // affordable here and nowhere else: this runs when a person presses a
+    // button, once, not on the sync path.
+    //
+    // Matched on both spellings — the normalized address and the one that was
+    // passed — because the column keeps whatever the message said, +tag and
+    // all, while the list this is keyed on has the tag stripped.
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET spam_score = ?, spam_state = ?,"
+                             " spam_detail = '' WHERE spam_state < ?"
+                             " AND (LOWER(sender) LIKE ? OR LOWER(sender) LIKE ?)"));
+    q.addBindValue(SpamHeuristics::UserNotSpamWeight);
+    q.addBindValue(int(MessageListModel::SpamUserCleared));
+    q.addBindValue(int(MessageListModel::SpamUserCleared));
+    q.addBindValue(QStringLiteral("%%%1%%").arg(norm));
+    q.addBindValue(QStringLiteral("%%%1%%").arg(address.trimmed().toLower()));
+    if (!q.exec())
+        return 0;
+    return q.numRowsAffected();
+}
+
+QSet<QString> MailStore::notSpamSenders(const QSet<QString> &addresses)
+{
+    QSet<QString> out;
+    if (!m_db.isOpen() || addresses.isEmpty())
+        return out;
+    QStringList needles;
+    needles.reserve(addresses.size());
+    for (const QString &a : addresses) {
+        const QString n = SpamHeuristics::normalizeAddress(a);
+        if (!n.isEmpty() && n.contains(QLatin1Char('@')))
+            needles.append(n);
+    }
+    if (needles.isEmpty())
+        return out;
+    // Chunked like knownCorrespondents(), and batched into the same pass for
+    // the same reason: this is asked once per header the sync delivers.
+    constexpr int chunk = 500;
+    for (qsizetype start = 0; start < needles.size(); start += chunk) {
+        const QStringList slice = needles.mid(start, chunk);
+        const QString placeholders =
+            QStringList(slice.size(), QStringLiteral("?")).join(QLatin1Char(','));
+        QSqlQuery q(m_db);
+        q.prepare(QStringLiteral("SELECT addr_norm FROM not_spam_senders"
+                                 " WHERE addr_norm IN (%1)").arg(placeholders));
+        for (const QString &n : slice)
+            q.addBindValue(n);
+        if (!q.exec())
+            continue;
+        while (q.next())
+            out.insert(q.value(0).toString());
+    }
+    return out;
+}
+
+QSet<QString> MailStore::userClearedMessageIds(const QSet<QString> &msgids)
+{
+    // Soft-deleted rows are deliberately not excluded — see the header. While
+    // the move is in flight the only row carrying the user's answer is the
+    // outgoing copy, which is soft-deleted the moment the rescue is journalled.
+    return lookupMessageIds(m_db, msgids,
+                            QStringLiteral(" AND spam_state = %1")
+                                .arg(int(MessageListModel::SpamUserCleared)));
 }
 
 QHash<QString, MailStore::DomainHistory>

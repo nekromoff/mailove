@@ -96,6 +96,13 @@ void JmapBackend::connectAccount(const Credentials &credentials)
     m_session->discover(credentials);
 }
 
+/// Everything JMAP does goes out over the session's Authorization header, so
+/// there is one place to put this.
+void JmapBackend::updateAccessToken(const QString &accessToken)
+{
+    m_session->setAccessToken(accessToken);
+}
+
 void JmapBackend::disconnectAccount()
 {
     stopPush();

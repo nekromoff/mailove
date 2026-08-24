@@ -55,6 +55,27 @@ public:
         ConfirmedNoAttachment = 3,
     };
 
+    /// What a Header::spamState value means. Ordered by how much the verdict
+    /// behind it is worth, and every path that writes one respects the order:
+    /// the cache upsert keeps MAX() of the old and the new, a body re-score
+    /// gives up against anything from SpamExempt upwards, and the 2.9
+    /// re-derivation sweep leaves those states alone. A verdict may be
+    /// refined, never demoted.
+    enum SpamState {
+        SpamNotScored = 0,
+        SpamFromHeaders = 1,
+        SpamWithBody = 2,
+        /// Rule 0 (a known correspondent), or a folder that is not scored at
+        /// all. Reached by the filter deciding not to judge, which is a weaker
+        /// thing than the user deciding for it.
+        SpamExempt = 3,
+        /// The user answered for this message: "Not spam", or a drag out of
+        /// the junk folder. Nothing the scorer computes may overwrite it, and
+        /// it is what MailStore::userClearedMessageIds() looks for so that the
+        /// answer survives the move that expressed it.
+        SpamUserCleared = 4,
+    };
+
     /// Whether \a kind (an AttachKind) means "show the paperclip".
     static constexpr bool kindHasAttachment(int kind)
     {
@@ -79,9 +100,9 @@ public:
         /// Local spam heuristics (spamheuristics.h). The score is kept rather
         /// than a boolean so a threshold change re-judges cached mail.
         int spamScore = 0;
-        /// 0 never scored, 1 scored from headers, 2 scored with the body,
-        /// 3 exempt under Rule 0 (a known correspondent).
-        int spamState = 0;
+        /// A SpamState: how much was known when the score was computed, and
+        /// hence what may overwrite it.
+        int spamState = SpamNotScored;
         QString spamDetail;      ///< one line per rule that fired
         /// RFC 5322 Message-ID with the angle brackets stripped. Stable across
         /// folders and UIDVALIDITY resets, unlike uid.
@@ -165,6 +186,9 @@ public:
     void setSpamVerdict(qint64 uid, int score, int state, const QString &detail);
     /// The stored verdict state of a row, or 0 when it is not listed.
     int spamStateOf(qint64 uid) const;
+    /// Unmarks every loaded row from \a address and records the user's answer
+    /// on them. The in-memory half of MailStore::clearSpamVerdictsFrom().
+    int clearSpamFrom(const QString &address);
     int colorLabelAt(int row) const;
     void setColorLabel(qint64 uid, int color);
     /// Drops the given uids from the model (visible and hidden lists).

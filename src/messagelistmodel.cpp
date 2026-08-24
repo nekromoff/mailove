@@ -70,7 +70,7 @@ QVariant MessageListModel::data(const QModelIndex &index, int role) const
         // Only the confident tail is shown. "Unsure" deliberately renders as
         // nothing at all: a maybe-mark on an ordinary message is a false
         // positive the reader still has to spend attention dismissing.
-        return h.spamState != 3 && h.spamScore >= SpamHeuristics::spamThreshold();
+        return h.spamState < SpamExempt && h.spamScore >= SpamHeuristics::spamThreshold();
     case SpamDetailRole:
         return h.spamDetail;
     }
@@ -432,7 +432,7 @@ bool MessageListModel::spamAt(int row) const
     // Same test as SpamRole, deliberately: what the list marks and what the
     // menu offers to undo have to be the same message.
     const Header &h = m_all.at(m_rows.at(row));
-    return h.spamState != 3 && h.spamScore >= SpamHeuristics::spamThreshold();
+    return h.spamState < SpamExempt && h.spamScore >= SpamHeuristics::spamThreshold();
 }
 
 void MessageListModel::removeByUids(const QList<qint64> &uids)
@@ -500,8 +500,8 @@ void MessageListModel::clearSpam(qint64 uid)
         return;
     const int allIndex = it.value();
     Header &h = m_all[allIndex];
-    h.spamScore = 0;
-    h.spamState = 3;
+    h.spamScore = SpamHeuristics::UserNotSpamWeight;
+    h.spamState = SpamUserCleared;
     h.spamDetail.clear();
     const int row = visibleRowOf(allIndex);
     if (row >= 0) {
@@ -510,15 +510,43 @@ void MessageListModel::clearSpam(qint64 uid)
     }
 }
 
+int MessageListModel::clearSpamFrom(const QString &address)
+{
+    const QString needle = SpamHeuristics::normalizeAddress(address);
+    if (needle.isEmpty())
+        return 0;
+    // The listed half of MailStore::clearSpamVerdictsFrom(): the open folder is
+    // already in memory, and a stored verdict nothing re-reads would leave the
+    // mark on screen until the folder was reopened.
+    int cleared = 0;
+    for (qsizetype i = 0; i < m_all.size(); ++i) {
+        Header &h = m_all[i];
+        if (h.spamState >= SpamUserCleared
+            || SpamHeuristics::normalizeAddress(SpamHeuristics::addressOf(h.from)) != needle) {
+            continue;
+        }
+        h.spamScore = SpamHeuristics::UserNotSpamWeight;
+        h.spamState = SpamUserCleared;
+        h.spamDetail.clear();
+        ++cleared;
+        if (const int row = visibleRowOf(int(i)); row >= 0) {
+            const QModelIndex idx = index(row, 0);
+            Q_EMIT dataChanged(idx, idx, {SpamRole, SpamDetailRole});
+        }
+    }
+    return cleared;
+}
+
 void MessageListModel::setSpamVerdict(qint64 uid, int score, int state, const QString &detail)
 {
     const auto it = m_byUid.constFind(uid);
     if (it == m_byUid.constEnd())
         return;
     Header &h = m_all[it.value()];
-    // State 3 is the user's own answer — "not spam", or the known-correspondent
-    // exemption. A body-stage re-score knows strictly less than that.
-    if (h.spamState == 3)
+    // From SpamExempt upwards the verdict came from something a body-stage
+    // re-score knows strictly less than: the known-correspondent exemption, or
+    // the user's own answer.
+    if (h.spamState >= SpamExempt)
         return;
     h.spamScore = score;
     h.spamState = state;

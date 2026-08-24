@@ -314,6 +314,10 @@ const AdvancedConfig::Knob kSchema[] = {
      "Calls itself a well-known brand from a domain that brand does not send from."},
     {"spamrules/charset-mismatch", Type::Int, 8, -999, 999, Reload::Live,
      "The subject was needlessly encoded, which hides it from simple filters."},
+    {"spamrules/cyrillic-script", Type::Int, 50, -999, 999, Reload::Live,
+     "The subject or the sender's name is written in Cyrillic. Decisive by default; "
+     "turn it down or off if you correspond in Cyrillic (known correspondents are "
+     "always exempt)."},
     {"spamrules/date-skew", Type::Int, 15, -999, 999, Reload::Live,
      "The Date header is hours away from when the message actually arrived."},
     {"spamrules/display-name-address", Type::Int, 30, -999, 999, Reload::Live,

@@ -510,6 +510,32 @@ void testJunkFolderIsDecisive()
     check(!fired(elsewhere, "junk-folder") && elsewhere.total == 0,
           QStringLiteral("the rule is about the folder, nothing else (%1)")
               .arg(hitList(elsewhere)));
+
+    // The reverse fact, which is the user speaking rather than being spoken
+    // for: they took this message out of the junk folder. It has to beat the
+    // folder rule outright — a rescued message whose old copy is still filed
+    // as junk is the disagreement the user was settling — and it has to beat
+    // any pile of accusations the message itself attracts, or a false positive
+    // could not be corrected at all.
+    SpamHeuristics::Context rescued = junk;
+    rescued.userNotSpam = true;
+    const SpamHeuristics::Score cleared = SpamHeuristics::score(headOnly(ordinary), rescued);
+    check(fired(cleared, "user-not-spam") && !fired(cleared, "junk-folder"),
+          QStringLiteral("the user's rescue replaces the junk-folder rule (%1)")
+              .arg(hitList(cleared)));
+    check(cleared.verdict == SpamHeuristics::Verdict::Ham,
+          QStringLiteral("…and the message comes out unmarked (total %1)").arg(cleared.total));
+
+    SpamHeuristics::Message loaded;
+    loaded.head = QByteArray(ordinary);
+    loaded.attachmentNames = {QStringLiteral("invoice.pdf.exe")};
+    loaded.text = QStringLiteral("CLICK HERE http://bit.ly/x to claim your prize now!!!");
+    const SpamHeuristics::Score stillClear = SpamHeuristics::score(loaded, rescued);
+    check(stillClear.verdict == SpamHeuristics::Verdict::Ham
+              && stillClear.total < SpamHeuristics::UnsureThreshold,
+          QStringLiteral("no accumulation of rules overturns it (total %1: %2)")
+              .arg(stillClear.total)
+              .arg(hitList(stillClear)));
 }
 
 /// The scorer reads the raw head, where any non-ASCII header travels as an
@@ -573,6 +599,44 @@ void testEncodedHeaders()
     check(!fired(real, "subject-confusable"),
           QStringLiteral("...and its mojibake does not read as a homoglyph (%1)")
               .arg(hitList(real)));
+
+    // cyrillic-script: decisive on a Cyrillic subject, decisive on a Cyrillic
+    // sender name, and silent for Latin text however accented — the rule is a
+    // script test, not a "foreign-looking" test, and Slovak diacritics are
+    // exactly the mail this mailbox lives on.
+    const SpamHeuristics::Score cyrSubj = SpamHeuristics::score(
+        headOnly("Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+                 " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+                 "From: Sender <s@x1z.test>\r\n"
+                 "To: You <you@example.org>\r\n"
+                 "Subject: =?UTF-8?B?0J/RgNC40LLQtdGC?=\r\n"
+                 "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+                 "Message-ID: <cy1@x1z.test>\r\n"),
+        {});
+    check(fired(cyrSubj, "cyrillic-script"),
+          QStringLiteral("a Cyrillic subject fires cyrillic-script (%1)").arg(hitList(cyrSubj)));
+    const SpamHeuristics::Score cyrName = SpamHeuristics::score(
+        headOnly("Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+                 " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+                 "From: =?UTF-8?B?0JjQstCw0L0g0J/QtdGC0YDQvtCy?= <s@x1z.test>\r\n"
+                 "To: You <you@example.org>\r\n"
+                 "Subject: Hello\r\n"
+                 "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+                 "Message-ID: <cy2@x1z.test>\r\n"),
+        {});
+    check(fired(cyrName, "cyrillic-script"),
+          QStringLiteral("a Cyrillic sender name fires it too (%1)").arg(hitList(cyrName)));
+    const SpamHeuristics::Score slovak = SpamHeuristics::score(
+        headOnly("Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+                 " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+                 "From: Sender <s@x1z.test>\r\n"
+                 "To: You <you@example.org>\r\n"
+                 "Subject: =?UTF-8?B?UG96dsOhbmthIG5hIHNjaMO0ZHp1?=\r\n"
+                 "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+                 "Message-ID: <cy3@x1z.test>\r\n"),
+        {});
+    check(!fired(slovak, "cyrillic-script"),
+          QStringLiteral("accented Latin does not (%1)").arg(hitList(slovak)));
 
     // Two encoded words joined across transport whitespace stay one word —
     // splitting mid-word is how long names travel, and a space inserted there
