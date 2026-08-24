@@ -1,3 +1,53 @@
+mailove (3.2) unstable; urgency=medium
+
+  * "Not spam" now sticks. Taking a message out of the junk folder, or saying
+    Not spam about it, is recorded against both that message and its sender
+    and outweighs every rule in the filter - the exact mirror of the weight a
+    message carries for sitting in Junk. It survives the move that expresses
+    it (the rescued copy is deleted and recreated under a new uid, so the
+    answer is carried by Message-ID), it clears the mark from that sender's
+    other cached mail in every folder, and no later re-score can put it back.
+    Unlike the recipients allowlist it is not revoked by an authentication
+    failure, because the mail people rescue is very often mail that fails SPF
+    or DKIM for reasons of the sender's own.
+  * Cyrillic in a subject or a sender's name is now scored, and enough on its
+    own to mark a message at the default threshold. This is a per-mailbox
+    judgement rather than a linguistic one: unsolicited Russian-language bulk
+    is usually authenticated and DKIM-clean from a domain the sender owns, so
+    nothing else here catches it. A mailbox that corresponds in Cyrillic turns
+    the weight down or off under [spamrules], and a known correspondent is
+    exempt before the rule is ever reached.
+  * Subjects encoded in windows-1251 are decoded properly instead of falling
+    back to Latin-1, which turned Cyrillic into accented Latin and hid it from
+    the rule above.
+  * The activity log can show what the spam filter decided and why: a "Spam
+    decisions" view listing, per message scored, the sender, every rule that
+    fired with its weight, the total and the verdict. Rule identifiers only,
+    never the subject or the evidence text, and addresses are masked with the
+    rest of the log. The verdicts are kept out of the other views, being one
+    or two lines per message and enough to bury everything else. The log's
+    Clear button is gone; the file recycles itself and saving a copy does not
+    need the window emptied first.
+  * Sending from a client left open for hours no longer fails. SMTP dials and
+    authenticates per message out of the OAuth token taken when the backend
+    connected, and that copy dies within the hour while the IMAP session it
+    was minted with stays up - so the token is now renewed before dialling,
+    and the request is coalesced so several sends cannot each start their own.
+    A refused SMTP login is also read as an authentication problem rather than
+    a protocol one, which sends the mail to the outbox to renew and retry
+    instead of stranding it in the composer as a permanent rejection.
+  * Dismissing the PGP passphrase prompt sends the message unsigned instead of
+    failing the send and putting you back in front of the same prompt.
+    Encryption is unaffected - it never needed the passphrase.
+  * Hovering a link in a message shows its full address in a tooltip. Scripts
+    are off in the message view and there is no status bar, so until now there
+    was no way to see where a link went before clicking it.
+  * Cache writes no longer wait on the disk for every transaction
+    (synchronous=NORMAL alongside the write-ahead log), which is what made
+    listing and syncing large folders stall.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Mon, 24 Aug 2026 12:00:00 +0200
+
 mailove (3.1) unstable; urgency=medium
 
   * Hostile CSS in a message can no longer reach the network the way it could.

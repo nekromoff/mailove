@@ -33,6 +33,35 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.2" date="2026-08-24" type="stable">
+      <description>
+        <ul>
+          <li>"Not spam" now sticks. Rescuing a message from the junk folder
+              is recorded against the message and its sender, outweighs every
+              rule in the filter, survives the move that expresses it, clears
+              the mark from that sender's other cached mail, and cannot be
+              undone by a later re-score.</li>
+          <li>Cyrillic in a subject or sender name is now scored, and is
+              enough on its own to mark a message at the default threshold -
+              a per-mailbox judgement, turned down or off under [spamrules].
+              Subjects encoded in windows-1251 are decoded properly instead
+              of falling back to Latin-1.</li>
+          <li>The activity log can show what the spam filter decided and why:
+              per message, the sender, each rule that fired with its weight,
+              the total and the verdict. Rule identifiers only, never the
+              subject, with addresses masked as everywhere else.</li>
+          <li>Sending from a client left open for hours no longer fails. The
+              OAuth token is renewed before SMTP dials rather than reusing
+              the copy taken at connect, and a refused login sends the mail
+              to the outbox to retry instead of stranding it in the composer
+              as a permanent rejection.</li>
+          <li>Dismissing the PGP passphrase prompt sends the message unsigned
+              instead of failing the send. Hovering a link in a message shows
+              its full address. Cache writes no longer wait on the disk for
+              every transaction, which is what stalled large folders.</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.1" date="2026-08-19" type="stable">
       <description>
         <ul>
