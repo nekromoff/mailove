@@ -150,8 +150,17 @@ public:
     /// Emits cacheMigrationsFinished() when the last one is done, which is what
     /// the background jobs wait for: the search-index rebuild reads the very
     /// index one of these steps replaces.
+    /// \a bodyHash is handed through to MailStore::runMigration() for the
+    /// junk_hash1 seed — the client's MIME parser, on loan to the store.
+    /// Restarts the body writer if it has stopped and there is queued work.
+    /// Every pause path (a migration run, a reclaim) asks it to stop *without*
+    /// joining, so it leaves a finished QThread behind that must be reaped
+    /// before a new one can take over.
+    void reviveBodyWriter();
+
     void startCacheMigrations(const QString &account,
-                              std::function<bool(const QString &)> isOutgoing);
+                              std::function<bool(const QString &)> isOutgoing,
+                              std::function<QString(const QByteArray &)> bodyHash = {});
 
     /// Announces a migration's progress from a worker thread. Public so that a
     /// future migration living elsewhere can drive the same modal; always call

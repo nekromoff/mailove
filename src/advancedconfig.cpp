@@ -350,6 +350,9 @@ const AdvancedConfig::Knob kSchema[] = {
      "The message body contains a password box. A real sign-in page never is one."},
     {"spamrules/image-only", Type::Int, 12, -999, 999, Reload::Live,
      "Nearly the whole message is one image, with no text a filter could read."},
+    {"spamrules/junk-content-match", Type::Int, 50, -999, 999, Reload::Live,
+     "The plain-text body is identical to a message you moved to spam — the same "
+     "campaign under a fresh envelope. Decisive at the default threshold."},
     {"spamrules/junk-folder", Type::Int, 999, -999, 999, Reload::Live,
      "The message is already in a junk folder. Far above the threshold on purpose: it is "
      "a decision you or your server made, not a guess. 0 makes junk folders score like "

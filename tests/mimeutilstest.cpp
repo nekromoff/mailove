@@ -25,6 +25,7 @@
 
 #include <QByteArray>
 #include <QCoreApplication>
+#include <QGuiApplication>
 #include <QDir>
 #include <QStandardPaths>
 #include <QTextStream>
@@ -98,7 +99,11 @@ std::shared_ptr<KMime::Message> buildMessage(const QByteArray &big, const QByteA
 
 int main(int argc, char **argv)
 {
-    QCoreApplication app(argc, argv);
+    // QTextDocument::toMarkdown() asks QFontDatabase whether a block is fixed
+    // pitch, and QFontDatabase is fatal without a QGuiApplication — so this
+    // test needs one, offscreen as viewertest does it. Nothing here draws.
+    qputenv("QT_QPA_PLATFORM", "offscreen");
+    QGuiApplication app(argc, argv);
     // Both together are what redirect AppDataLocation — where AttachmentStore
     // writes its payload files — away from the real cache.
     QCoreApplication::setApplicationName(QStringLiteral("mailove-mimeutilstest"));
@@ -376,6 +381,45 @@ int main(int argc, char **argv)
         check(MimeUtils::flattenMarkdownTables(QStringLiteral("a | b in prose"))
                   == QStringLiteral("a | b in prose"),
               "a pipe mid-sentence is not table furniture");
+    }
+
+    // --- html to markdown, shared by both Copy as Markdown actions --------
+    {
+        check(MimeUtils::htmlToMarkdown(QStringLiteral("<p>Hello <b>there</b></p>"))
+                  == QStringLiteral("Hello **there**"),
+              "inline markup converts");
+        check(MimeUtils::htmlToMarkdown(QStringLiteral("<p>one<br>two</p>"))
+                  == QStringLiteral("one\n\ntwo"),
+              "a <br> is a real break, not a soft one renderers rejoin");
+        // Images: the reference is worthless outside mailove (cid:) or a read
+        // receipt waiting to fire (remote), so only the author's alt survives.
+        check(MimeUtils::htmlToMarkdown(
+                  QStringLiteral("<p><img src=\"cid:x@y\" alt=\"Company logo\">Hi</p>"))
+                  == QStringLiteral("Company logoHi"),
+              "a cid: image leaves its alt text behind");
+        check(!MimeUtils::htmlToMarkdown(
+                   QStringLiteral("<p><img src=\"https://track.test/pixel.gif\">Hi</p>"))
+                   .contains(QLatin1String("track.test")),
+              "a remote image's URL does not ride out on the clipboard");
+        check(MimeUtils::htmlToMarkdown(QStringLiteral("<p><img src=\"cid:z\">Hi</p>"))
+                  == QStringLiteral("Hi"),
+              "an image with no alt leaves nothing");
+        // The newsletter button: an image wrapped in a tracking link. With the
+        // image gone the label is empty, and "[ ](https://…)" renders as a
+        // blank nobody can click or read.
+        check(MimeUtils::htmlToMarkdown(
+                  QStringLiteral("<a href=\"https://t.test/l?m=1\"><img src=\"cid:b\"></a>"))
+                  == QStringLiteral("https://t.test/l?m=1"),
+              "an image-only link becomes the plain URL, not an empty label");
+        check(MimeUtils::htmlToMarkdown(
+                  QStringLiteral("<a href=\"https://t.test/l\"><img src=\"cid:b\" "
+                                 "alt=\"Read online\"></a>"))
+                  == QStringLiteral("[Read online](https://t.test/l)"),
+              "...but alt text still makes a proper label");
+        check(MimeUtils::htmlToMarkdown(QStringLiteral("<a href=\"https://e.test/\">Link</a>"))
+                  == QStringLiteral("[Link](https://e.test/)"),
+              "a link keeps its target — the whole reason not to copy plain text");
+        check(MimeUtils::htmlToMarkdown(QString()).isEmpty(), "empty html converts to nothing");
     }
 
     out << (failures == 0 ? "all mime utils tests passed\n"

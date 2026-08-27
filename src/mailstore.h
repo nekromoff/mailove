@@ -69,9 +69,16 @@ public:
     /// indeterminate. \a cancelled is polled between slices — a step that stops
     /// early leaves its flag unset and resumes from the start next launch, so
     /// every one of them is written to be safe to re-run.
+    /// \a bodyHash maps a raw cached body to its SpamHeuristics::contentHash()
+    /// — parsing MIME is not the store's business, so the junk_hash1 backfill
+    /// borrows the client's parser through it (MailClient::rawBodyHash). A
+    /// caller without one leaves that step unfinished, to resume on a launch
+    /// that has it; latching it done instead would silently skip the backfill
+    /// for good.
     static void runMigration(QSqlDatabase &db, const Migration &step, const QString &account,
                              const std::function<void(int)> &progress,
-                             const std::function<bool()> &cancelled);
+                             const std::function<bool()> &cancelled,
+                             const std::function<QString(const QByteArray &)> &bodyHash = {});
 
     QStringList cachedFolders(const QString &account);
     void storeFolders(const QString &account, const QStringList &folders);
@@ -568,6 +575,17 @@ public:
     /// known-contact-spoofed — accepted deliberately, because the alternative is
     /// a "Not spam" button that does not work on the mail it is pressed on.
     void setNotSpamSender(const QString &address, bool notSpam);
+
+    /// The junk-content corpus: normalized plain-text fingerprints
+    /// (SpamHeuristics::contentHash()) of messages the user moved to spam —
+    /// plus, once, what the junk_hash1 backfill found already filed there.
+    /// Global rather than per account on purpose: spam content is spam
+    /// whichever mailbox received it.
+    void addJunkContentHash(const QString &hash);
+    /// The reverse gesture, from a rescue or "Not spam": content the user has
+    /// pulled back out must stop matching, or the correction never sticks.
+    void removeJunkContentHash(const QString &hash);
+    bool junkContentHashKnown(const QString &hash);
     /// The subset of \a addresses on that list, normalized. Batched per FETCH
     /// like knownCorrespondents(), which it is scored alongside.
     QSet<QString> notSpamSenders(const QSet<QString> &addresses);

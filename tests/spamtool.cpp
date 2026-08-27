@@ -11,6 +11,7 @@
 //   ./spamtool --auth-pass msg.eml          ...or passed
 //   ./spamtool --arc-pass msg.eml           ...or failed only because of a relay (ARC)
 //   ./spamtool --junk msg.eml               score as if it sat in the Junk folder
+//   ./spamtool --junk-content msg.eml       score as if its text matched junked mail
 //   ./spamtool --crypto 2 msg.eml           score as OpenPGP signed (1 enc, 2 sig, 3 both)
 //   ./spamtool --familiar-tld sk            score as if your own mail goes to .sk
 //   ./spamtool --quiet ...                  totals only, no per-message lines
@@ -485,6 +486,10 @@ int main(int argc, char **argv)
             base.arcPassed = true;
         else if (arg == QLatin1String("--junk"))
             base.inJunkFolder = true;
+        // Simulated, like --auth-pass: a corpus on disk has no junk-content
+        // table behind it to be looked up in.
+        else if (arg == QLatin1String("--junk-content"))
+            base.junkContentMatch = true;
         else if (arg == QLatin1String("--crypto"))
             base.crypto = next().toInt();
         // Simulated sender-domain history, the way --auth-pass simulates a

@@ -157,6 +157,15 @@ struct Context {
     /// signed or encrypted to the recipient's key is not a thing that happens.
     int crypto = 0;
 
+    /// The plain-text body, run through contentHash(), matches a message the
+    /// user moved to the junk folder (MailStore::junkContentHashKnown()).
+    /// Body-pass only by nature: at list-build time there is no text to hash,
+    /// so this joins the score when the body arrives, like every other body
+    /// rule. Never set for mail already sitting in junk — the junk-folder rule
+    /// owns that fact, and a junked message would otherwise match its own
+    /// fingerprint.
+    bool junkContentMatch = false;
+
     /// The message is sitting in a junk/spam folder.
     ///
     /// Decisive, and the only signal here that outranks Rule 0. Everything else
@@ -280,5 +289,19 @@ QString tldOf(const QString &address);
 /// the full domain when the list has not loaded, which can only ever make two
 /// domains look *less* related — the safe direction.
 QString organizationalDomainOf(const QString &address);
+
+/// A fingerprint of a message's plain-text body: whitespace collapsed, case
+/// folded, SHA-256, hex. What the junk-content corpus stores and what arriving
+/// mail is looked up by — so both sides must come through this one function,
+/// never hash on their own. Empty for text too short to be distinctive: the
+/// hash of nothing would match every other empty body.
+QString contentHash(const QString &text);
+
+/// The name heuristic for "is this mailbox a junk folder": the localized names
+/// the major providers use, plus a substring test on the two roots. Shared
+/// between MailClient::isJunkFolder() — which asks the server's special-use
+/// answer first — and the cache-side users that have no server to ask (the
+/// junk_hash1 backfill walking every account's folders).
+bool folderNameLooksJunk(const QString &mailBox);
 
 } // namespace SpamHeuristics

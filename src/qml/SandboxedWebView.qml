@@ -73,6 +73,18 @@ WebEngineView {
         property bool hasSelection: false
         property url linkUrl: ""
 
+        // First, and the only entry that works without a selection: the
+        // common case is wanting the message, not part of it, and reaching
+        // that through Select all → Copy made the reader do the renderer's
+        // work. Converted from the sanitized HTML part directly, so it needs
+        // no selection and no round trip through the clipboard. Named for
+        // the common case; the selection variant below carries the qualifier.
+        QQC2.MenuItem {
+            text: "Copy as Markdown"
+            icon.name: "edit-copy"
+            onTriggered: Mail.copyMessageAsMarkdown()
+        }
+        QQC2.MenuSeparator {}
         QQC2.MenuItem {
             text: "Copy"
             icon.name: "edit-copy"
@@ -80,7 +92,7 @@ WebEngineView {
             onTriggered: view.triggerWebAction(WebEngineView.Copy)
         }
         QQC2.MenuItem {
-            text: "Copy as Markdown"
+            text: "Copy selection as Markdown"
             icon.name: "edit-copy"
             enabled: contextMenu.hasSelection
             // The renderer's Copy puts the selection's HTML flavour on the

@@ -8,6 +8,7 @@
 #include <QHash>
 #include <QRegularExpression>
 #include <QTextBlock>
+#include <QTextCursor>
 #include <QTextDocument>
 #include <QTextFragment>
 #include <QUrl>
@@ -350,6 +351,77 @@ QString plainTextWithLinks(const QString &html)
     if (!out.isEmpty())
         out.chop(1); // the loop's trailing block separator
     return out;
+}
+
+QString htmlToMarkdown(const QString &html)
+{
+    QTextDocument doc;
+    doc.setHtml(html);
+    // Images out — on the parsed document, not with a regex over the markup.
+    // toMarkdown() would emit "![](cid:…)", a reference to a part of a message
+    // the paste target has never seen. The parser keeps the author's alt text
+    // as ImageAltText, and alt is written for a reader who cannot see the
+    // picture — which is exactly the reader of the pasted text.
+    QList<std::pair<QTextFragment, std::pair<QString, QTextCharFormat>>> images;
+    for (QTextBlock block = doc.begin(); block.isValid(); block = block.next()) {
+        for (QTextBlock::iterator it = block.begin(); !it.atEnd(); ++it) {
+            const QTextFragment fragment = it.fragment();
+            const QTextCharFormat format = fragment.charFormat();
+            if (!fragment.isValid() || !format.isImageFormat())
+                continue;
+            const QString alt = format.property(QTextFormat::ImageAltText).toString().trimmed();
+            const QString href = format.isAnchor() ? format.anchorHref().trimmed() : QString();
+            // Alt inside a link keeps the link and becomes its label. Alt with
+            // no link is plain text. And the newsletter button — an image that
+            // is the whole content of a link, no alt — would otherwise take
+            // the href with it when it goes, or leave "[ ](https://…)", a
+            // label nobody can read or click; the address itself is the honest
+            // thing to leave behind, as text rather than as a link labelled
+            // with its own address.
+            QTextCharFormat replacementFormat;
+            if (!alt.isEmpty() && !href.isEmpty()) {
+                replacementFormat.setAnchor(true);
+                replacementFormat.setAnchorHref(href);
+            }
+            images.append({fragment, {alt.isEmpty() ? href : alt, replacementFormat}});
+        }
+    }
+    // Back to front: each edit shifts every position after it.
+    for (auto it = images.crbegin(); it != images.crend(); ++it) {
+        QTextCursor cursor(&doc);
+        cursor.setPosition(it->first.position());
+        cursor.setPosition(it->first.position() + it->first.length(), QTextCursor::KeepAnchor);
+        // insertText on a selection replaces it; an empty string deletes.
+        cursor.insertText(it->second.first, it->second.second);
+    }
+    // <br> parses to line-separator characters, which toMarkdown() emits as
+    // bare newlines — soft breaks that renderers join into one line. Promoted
+    // to real paragraph breaks, they survive as the separate lines the reader
+    // saw. (The writer's own 80-column prose wrapping also emits bare
+    // newlines, so this cannot be fixed after the fact — only here, where the
+    // two are still distinguishable.)
+    for (QTextCursor cursor(&doc);;) {
+        cursor = doc.find(QString(QChar::LineSeparator), cursor);
+        if (cursor.isNull())
+            break;
+        cursor.insertBlock();
+    }
+    // Layout-table furniture stripped (with blank runs capped) — the paste
+    // target gets content, not a diagram of the newsletter's grid.
+    QString markdown =
+        flattenMarkdownTables(doc.toMarkdown(QTextDocument::MarkdownDialectGitHub)).trimmed();
+    // A link whose only content was an image has no label left once the image
+    // is gone, and Qt writes it as "[ ](https://…)" — a link that renders as
+    // a blank you cannot click and cannot read. Every tracking-link button in
+    // a newsletter is one of these. Emitted as the bare URL instead: still
+    // the whole address, still one click in anything that autolinks, and it
+    // says where it goes. (Over generated Markdown, not over the message's
+    // markup — the house rule is about parsing mail, and this is our own
+    // output, line-oriented like flattenMarkdownTables above.)
+    static const QRegularExpression emptyLinkRe(
+        QStringLiteral("(?<!!)\\[[ \\t]*\\]\\(\\s*([^()\\s]+)\\s*\\)"));
+    markdown.replace(emptyLinkRe, QStringLiteral("\\1"));
+    return markdown;
 }
 
 QString flattenMarkdownTables(const QString &markdown)

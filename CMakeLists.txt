@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailove VERSION 3.2 LANGUAGES CXX)
+project(mailove VERSION 3.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -433,6 +433,24 @@ qt_add_executable(storetest tests/storetest.cpp
 target_include_directories(storetest PRIVATE src)
 target_link_libraries(storetest PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql PkgConfig::ZSTD)
 
+# The body writer across a pause: that a fetched body still reaches the cache
+# after a migration run has stopped the writer, and that one queued during the
+# pause is not stranded. Regression cover for a writer that died silently and
+# left the cache to stop filling. Exit 0 = every check passed.
+qt_add_executable(bodywritertest tests/bodywritertest.cpp
+    src/maintenancescheduler.cpp src/maintenancescheduler.h
+    src/mailstore.cpp src/mailstore.h
+    src/mimeutils.cpp src/mimeutils.h
+    src/messagelistmodel.cpp src/messagelistmodel.h
+    src/attachmentstore.cpp src/attachmentstore.h
+    src/spamheuristics.cpp src/spamheuristics.h
+    src/publicsuffixlist.cpp src/publicsuffixlist.h
+    src/advancedconfig.cpp src/advancedconfig.h)
+target_include_directories(bodywritertest PRIVATE src)
+target_link_libraries(bodywritertest PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql PkgConfig::ZSTD KPim6::Mime KF6::Codecs)
+set_target_properties(bodywritertest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)
+
 # The deferred cache migrations, against a legacy-shaped throwaway database:
 # what is reported pending, what each step does to the rows, that they are safe
 # to re-run, and that a cancelled one resumes. Exit 0 = every check passed.
@@ -622,10 +640,40 @@ if(MAILOVE_HAVE_OPENPGP)
     list(APPEND _mailove_tests pgpkeytool)
 endif()
 
-# Keep the test and diagnostic targets out of the build root: both the
-# binaries and the AUTOMOC/AUTOUIC scratch dirs land under build/tests/.
+# Keep the test and diagnostic binaries out of the build root. Their AUTOMOC
+# scratch dirs are handled by the sweep below, which covers every target rather
+# than only the ones listed here.
 foreach(_test ${_mailove_tests})
     set_target_properties(${_test} PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
-        AUTOGEN_BUILD_DIR "${CMAKE_BINARY_DIR}/tests/${_test}_autogen")
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+endforeach()
+
+# Every AUTOMOC/AUTOUIC scratch directory goes under build/autogen/, instead of
+# a <target>_autogen dropped beside it — which for anything built in this
+# directory means the build root.
+#
+# Swept over the directory's targets rather than written per target on purpose.
+# The per-target version was already here and still leaked: a target has to
+# remember to opt in, several never did (accountstoretest, mimeutilstest,
+# advancedconfigtest, spamheuristicstest, updatechecktool), and every target
+# added later starts out forgetting too. Sweeping is the version that cannot be
+# forgotten.
+#
+# mailove is deliberately not touched here: its AUTOGEN_BUILD_DIR has to be set
+# before qt_add_qml_module() bakes the path into the metatypes dependency, so it
+# is set up there instead — to the same build/autogen/ location.
+get_property(_mailove_all_targets
+    DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" PROPERTY BUILDSYSTEM_TARGETS)
+foreach(_target ${_mailove_all_targets})
+    if(_target STREQUAL "mailove")
+        continue()
+    endif()
+    get_target_property(_target_type ${_target} TYPE)
+    # UTILITY and INTERFACE targets compile nothing, so they have no autogen
+    # directory to place.
+    if(_target_type STREQUAL "UTILITY" OR _target_type STREQUAL "INTERFACE_LIBRARY")
+        continue()
+    endif()
+    set_target_properties(${_target} PROPERTIES
+        AUTOGEN_BUILD_DIR "${CMAKE_BINARY_DIR}/autogen/${_target}_autogen")
 endforeach()

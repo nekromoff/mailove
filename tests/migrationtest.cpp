@@ -18,6 +18,7 @@
  */
 
 #include "../src/mailstore.h"
+#include "../src/spamheuristics.h"
 
 #include <QCoreApplication>
 #include <QDateTime>
@@ -163,6 +164,13 @@ int main(int argc, char **argv)
     body(imported, 3, plain);
     body(QStringLiteral("INBOX"), 0, plain); // ghost body
     body(QStringLiteral("INBOX"), 5, plain);
+    // A junk folder, for the junk_hash1 seed: its text must end up
+    // fingerprinted, the inbox's must not. Twice on purpose — the same
+    // campaign filed twice is still one fingerprint.
+    const QByteArray junkRaw =
+        "Subject: deal\r\n\r\nBUY CHEAP MEDS NOW best prices guaranteed click here fast\r\n";
+    body(QStringLiteral("Spam"), 51, junkRaw);
+    body(QStringLiteral("Spam"), 52, junkRaw);
 
     // An index keyed the old way (its own rowids, not the messages' ones).
     exec(db, QStringLiteral(
@@ -185,7 +193,8 @@ int main(int argc, char **argv)
           QStringLiteral("…first, before anything reads rows by their scoped key"));
     check(flags.contains(QLatin1String("ghost_sweep1"))
               && flags.contains(QLatin1String("raw_refetch_29"))
-              && flags.contains(QLatin1String("attach_backfill")),
+              && flags.contains(QLatin1String("attach_backfill"))
+              && flags.contains(QLatin1String("junk_hash1")),
           QStringLiteral("every deferred step is listed on a cache that has had none"));
     check(!store.pendingMigrations(QString()).isEmpty()
               && !QStringList(store.pendingMigrations(QString()).first().flag)
@@ -207,8 +216,15 @@ int main(int argc, char **argv)
             ++reports;
     };
     const auto never = [] { return false; };
+    // The junk seed's parser stub: fixtures' bodies are plain bytes, so their
+    // "plain text" is the raw itself. What matters is that the seed and the
+    // checks below fingerprint through the same function, exactly as the
+    // client and the scorer share MailClient::rawBodyHash().
+    const auto hasher = [](const QByteArray &raw) {
+        return SpamHeuristics::contentHash(QString::fromUtf8(raw));
+    };
     for (const auto &s : steps)
-        MailStore::runMigration(db, s, account, progress, never);
+        MailStore::runMigration(db, s, account, progress, never, hasher);
 
     check(reports > 0,
           QStringLiteral("the steps report progress, so the modal can show a bar and an estimate"));
@@ -264,6 +280,15 @@ int main(int argc, char **argv)
     check(count(db, QStringLiteral("SELECT COUNT(*) FROM fts_pending")) > 0,
           QStringLiteral("cached bodies are queued for background text indexing"));
 
+    check(count(db, QStringLiteral("SELECT COUNT(*) FROM junk_content_hashes")) == 1,
+          QStringLiteral("the junk seed fingerprints spam-folder bodies, deduplicated"));
+    check(store.junkContentHashKnown(
+              SpamHeuristics::contentHash(QString::fromUtf8(junkRaw))),
+          QStringLiteral("…by the same fingerprint the scorer computes"));
+    check(!store.junkContentHashKnown(
+              SpamHeuristics::contentHash(QString::fromUtf8(withAttachment))),
+          QStringLiteral("…and inbox mail taught it nothing"));
+
     // --- and never again ---------------------------------------------------
 
     out() << "idempotence" << Qt::endl;
@@ -272,7 +297,7 @@ int main(int argc, char **argv)
           QStringLiteral("nothing is pending once they have run"));
     const qint64 settled = count(db, QStringLiteral("SELECT COUNT(*) FROM messages"));
     for (const auto &s : steps)
-        MailStore::runMigration(db, s, account, progress, never);
+        MailStore::runMigration(db, s, account, progress, never, hasher);
     check(count(db, QStringLiteral("SELECT COUNT(*) FROM messages")) == settled,
           QStringLiteral("running them a second time changes nothing"));
     check(count(db, QStringLiteral(
@@ -343,6 +368,28 @@ int main(int argc, char **argv)
           QStringLiteral("…and the rerun finishes the work"));
     check(store.pendingMigrations(account).isEmpty(),
           QStringLiteral("…and settles the cache"));
+
+    // --- the seed without its parser ----------------------------------------
+
+    out() << "junk seed without a parser" << Qt::endl;
+
+    // A caller with no bodyHash must leave the step unfinished rather than
+    // latch it done with nothing learned — latching would silently skip the
+    // backfill for good.
+    exec(db, QStringLiteral("DELETE FROM meta_flags WHERE flag = 'junk_hash1'"));
+    exec(db, QStringLiteral("DELETE FROM junk_content_hashes"));
+    const MailStore::Migration seed{
+        QStringLiteral("junk_hash1"),
+        QStringLiteral("Learning the mail already in your spam folders")};
+    MailStore::runMigration(db, seed, account, progress, never);
+    check(count(db, QStringLiteral(
+              "SELECT COUNT(*) FROM meta_flags WHERE flag = 'junk_hash1'")) == 0,
+          QStringLiteral("without a parser the seed stays pending, not latched done"));
+    MailStore::runMigration(db, seed, account, progress, never, hasher);
+    check(count(db, QStringLiteral("SELECT COUNT(*) FROM junk_content_hashes")) == 1
+              && count(db, QStringLiteral(
+                     "SELECT COUNT(*) FROM meta_flags WHERE flag = 'junk_hash1'")) == 1,
+          QStringLiteral("…and the launch that has one finishes it"));
 
     db.close();
     db = QSqlDatabase();

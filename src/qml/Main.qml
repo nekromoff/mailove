@@ -710,18 +710,31 @@ Kirigami.ApplicationWindow {
             onTriggered: spam ? messageList.requestNotSpam() : messageList.requestJunk()
         }
         QQC2.MenuSeparator {}
-        // The full-fidelity forward: the original bytes as a message/rfc822
-        // attachment — every image, attachment and signature intact, nothing
-        // stripped or re-rendered. Acts on the open message, which a
-        // right-click follows in practice; a multi-row selection has no
-        // single message to attach.
+        // Same gate as Forward as attachment below, and for the same reason:
+        // this converts the *open* message, and a row that was never opened
+        // may have no cached body to convert. A right-click follows the open
+        // message in practice, so the entry is live whenever it can act.
         QQC2.MenuItem {
-            text: "Forward as attachment"
-            icon.name: "mail-forward"
+            text: "Copy as Markdown"
+            icon.name: "edit-copy"
             enabled: messageMenu.rowCount === 1
                      && Mail.messageModel.uidAt(messageMenu.rows[0]) === messageList.openedUid
+            onTriggered: Mail.copyMessageAsMarkdown()
+        }
+        QQC2.MenuSeparator {}
+        // The full-fidelity forward: the original bytes as a message/rfc822
+        // attachment — every image, attachment and signature intact, nothing
+        // stripped or re-rendered. One .eml per selected row; the open row
+        // comes from its loaded context, so it forwards decrypted. Rows with
+        // nothing cached are reported rather than dropped quietly.
+        QQC2.MenuItem {
+            text: messageMenu.rowCount > 1
+                  ? "Forward " + messageMenu.rowCount + " as attachments"
+                  : "Forward as attachment"
+            icon.name: "mail-forward"
+            enabled: messageMenu.rowCount > 0
             onTriggered: {
-                const r = Mail.forwardAsAttachmentData()
+                const r = Mail.forwardRowsAsAttachmentData(messageMenu.rows)
                 if (r.subject !== undefined)
                     composeSheet().openForward(r)
             }
@@ -3090,66 +3103,149 @@ Kirigami.ApplicationWindow {
                                             Mail.markMessagesRead(rows)
                                     }
 
+                                    // Both restores below re-derive currentIndex, and writing
+                                    // currentIndex drives the view's layout: it positions to the
+                                    // tracked item, which moves contentY, which relays out the rows.
+                                    // Doing that from inside the model's own signal emission re-enters
+                                    // QQuickItemView while it is still processing the same reset — its
+                                    // delegates are already torn down but its item list is not rebuilt
+                                    // yet, and the layout walks a null item and segfaults. Deferring
+                                    // also fixes a subtler wrong: read during the emission, count is
+                                    // still the *old* row count, so a folder change that empties the
+                                    // model looked non-empty here and set currentIndex on nothing.
+                                    property bool resetRestorePending: false
+                                    property bool layoutRestorePending: false
+
+                                    function scheduleResetRestore() {
+                                        // A reconnect storm resets the model once per reopen; coalesce
+                                        // them into a single restore per event-loop turn.
+                                        if (resetRestorePending)
+                                            return
+                                        resetRestorePending = true
+                                        Qt.callLater(restoreAfterReset)
+                                    }
+                                    function restoreAfterReset() {
+                                        resetRestorePending = false
+                                        // The rows under the cursor are different ones
+                                        // now (search/filter/sort) — currentIndex often
+                                        // keeps its old number, so no change signal
+                                        // fires and the preview would show the previous
+                                        // message.
+                                        if (messageList.count <= 0) {
+                                            // openedUid deliberately survives: opening a
+                                            // folder clears the model and *then* fills
+                                            // it, so every refresh passes through an
+                                            // empty model. Forgetting the user's pick
+                                            // here made the restore below a no-op — the
+                                            // first reset wiped it, the second snapped
+                                            // to row 0. A real folder change clears it
+                                            // explicitly at the click instead.
+                                            messageList.currentIndex = -1
+                                            console.debug(traceLog,
+                                                          "mailove: msg reset: empty, keeping uid",
+                                                          messageList.openedUid)
+                                            return
+                                        }
+                                        // A message the user opened is followed by uid,
+                                        // not by row number. An account switch resets
+                                        // this model again when the folder refresh
+                                        // lands, and snapping to row 0 unconditionally
+                                        // threw away a message clicked in between —
+                                        // the click registered, then the reset moved
+                                        // the cursor back to the top.
+                                        const row = messageList.openedUid >= 0
+                                            ? Mail.messageModel.rowForUid(messageList.openedUid) : -1
+                                        messageList.currentIndex = row >= 0 ? row : 0
+                                        // Set explicitly: assigning the same number
+                                        // fires no change signal, which would leave a
+                                        // uid here that is no longer under the cursor.
+                                        // Only when the restore actually failed — if
+                                        // the message was found, the cursor is already
+                                        // on it and its uid is the one to keep.
+                                        if (row < 0) {
+                                            messageList.openedUid =
+                                                Mail.messageModel.uidAt(messageList.currentIndex)
+                                        }
+                                        console.debug(traceLog,
+                                                      "mailove: msg reset: count", messageList.count,
+                                                      "wanted uid", messageList.openedUid,
+                                                      "-> row", row,
+                                                      "current", messageList.currentIndex)
+                                        // Only when the cursor landed on a *different*
+                                        // message than the viewer is showing. A
+                                        // successful restore means the same mail is
+                                        // still under the cursor, and re-fetching it
+                                        // re-parsed the MIME and reloaded the web view
+                                        // on every refresh — three times per message
+                                        // during a reconnect, all on the GUI thread.
+                                        if (row < 0)
+                                            fetchDebounce.restart()
+                                    }
+
+                                    function scheduleLayoutRestore() {
+                                        if (layoutRestorePending)
+                                            return
+                                        layoutRestorePending = true
+                                        Qt.callLater(restoreAfterLayoutChange)
+                                    }
+                                    function restoreAfterLayoutChange() {
+                                        layoutRestorePending = false
+                                        if (messageList.count <= 0) {
+                                            messageList.currentIndex = -1
+                                            return
+                                        }
+                                        // The user just picked a different order and is
+                                        // about to read it from the start; chasing
+                                        // their previously opened message would drop
+                                        // them somewhere in the middle of it.
+                                        if (messageList.sortJumpsToTop) {
+                                            messageList.sortJumpsToTop = false
+                                            messageList.currentIndex = -1
+                                            Qt.callLater(() => messageList.positionViewAtBeginning())
+                                            return
+                                        }
+                                        const row = messageList.openedUid >= 0
+                                            ? Mail.messageModel.rowForUid(messageList.openedUid) : -1
+                                        messageList.currentIndex = row >= 0 ? row : 0
+                                        if (row < 0) {
+                                            messageList.openedUid =
+                                                Mail.messageModel.uidAt(messageList.currentIndex)
+                                            fetchDebounce.restart()
+                                        }
+                                        // Follow the cursor to its new row. Keeping the
+                                        // old scroll offset would leave the view
+                                        // showing unrelated messages — and if it was
+                                        // sitting at the bottom it stays at the bottom,
+                                        // where atYEnd below keeps asking for another
+                                        // page, which lands somewhere else in the new
+                                        // order and leaves it at the bottom again: the
+                                        // list scrolls on by itself. Deferred, because
+                                        // the view has not finished relaying out the
+                                        // rows while this signal is still being
+                                        // delivered.
+                                        Qt.callLater(() => {
+                                            if (messageList.currentIndex >= 0)
+                                                messageList.positionViewAtIndex(
+                                                    messageList.currentIndex, ListView.Center)
+                                        })
+                                        console.debug(traceLog,
+                                                      "mailove: msg re-sorted: count",
+                                                      messageList.count,
+                                                      "uid", messageList.openedUid,
+                                                      "-> row", messageList.currentIndex)
+                                    }
+
                                     // Row indexes shift on re-sort/search — selections
                                     // would silently point at the wrong messages.
                                     Connections {
                                         target: Mail.messageModel
                                         function onModelReset() {
+                                            // Clearing the selection is safe to do inline — it only resets
+                                            // JS state to empty and never touches view geometry, and it has
+                                            // to happen now so nothing in this turn acts on row numbers that
+                                            // point at the previous set of messages.
                                             messageList.clearSelection()
-                                            // The rows under the cursor are different ones
-                                            // now (search/filter/sort) — currentIndex often
-                                            // keeps its old number, so no change signal
-                                            // fires and the preview would show the previous
-                                            // message.
-                                            if (messageList.count <= 0) {
-                                                // openedUid deliberately survives: opening a
-                                                // folder clears the model and *then* fills
-                                                // it, so every refresh passes through an
-                                                // empty model. Forgetting the user's pick
-                                                // here made the restore below a no-op — the
-                                                // first reset wiped it, the second snapped
-                                                // to row 0. A real folder change clears it
-                                                // explicitly at the click instead.
-                                                messageList.currentIndex = -1
-                                                console.debug(traceLog,
-                                                              "mailove: msg reset: empty, keeping uid",
-                                                              messageList.openedUid)
-                                                return
-                                            }
-                                            // A message the user opened is followed by uid,
-                                            // not by row number. An account switch resets
-                                            // this model again when the folder refresh
-                                            // lands, and snapping to row 0 unconditionally
-                                            // threw away a message clicked in between —
-                                            // the click registered, then the reset moved
-                                            // the cursor back to the top.
-                                            const row = messageList.openedUid >= 0
-                                                ? Mail.messageModel.rowForUid(messageList.openedUid) : -1
-                                            messageList.currentIndex = row >= 0 ? row : 0
-                                            // Set explicitly: assigning the same number
-                                            // fires no change signal, which would leave a
-                                            // uid here that is no longer under the cursor.
-                                            // Only when the restore actually failed — if
-                                            // the message was found, the cursor is already
-                                            // on it and its uid is the one to keep.
-                                            if (row < 0) {
-                                                messageList.openedUid =
-                                                    Mail.messageModel.uidAt(messageList.currentIndex)
-                                            }
-                                            console.debug(traceLog,
-                                                          "mailove: msg reset: count", messageList.count,
-                                                          "wanted uid", messageList.openedUid,
-                                                          "-> row", row,
-                                                          "current", messageList.currentIndex)
-                                            // Only when the cursor landed on a *different*
-                                            // message than the viewer is showing. A
-                                            // successful restore means the same mail is
-                                            // still under the cursor, and re-fetching it
-                                            // re-parsed the MIME and reloaded the web view
-                                            // on every refresh — three times per message
-                                            // during a reconnect, all on the GUI thread.
-                                            if (row < 0)
-                                                fetchDebounce.restart()
+                                            messageList.scheduleResetRestore()
                                         }
                                         // Re-sorting keeps the same rows and only renumbers
                                         // them, so it reports a layout change instead of a
@@ -3160,49 +3256,7 @@ Kirigami.ApplicationWindow {
                                         // onModelReset does above.
                                         function onLayoutChanged() {
                                             messageList.clearSelection()
-                                            if (messageList.count <= 0) {
-                                                messageList.currentIndex = -1
-                                                return
-                                            }
-                                            // The user just picked a different order and is
-                                            // about to read it from the start; chasing
-                                            // their previously opened message would drop
-                                            // them somewhere in the middle of it.
-                                            if (messageList.sortJumpsToTop) {
-                                                messageList.sortJumpsToTop = false
-                                                messageList.currentIndex = -1
-                                                Qt.callLater(() => messageList.positionViewAtBeginning())
-                                                return
-                                            }
-                                            const row = messageList.openedUid >= 0
-                                                ? Mail.messageModel.rowForUid(messageList.openedUid) : -1
-                                            messageList.currentIndex = row >= 0 ? row : 0
-                                            if (row < 0) {
-                                                messageList.openedUid =
-                                                    Mail.messageModel.uidAt(messageList.currentIndex)
-                                                fetchDebounce.restart()
-                                            }
-                                            // Follow the cursor to its new row. Keeping the
-                                            // old scroll offset would leave the view
-                                            // showing unrelated messages — and if it was
-                                            // sitting at the bottom it stays at the bottom,
-                                            // where atYEnd below keeps asking for another
-                                            // page, which lands somewhere else in the new
-                                            // order and leaves it at the bottom again: the
-                                            // list scrolls on by itself. Deferred, because
-                                            // the view has not finished relaying out the
-                                            // rows while this signal is still being
-                                            // delivered.
-                                            Qt.callLater(() => {
-                                                if (messageList.currentIndex >= 0)
-                                                    messageList.positionViewAtIndex(
-                                                        messageList.currentIndex, ListView.Center)
-                                            })
-                                            console.debug(traceLog,
-                                                          "mailove: msg re-sorted: count",
-                                                          messageList.count,
-                                                          "uid", messageList.openedUid,
-                                                          "-> row", messageList.currentIndex)
+                                            messageList.scheduleLayoutRestore()
                                         }
                                         // Incremental inserts (appendHeaders: search local
                                         // merge, load-more) shift every row at/after the

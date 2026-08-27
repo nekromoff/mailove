@@ -500,6 +500,34 @@ int main(int argc, char **argv)
         store.setNotSpamSender(rescuedFrom, false);
         check(store.notSpamSenders({rescuedFrom}).isEmpty(),
               QStringLiteral("marking one as junk takes the sender back off the list"));
+
+        // The content half of the same gesture. A campaign rotates addresses
+        // faster than any sender list moves, but the text it is selling
+        // travels unchanged — so junking a message remembers its fingerprint,
+        // and rescuing one forgets it again. Both directions matter: an
+        // override the user cannot take back is a worse trap than the false
+        // positive it was fixing.
+        const QString junked = SpamHeuristics::contentHash(QStringLiteral(
+            "Act now to claim your exclusive reward, limited time offer inside!"));
+        check(!junked.isEmpty(), QStringLiteral("the sample text has a fingerprint"));
+        check(!store.junkContentHashKnown(junked),
+              QStringLiteral("an unknown fingerprint is not in the junk corpus"));
+        store.addJunkContentHash(junked);
+        check(store.junkContentHashKnown(junked),
+              QStringLiteral("…junking a message remembers its content"));
+        // Twice is once: the same campaign filed again is not a second entry.
+        store.addJunkContentHash(junked);
+        check(store.junkContentHashKnown(junked),
+              QStringLiteral("…and re-learning it is idempotent"));
+        store.removeJunkContentHash(junked);
+        check(!store.junkContentHashKnown(junked),
+              QStringLiteral("…while a rescue forgets it again"));
+        // The empty fingerprint is what contentHash() returns for a body too
+        // short to be distinctive. It must never be stored and never match, or
+        // every message without a usable body would answer to it.
+        store.addJunkContentHash(QString());
+        check(!store.junkContentHashKnown(QString()),
+              QStringLiteral("an empty fingerprint is neither stored nor matched"));
     }
 
     // An account the predicate calls local: its junk folder must stay unmarked.

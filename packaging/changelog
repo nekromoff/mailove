@@ -1,3 +1,42 @@
+mailove (3.3) unstable; urgency=medium
+
+  * A message whose plain text is identical to one you moved to spam is now
+    marked on that alone - the same campaign under a fresh envelope. The
+    corpus learns when you file something as junk and unlearns when you
+    rescue it, so the correction sticks both ways, and it is seeded once from
+    what is already sitting in junk-named folders. Body text only, never the
+    headers, and it is not consulted inside a junk folder.
+  * Bodies are cached again after any maintenance pause. Both pause paths ask
+    the body writer to stop without waiting for it, which left a finished
+    thread behind that the restart check read as still running - so the
+    writer was gone for the rest of the session and every fetched body queued
+    up unwritten. The visible cost was the reading pane going back to the
+    network for messages that should have been on disk. Bodies flushed on the
+    way out also get their attachments lifted into the file store, as the
+    ordinary batches always did.
+  * Copy as Markdown now takes the whole message, from the message view's
+    context menu and the message list's, without selecting anything first.
+    Images are dropped and their alt text kept: a cid: reference means
+    nothing once the text leaves mailove, and a remote image pasted into
+    something that fetches it is the read receipt the message view refuses to
+    send. A link whose only content was an image - every newsletter button -
+    becomes its plain address rather than an empty label.
+  * Forward as attachment works on a selection, one .eml for each message
+    picked. Messages that are not cached, and encrypted ones other than the
+    one open, are named and left out rather than quietly missing from the
+    forward.
+  * Latin abbreviations glued to Cyrillic with a hyphen - SMS-rassylka,
+    it-usluhy.rf and the like - are no longer read as forgery. That shape is
+    ordinary in Russian and in Russian domains, while a letter substituted
+    for its look-alike has no hyphen to hide behind. Mail that does disguise
+    Latin as Cyrillic now says so in the reason it gives, instead of claiming
+    the sender writes in Cyrillic.
+  * The message list keeps its place through a reconnect. A reconnect resets
+    the model once per folder reopened, and each reset restored the cursor
+    separately, three times per message on the interface thread.
+
+ -- Daniel Duris <dusoft@staznosti.sk>  Thu, 27 Aug 2026 20:00:00 +0200
+
 mailove (3.2) unstable; urgency=medium
 
   * "Not spam" now sticks. Taking a message out of the junk folder, or saying

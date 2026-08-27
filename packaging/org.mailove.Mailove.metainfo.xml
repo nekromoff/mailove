@@ -33,6 +33,30 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.3" date="2026-08-27" type="stable">
+      <description>
+        <ul>
+          <li>A message whose plain text is identical to one you moved to
+              spam is marked on that alone. The corpus learns when you file
+              something as junk and unlearns when you rescue it.</li>
+          <li>Bodies are cached again after any maintenance pause - the body
+              writer never restarted, so the reading pane went back to the
+              network for messages that should have been on disk.</li>
+          <li>Copy as Markdown now takes the whole message, from the message
+              view's context menu and the message list's, with nothing
+              selected. Images are dropped and their alt text kept; an
+              image-only link becomes its plain address.</li>
+          <li>Forward as attachment works on a selection, one .eml each.
+              Messages that are not cached, and encrypted ones other than the
+              one open, are named and left out rather than quietly
+              missing.</li>
+          <li>Latin abbreviations glued to Cyrillic with a hyphen are no
+              longer read as forgery, and mail that does disguise Latin as
+              Cyrillic says so in the reason it gives.</li>
+          <li>The message list keeps its place through a reconnect.</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.2" date="2026-08-24" type="stable">
       <description>
         <ul>

@@ -664,7 +664,8 @@ MailClient::MailClient(QObject *parent)
         // No account key for a local archive: its key was born after the
         // multi-account migration and must not adopt another account's rows.
         m_jobs->startCacheMigrations(m_acct.local ? QString() : accountKey(),
-                                     &MailClient::folderNameIsOutgoing);
+                                     &MailClient::folderNameIsOutgoing,
+                                     &MailClient::rawBodyHash);
     });
 
     // The two long background jobs wait for those to finish. Not politeness:
@@ -3085,24 +3086,7 @@ void MailClient::clipboardSelectionToMarkdown(int)
         if (!mime || !mime->hasHtml())
             return; // an ownership-only change; the data write follows
         finish();
-        QTextDocument doc;
-        doc.setHtml(mime->html());
-        // <br> parses to line-separator characters, which toMarkdown() emits
-        // as bare newlines — soft breaks that renderers join into one line.
-        // Promoted to real paragraph breaks, they survive as the separate
-        // lines the reader saw. (The writer's own 80-column prose wrapping
-        // also emits bare newlines, so this cannot be fixed after the fact —
-        // only here, where the two are still distinguishable.)
-        for (QTextCursor cursor(&doc);;) {
-            cursor = doc.find(QString(QChar::LineSeparator), cursor);
-            if (cursor.isNull())
-                break;
-            cursor.insertBlock();
-        }
-        // Layout-table furniture stripped (with blank runs capped) — the
-        // paste target gets content, not a diagram of the newsletter's grid.
-        const QString markdown = MimeUtils::flattenMarkdownTables(
-            doc.toMarkdown(QTextDocument::MarkdownDialectGitHub)).trimmed();
+        const QString markdown = MimeUtils::htmlToMarkdown(mime->html());
         if (markdown.isEmpty())
             return; // leave the renderer's copy as it is
         // Our own setText fires dataChanged too — disconnected above.
@@ -3113,6 +3097,37 @@ void MailClient::clipboardSelectionToMarkdown(int)
     // If the renderer's write never comes (nothing was selected after all),
     // stop listening — a later ordinary copy must not get converted.
     QTimer::singleShot(3000, this, finish);
+}
+
+bool MailClient::copyMessageAsMarkdown()
+{
+    MessageContext *ctx = m_reading;
+    if (!ctx || !ctx->hasMessage())
+        return false;
+    // The HTML part through the viewer's own sanitizer — the same markup the
+    // reader was shown, minus scripting hooks and embedded documents. Never
+    // the raw part: what is copied should be what was read.
+    QString markdown;
+    if (!ctx->m_htmlBody.isEmpty()) {
+        QElapsedTimer started;
+        started.start();
+        markdown = MimeUtils::htmlToMarkdown(sanitizeMessageHtml(ctx->m_htmlBody));
+        // A click-time cost, unlike the open-time paths: ~300ms on a 400 KB
+        // newsletter, paid only when the user asks for it.
+        qCDebug(logTrace, "copy message as markdown: %lld chars of html -> %lld, %lldms",
+                static_cast<qint64>(ctx->m_htmlBody.size()),
+                static_cast<qint64>(markdown.size()), started.elapsed());
+    } else {
+        // Text-only mail is already the thing Markdown is trying to be.
+        markdown = ctx->m_textBody.trimmed();
+    }
+    if (markdown.isEmpty()) {
+        setStatus(tr("Nothing to copy"));
+        return false;
+    }
+    QGuiApplication::clipboard()->setText(markdown);
+    setStatus(tr("Message copied as Markdown"));
+    return true;
 }
 
 QString MailClient::newMessageBody() const
@@ -3428,6 +3443,20 @@ QVariantMap MailClient::forwardAsAttachmentDataFor(MessageContext *ctx)
     if (raw.isEmpty())
         return {};
 
+    const QUrl attachment = writeForwardEml(raw, origSubject);
+    if (attachment.isEmpty())
+        return {};
+
+    return {{QStringLiteral("to"), QString()},
+            {QStringLiteral("cc"), QString()},
+            {QStringLiteral("subject"), subject},
+            {QStringLiteral("body"), QStringLiteral("<p><br></p>") + signatureBlock()},
+            {QStringLiteral("attachments"),
+             QVariantList{attachment}}};
+}
+
+QUrl MailClient::writeForwardEml(const QByteArray &raw, const QString &subject)
+{
     // Same reasoning as every other composer temp file: private 0700
     // directory, process lifetime — it must survive until the send reads it.
     static QTemporaryDir tempDir(QDir::tempPath() + QStringLiteral("/mailove-forward-eml-XXXXXX"));
@@ -3435,7 +3464,7 @@ QVariantMap MailClient::forwardAsAttachmentDataFor(MessageContext *ctx)
         return {};
     static int count = 0;
     QString base;
-    for (const QChar &c : origSubject) {
+    for (const QChar &c : subject) {
         base.append(c.isLetterOrNumber() || c == QLatin1Char(' ') || c == QLatin1Char('-')
                         ? c : QLatin1Char('_'));
     }
@@ -3453,13 +3482,95 @@ QVariantMap MailClient::forwardAsAttachmentDataFor(MessageContext *ctx)
     file.close();
     qCDebug(logTrace, "forwardAsAttachment: %lld bytes -> %s",
             static_cast<qint64>(raw.size()), qUtf8Printable(path));
+    return QUrl::fromLocalFile(path);
+}
 
+QVariantMap MailClient::forwardRowsAsAttachmentData(const QVariantList &rows)
+{
+    QVariantList attachments;
+    QString firstSubject;
+    int skippedUncached = 0;
+    int skippedEncrypted = 0;
+    for (const QVariant &r : rows) {
+        const int row = r.toInt();
+        const qint64 uid = m_messageModel.uidAt(row);
+        if (uid < 0)
+            continue;
+        // The open message goes through the single-message path: it is the
+        // only one whose decrypted form is in hand, and a forward of
+        // ciphertext is addressed to the wrong key to be of use.
+        if (m_reading->m_message && m_reading->m_uid == uid) {
+            const QVariantMap one = forwardAsAttachmentDataFor(m_reading);
+            if (one.isEmpty())
+                continue;
+            attachments.append(one.value(QStringLiteral("attachments")).toList());
+            if (firstSubject.isEmpty())
+                firstSubject = m_reading->m_subject;
+            continue;
+        }
+        // Everyone else comes from the cache, reassembled the way the read
+        // path does it — the stored body is a stub whose attachment payloads
+        // live in the file store.
+        QByteArray raw = m_store.cachedBody(m_selectedFolder, uid);
+        if (raw.isEmpty()) {
+            ++skippedUncached;
+            continue;
+        }
+        auto msg = std::make_shared<KMime::Message>();
+        msg->setContent(KMime::CRLFtoLF(raw));
+        msg->parse();
+        const QList<MailStore::PartRef> parts = m_store.partsFor(m_selectedFolder, uid);
+        if (!parts.isEmpty()) {
+            if (!MimeUtils::restoreAttachments(msg.get(), parts)) {
+                ++skippedUncached; // a payload has gone missing; the cache entry is incomplete
+                continue;
+            }
+            raw = msg->encodedContent();
+        }
+        // Encrypted mail that is not the open one has no decrypted form here,
+        // and attaching the ciphertext would forward something the recipient
+        // cannot read. Skipped and counted rather than silently useless.
+        if (PgpMime::classify(msg.get()).isEncrypted()) {
+            ++skippedEncrypted;
+            continue;
+        }
+        const QString subject = msg->subject() ? msg->subject()->asUnicodeString() : QString();
+        const QUrl url = writeForwardEml(raw, subject);
+        if (url.isEmpty())
+            continue;
+        attachments.append(url);
+        if (firstSubject.isEmpty())
+            firstSubject = subject;
+    }
+
+    // Said plainly rather than by a greyed-out entry: the reader selected
+    // these, and a forward silently carrying fewer than they picked is worse
+    // than one that says which were left out and why.
+    if (skippedUncached > 0 || skippedEncrypted > 0) {
+        QStringList why;
+        if (skippedUncached > 0)
+            why << tr("%n not cached — open them first", nullptr, skippedUncached);
+        if (skippedEncrypted > 0)
+            why << tr("%n encrypted — forward those one at a time", nullptr, skippedEncrypted);
+        Q_EMIT errorOccurred(tr("Attached %1 of %2: %3")
+                                 .arg(attachments.size())
+                                 .arg(rows.size())
+                                 .arg(why.join(QStringLiteral(", "))));
+    }
+    if (attachments.isEmpty())
+        return {};
+
+    QString subject = firstSubject;
+    if (!subject.startsWith(QLatin1String("Fwd:"), Qt::CaseInsensitive)
+        && !subject.startsWith(QLatin1String("Fw:"), Qt::CaseInsensitive))
+        subject = QStringLiteral("Fwd: ") + subject;
+    if (attachments.size() > 1)
+        subject = tr("Fwd: %n messages", nullptr, int(attachments.size()));
     return {{QStringLiteral("to"), QString()},
             {QStringLiteral("cc"), QString()},
             {QStringLiteral("subject"), subject},
             {QStringLiteral("body"), QStringLiteral("<p><br></p>") + signatureBlock()},
-            {QStringLiteral("attachments"),
-             QVariantList{QUrl::fromLocalFile(path)}}};
+            {QStringLiteral("attachments"), attachments}};
 }
 
 QStringList MailClient::recipientSuggestions(const QString &prefix)
@@ -3703,6 +3814,15 @@ void MailClient::rescoreWithBody(const QString &folder, qint64 uid, KMime::Messa
         ctx.authFailed = true;
     ctx.authSoftFailed = SpamHeuristics::authResultsSoftFailed(authInfo);
     ctx.crypto = PgpMime::storedKind(PgpMime::kindFromHead(m.head));
+
+    // Learned from the user's own junk moves (and the one-time seed of what
+    // already sat in their junk folders): the same text they already threw
+    // away, arriving again. Never asked for mail already sitting in junk —
+    // the junk-folder rule owns that fact, and a junked message would match
+    // its own fingerprint.
+    if (!isJunkFolderKey(folder))
+        ctx.junkContentMatch =
+            m_store.junkContentHashKnown(SpamHeuristics::contentHash(m.text));
 
     // A copy of a message the user rescued elsewhere — the same test the header
     // pass makes, repeated because a body scored from the prefetch may be the
@@ -4561,41 +4681,15 @@ bool MailClient::isJunkFolder(const QString &mailBox) const
 {
     // The server's own answer first: RFC 6154 \Junk over IMAP, the `junk` role
     // over JMAP. It settles *which* mailbox is the junk one — but not that no
-    // other holds spam, so the name heuristic below still runs. This drives
-    // the hostile-content defaults (plain text, no remote content), where a
-    // miss silently downgrades protection and a false positive costs one
-    // click, which is why the guessing is generous and stays that way.
+    // other holds spam, so the name heuristic still runs. This drives the
+    // hostile-content defaults (plain text, no remote content), where a miss
+    // silently downgrades protection and a false positive costs one click,
+    // which is why the guessing is generous and stays that way. The name list
+    // itself lives in SpamHeuristics so the junk_hash1 backfill — which walks
+    // every account's folders with no server to ask — applies the same test.
     if (!m_junkFolder.isEmpty() && mailBox == m_junkFolder)
         return true;
-
-    static const QStringList junkNames = {
-        QStringLiteral("spam"),         QStringLiteral("junk"),
-        QStringLiteral("junk e-mail"),  QStringLiteral("junk email"),
-        QStringLiteral("junk mail"),    QStringLiteral("bulk mail"),
-        QStringLiteral("bulk"),         QStringLiteral("quarantine"),
-        // Localized names used by the major providers' web UIs
-        QStringLiteral("correo no deseado"), QStringLiteral("no deseado"),
-        QStringLiteral("courrier indésirable"), QStringLiteral("indésirables"),
-        QStringLiteral("pourriel"),     QStringLiteral("unerwünscht"),
-        QStringLiteral("posta indesiderata"), QStringLiteral("indesiderata"),
-        QStringLiteral("lixo eletrônico"), QStringLiteral("lixo eletronico"),
-        QStringLiteral("ongewenst"),    QStringLiteral("ongewenste e-mail"),
-        QStringLiteral("uønsket e-post"), QStringLiteral("skräppost"),
-        QStringLiteral("roskaposti"),   QStringLiteral("uønsket post"),
-        QStringLiteral("wiadomości-śmieci"), QStringLiteral("niechciane"),
-        QStringLiteral("nevyžádaná pošta"), QStringLiteral("nevyžiadaná pošta"),
-        QStringLiteral("levélszemét"),  QStringLiteral("спам"),
-        QStringLiteral("нежелательная почта"), QStringLiteral("垃圾邮件"),
-        QStringLiteral("垃圾郵件"),      QStringLiteral("迷惑メール"),
-        QStringLiteral("스팸")};
-    const QChar sep = mailBox.contains(QLatin1Char('/')) ? QLatin1Char('/')
-                                                         : QLatin1Char('.');
-    const QString leaf = mailBox.section(sep, -1).toLower();
-    if (junkNames.contains(leaf))
-        return true;
-    // Providers decorate the leaf ("Spam (2)", "Junk-E-Mail"); a substring test
-    // on these two roots costs nothing and catches the decorated variants.
-    return leaf.contains(QLatin1String("spam")) || leaf.contains(QLatin1String("junk"));
+    return SpamHeuristics::folderNameLooksJunk(mailBox);
 }
 
 QString MailClient::trashFolderName() const
@@ -4728,10 +4822,31 @@ void MailClient::markAsNotSpam(const QVariantList &rows)
         m_messageModel.clearSpam(uid);
         m_store.setSpamVerdict(m_selectedFolder, uid, SpamHeuristics::UserNotSpamWeight,
                                MessageListModel::SpamUserCleared, QString());
+        // "Not spam" also unlearns the fingerprint, exactly as a rescue from
+        // the junk folder does — the two are the same statement.
+        m_store.removeJunkContentHash(cachedBodyHash(uid));
         ++cleared;
     }
     if (cleared > 0)
         setStatus(tr("Not spam — sender added to your known contacts"));
+}
+
+QString MailClient::rawBodyHash(const QByteArray &raw)
+{
+    if (raw.isEmpty())
+        return {};
+    KMime::Message msg;
+    msg.setContent(KMime::CRLFtoLF(raw));
+    msg.parse();
+    QString text;
+    QString html;
+    MimeUtils::collectBodies(&msg, &text, &html);
+    return SpamHeuristics::contentHash(text);
+}
+
+QString MailClient::cachedBodyHash(qint64 uid)
+{
+    return rawBodyHash(m_store.cachedBody(m_selectedFolder, uid));
 }
 
 void MailClient::markAsJunk(const QVariantList &rows)
@@ -4751,6 +4866,16 @@ void MailClient::markAsJunk(const QVariantList &rows)
         const QString sender = SpamHeuristics::addressOf(m_messageModel.fromAt(v.toInt()));
         if (!sender.isEmpty())
             m_store.setNotSpamSender(sender, false);
+    }
+    // The other thing the gesture teaches, besides the sender: the content.
+    // The same text arriving again under a fresh envelope is what the
+    // junk-content-match rule scores, and this is where its corpus grows. From
+    // the cached body, so a message junked unread (nothing cached) teaches
+    // nothing.
+    for (const QVariant &v : rows) {
+        const qint64 uid = m_messageModel.uidAt(v.toInt());
+        if (uid > 0)
+            m_store.addJunkContentHash(cachedBodyHash(uid));
     }
     // The local verdict is not journalled: it is mailove's own opinion about
     // the message, has never been sent anywhere, and already worked offline.
@@ -4781,6 +4906,17 @@ void MailClient::moveMessagesTo(const QVariantList &rows, const QString &targetF
     const bool rescuedFromJunk = isJunkFolderKey(m_selectedFolder)
         && !isJunkFolderKey(targetFolder)
         && targetFolder != trashFolderName();
+    // The drag into the junk folder is the same statement markAsJunk() makes
+    // with a button, and it teaches the junk-content corpus the same way.
+    // Only the content half — the sender-allowlist withdrawal stays that
+    // path's own, as it always has been.
+    if (isJunkFolderKey(targetFolder) && !isJunkFolderKey(m_selectedFolder)) {
+        for (const QVariant &v : rows) {
+            const qint64 uid = m_messageModel.uidAt(v.toInt());
+            if (uid > 0)
+                m_store.addJunkContentHash(cachedBodyHash(uid));
+        }
+    }
     QStringList rescuedSenders;
     if (rescuedFromJunk) {
         for (const QVariant &v : rows) {
@@ -4823,6 +4959,10 @@ void MailClient::moveMessagesTo(const QVariantList &rows, const QString &targetF
             m_messageModel.clearSpam(uid);
             m_store.setSpamVerdict(m_selectedFolder, uid, SpamHeuristics::UserNotSpamWeight,
                                    MessageListModel::SpamUserCleared, QString());
+            // And unlearned by content, or the identical copy arriving
+            // tomorrow is marked all over again by the very fingerprint this
+            // message taught on its way in.
+            m_store.removeJunkContentHash(cachedBodyHash(uid));
         }
     }
 
@@ -5213,7 +5353,33 @@ void MailClient::pollOtherAccounts()
             return;
         }
         const QVariantMap account = queue->takeFirst();
-        pollAccount(account, [step] { (*step)(); });
+        // The round only moves — and m_accountPollBusy only clears — when this
+        // account calls back. Every error path in pollAccount() does, but "no
+        // reply at all" is not an error path: an account that simply never
+        // answered parked the flag forever, and every later tick bailed out at
+        // the top — one stalled account silently cost every account queued
+        // behind it its polling for the rest of the session. The deadline is
+        // on the account's slot in the round, not on its work: a completion
+        // that arrives late still runs its own cleanup, and the guard here
+        // just makes its advance the no-op instead of a double step.
+        auto advanced = std::make_shared<bool>(false);
+        const auto advance = [advanced, step] {
+            if (*advanced)
+                return;
+            *advanced = true;
+            (*step)();
+        };
+        constexpr int kAccountDeadlineMs = 2 * 60 * 1000;
+        const QString who = account.value(QStringLiteral("user")).toString()
+            + QLatin1Char('@') + account.value(QStringLiteral("host")).toString();
+        QTimer::singleShot(kAccountDeadlineMs, this, [advanced, advance, who] {
+            if (*advanced)
+                return; // finished in time; nothing to rescue
+            qCWarning(logUnread) << "background poll:" << who
+                                 << "did not finish within its deadline — moving on";
+            advance();
+        });
+        pollAccount(account, advance);
     };
     (*step)();
 }
@@ -5403,6 +5569,12 @@ void MailClient::syncBackgroundFolders(MailBackend *backend, const QString &key,
     // would be worse than waiting, so that folder is skipped and left to the
     // next switch to this account.
     auto voided = std::make_shared<bool>(false);
+    // Which step of the pass a deferred callback belongs to. The chain only
+    // advances on replies, and a folder is not guaranteed to send one — so
+    // every phase below arms a deadline, and this is how a deadline (or a
+    // reply that outlived one) knows it is stale: next() bumps the counter,
+    // and anything holding an older value stands down.
+    auto gen = std::make_shared<quint64>(0);
     const QStringList authDomains =
         m_authVerification ? trustedAuthDomainsForHost(host) : QStringList();
 
@@ -5422,7 +5594,14 @@ void MailClient::syncBackgroundFolders(MailBackend *backend, const QString &key,
     // background account are worth keeping current, but not at the price of
     // firing a mailbox's worth of requests at a server nobody is waiting on.
     auto next = std::make_shared<std::function<void()>>();
-    *next = [this, backend, key, queue, current, rows, voided, done] {
+    // Weak on purpose, twice over. Strong, the step would hold itself alive —
+    // a cycle that leaks the pass's state on every poll, in a process that
+    // runs for weeks. And a deadline that outlives the pass (the backend
+    // errored out and was torn down, dropping the connections that own this
+    // function) has nothing left to advance: failing the lock IS the answer.
+    std::weak_ptr<std::function<void()>> weakNext = next;
+    *next = [this, backend, key, queue, current, rows, voided, gen, weakNext, done] {
+        const quint64 myGen = ++*gen; // retires the previous step's deadline
         if (queue->isEmpty()) {
             done();
             return;
@@ -5431,12 +5610,28 @@ void MailClient::syncBackgroundFolders(MailBackend *backend, const QString &key,
         *voided = false;
         *current = queue->takeFirst();
         backend->openFolder(*current, m_store.syncStateIn(key, *current));
+        // A folder that never answers the open — deleted server-side
+        // mid-sweep, or a failure that maps onto no signal — used to stop the
+        // sweep dead: done() never ran, which wedged the account round above
+        // this pass (see pollOtherAccounts). Skip the folder, keep the pass.
+        constexpr int kOpenDeadlineMs = 60 * 1000;
+        QTimer::singleShot(kOpenDeadlineMs, this, [gen, myGen, weakNext, current] {
+            if (*gen != myGen)
+                return; // the pass moved on; this deadline is stale
+            const auto next = weakNext.lock();
+            if (!next)
+                return; // the pass itself is gone; nothing to advance
+            qCWarning(logUnread) << "background sync:" << *current
+                                 << "never answered the open — skipping it";
+            (*next)();
+        });
     };
 
     connect(backend, &MailBackend::folderOpened, this,
-            [this, backend, key, current, rows, voided, next](const QString &folder,
-                                                              qint64 messageCount,
-                                                              const QString &syncToken) {
+            [this, backend, key, current, rows, voided, gen, weakNext,
+             next](const QString &folder,
+                                                                   qint64 messageCount,
+                                                                   const QString &syncToken) {
         if (folder != *current)
             return;
         // JMAP resumes its delta from this; the UPDATE is a no-op for a folder
@@ -5447,10 +5642,37 @@ void MailClient::syncBackgroundFolders(MailBackend *backend, const QString &key,
             (*next)();
             return;
         }
+        // The open answered, so its deadline is retired here — and replaced,
+        // because the fetch below can go just as quiet. Kept as two separate
+        // budgets rather than one: an open that took most of a shared budget
+        // would leave a legitimate slow fetch to be shot mid-flight.
+        const quint64 myGen = ++*gen;
+        constexpr int kFetchDeadlineMs = 60 * 1000;
+        // weakNext, not next: held strongly, this timer would keep the step
+        // alive past the backend's death — a backend that errors out mid-fetch
+        // is torn down without bumping gen, and sixty seconds later the
+        // deadline would walk the step into openFolder() on freed memory. The
+        // step's owners are the backend's own connections, so the lock failing
+        // is precisely "the backend is gone".
+        QTimer::singleShot(kFetchDeadlineMs, this, [gen, myGen, weakNext, folder] {
+            if (*gen != myGen)
+                return;
+            const auto next = weakNext.lock();
+            if (!next)
+                return;
+            qCWarning(logUnread) << "background sync:" << folder
+                                 << "fetch never completed — skipping it";
+            (*next)();
+        });
         const qint64 maxUid = m_store.maxCachedUidIn(key, folder);
         const int cached = m_store.cachedHeaderCountIn(key, folder);
-        const auto stored = [this, key, folder, rows, next](MailBackend::Error error,
-                                                            const QString &) {
+        const auto stored = [this, key, folder, rows, gen, myGen,
+                             next](MailBackend::Error error, const QString &) {
+            // A fetch that outlived its deadline: the pass moved on, and rows
+            // is already collecting the next folder's headers — storing it
+            // under this folder's name would file mail in the wrong place.
+            if (*gen != myGen)
+                return;
             if (error == MailBackend::Error::None && !rows->isEmpty()) {
                 m_store.storeHeadersIn(key, folder, *rows);
                 // Per folder rather than once at the end, so the inbox's new

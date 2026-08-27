@@ -58,6 +58,18 @@ bool fired(const SpamHeuristics::Score &s, const char *id)
     return false;
 }
 
+/// The evidence line a rule wrote, for the rules whose wording is load-bearing:
+/// "written in Cyrillic" and "disguised as Cyrillic" are opposite accusations
+/// carrying the same weight, and only the detail tells the user which is meant.
+QString detailOf(const SpamHeuristics::Score &s, const char *id)
+{
+    for (const SpamHeuristics::Hit &h : s.hits) {
+        if (h.id == QLatin1String(id))
+            return h.detail;
+    }
+    return QString();
+}
+
 QString hitList(const SpamHeuristics::Score &s)
 {
     QStringList ids;
@@ -638,6 +650,78 @@ void testEncodedHeaders()
     check(!fired(slovak, "cyrillic-script"),
           QStringLiteral("accented Latin does not (%1)").arg(hitList(slovak)));
 
+    // A Latin-glued Russian compound is not a homoglyph. "SMS-рассылка" is how
+    // the language is written, and a whitespace-only word split read it as one
+    // two-alphabet word — scoring ordinary Russian mail with the rule built for
+    // "РayРal". The hyphen ends the word, so each half is single-script.
+    const SpamHeuristics::Score compound = SpamHeuristics::score(
+        headOnly("Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+                 " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+                 "From: Sender <s@x1z.test>\r\n"
+                 "To: You <you@example.org>\r\n"
+                 "Subject: =?UTF-8?B?U01TLdGA0LDRgdGB0YvQu9C60LAg0YHQtdCz0L7QtNC90Y8=?=\r\n"
+                 "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+                 "Message-ID: <cy4@x1z.test>\r\n"),
+        {});
+    check(!fired(compound, "subject-confusable"),
+          QStringLiteral("\"SMS-рассылка\" is not a homoglyph (%1)").arg(hitList(compound)));
+    check(fired(compound, "cyrillic-script"),
+          QStringLiteral("...but it is still Cyrillic (%1)").arg(hitList(compound)));
+    check(detailOf(compound, "cyrillic-script").contains(QStringLiteral("written in Cyrillic")),
+          QStringLiteral("...and is described as written, not disguised: \"%1\"")
+              .arg(detailOf(compound, "cyrillic-script")));
+
+    // The reverse: Latin text with Cyrillic look-alikes substituted in. Same
+    // rule, same weight, opposite accusation — the sender's name here is real
+    // spam seen in the wild, "WorkSpaCе PоrtalNоtificatiоn", where е and о are
+    // Cyrillic. Calling that "written in Cyrillic" tells the user nothing.
+    const SpamHeuristics::Score disguised = SpamHeuristics::score(
+        headOnly("Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+                 " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+                 "From: =?UTF-8?B?Tm90aWZpY2F0aW9uIC0gV29ya1NwYUPQtSBQ0L5ydGFsTtC+dGlmaWNhdGnQvm4=?="
+                 " <noreply@x1z.test>\r\n"
+                 "To: You <you@example.org>\r\n"
+                 "Subject: Document Shared: FY2026 Remittance Review\r\n"
+                 "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+                 "Message-ID: <cy5@x1z.test>\r\n"),
+        {});
+    check(fired(disguised, "display-name-confusable"),
+          QStringLiteral("a substituted homoglyph survives the narrower split (%1)")
+              .arg(hitList(disguised)));
+    check(detailOf(disguised, "cyrillic-script").contains(QStringLiteral("disguises")),
+          QStringLiteral("...and cyrillic-script says so: \"%1\"")
+              .arg(detailOf(disguised, "cyrillic-script")));
+
+    // Domains get the same treatment, for the same reason. "it-услуги.рф"
+    // (xn--it--lddzq5bpc.xn--p1ai) is a registered Russian domain joining a
+    // Latin abbreviation to a Cyrillic noun with a hyphen — legal in a label
+    // and common in that market. A homograph has no hyphen to hide behind.
+    const SpamHeuristics::Score idn = SpamHeuristics::score(
+        headOnly("Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+                 " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+                 "From: Sender <info@xn--it--lddzq5bpc.xn--p1ai>\r\n"
+                 "To: You <you@example.org>\r\n"
+                 "Subject: Hello\r\n"
+                 "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+                 "Message-ID: <cy6@x1z.test>\r\n"),
+        {});
+    check(!fired(idn, "from-domain-confusable"),
+          QStringLiteral("a hyphenated Latin/Cyrillic IDN is a domain, not a forgery (%1)")
+              .arg(hitList(idn)));
+
+    // "раypal.com" with Cyrillic р and а, as it travels: xn--ypal-43d9g.com.
+    const SpamHeuristics::Score fake = SpamHeuristics::score(
+        headOnly("Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+                 " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+                 "From: Billing <billing@xn--ypal-43d9g.com>\r\n"
+                 "To: You <you@example.org>\r\n"
+                 "Subject: Account notice\r\n"
+                 "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+                 "Message-ID: <cy7@x1z.test>\r\n"),
+        {});
+    check(fired(fake, "from-domain-confusable"),
+          QStringLiteral("...while a substituted domain label still is (%1)").arg(hitList(fake)));
+
     // Two encoded words joined across transport whitespace stay one word —
     // splitting mid-word is how long names travel, and a space inserted there
     // would hide the very word the rules examine.
@@ -779,6 +863,56 @@ void testBodyRules()
 
 /// The link group must not let a message accumulate its way to a verdict: a
 /// newsletter with hundreds of links is not hundreds of times as suspicious.
+void testJunkContentMatch()
+{
+    // The fingerprint folds exactly what campaigns vary between sends --
+    // whitespace and case -- and nothing else.
+    const QString a = QStringLiteral("Act NOW to claim   your exclusive reward today!");
+    const QString b = QStringLiteral("act now to claim your\nexclusive reward today!");
+    check(!SpamHeuristics::contentHash(a).isEmpty()
+              && SpamHeuristics::contentHash(a) == SpamHeuristics::contentHash(b),
+          QStringLiteral("contentHash folds whitespace and case"));
+    check(SpamHeuristics::contentHash(a)
+              != SpamHeuristics::contentHash(QStringLiteral(
+                  "Act NOW to claim your exclusive reward tomorrow!")),
+          QStringLiteral("...and different text hashes differently"));
+    // Short residue is boilerplate, not identity: it must never match.
+    check(SpamHeuristics::contentHash(QStringLiteral("Sent from my iPhone")).isEmpty(),
+          QStringLiteral("short text has no fingerprint"));
+    check(SpamHeuristics::contentHash(QString()).isEmpty(),
+          QStringLiteral("...and neither does an empty body"));
+
+    SpamHeuristics::Message m;
+    m.head = QByteArray(plainHead());
+    SpamHeuristics::Context ctx;
+    ctx.junkContentMatch = true;
+    const SpamHeuristics::Score hitScore = SpamHeuristics::score(m, ctx);
+    check(fired(hitScore, "junk-content-match"),
+          QStringLiteral("junk-content-match fires (%1)").arg(hitList(hitScore)));
+    check(hitScore.total >= SpamHeuristics::spamThreshold(),
+          QStringLiteral("...decisively at the default threshold"));
+    const SpamHeuristics::Score quiet = SpamHeuristics::score(m, {});
+    check(!fired(quiet, "junk-content-match"),
+          QStringLiteral("...and stays quiet without the match"));
+
+    // Rule 0 outranks it: a known correspondent re-sending once-junked text is
+    // a person, not a campaign.
+    ctx.knownCorrespondent = true;
+    const SpamHeuristics::Score exempt = SpamHeuristics::score(m, ctx);
+    check(exempt.exempt,
+          QStringLiteral("the known-correspondent exemption still outranks it"));
+
+    // The folder-name heuristic the backfill shares with the client.
+    check(SpamHeuristics::folderNameLooksJunk(QStringLiteral("Spam"))
+              && SpamHeuristics::folderNameLooksJunk(QStringLiteral("INBOX.Junk"))
+              && SpamHeuristics::folderNameLooksJunk(QStringLiteral("Junk-E-Mail"))
+              && SpamHeuristics::folderNameLooksJunk(QStringLiteral("nevy\u017eiadan\u00e1 po\u0161ta")),
+          QStringLiteral("junk folder names are recognized, decorated and localized alike"));
+    check(!SpamHeuristics::folderNameLooksJunk(QStringLiteral("INBOX"))
+              && !SpamHeuristics::folderNameLooksJunk(QStringLiteral("Archive")),
+          QStringLiteral("...and ordinary folders are not"));
+}
+
 void testLinkGroupIsCapped()
 {
     SpamHeuristics::Message m;
@@ -1402,6 +1536,7 @@ int main(int argc, char **argv)
     testEncodedHeaders();
     testListMailLinksAreExempt();
     testBodyRules();
+    testJunkContentMatch();
     testLinkGroupIsCapped();
     testHamStaysUnmarked();
     testKnownCorrespondentExemption();

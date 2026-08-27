@@ -7,6 +7,7 @@
 
 #include "publicsuffixlist.h"
 
+#include <QCryptographicHash>
 #include <QRegularExpression>
 #include <QSet>
 #include <QStringList>
@@ -380,9 +381,16 @@ Script scriptOf(QChar c)
 /// across a whole subject is ordinary in multilingual mail; mixing *inside one
 /// word* is how "PayPaI" and "аpple.com" are built, and essentially never
 /// happens by accident.
+///
+/// "Word" ends at anything that is not a letter, not merely at whitespace.
+/// Russian marketing copy is full of Latin-glued compounds — SMS-рассылка,
+/// IT-услуги, VIP-клиент — and a whitespace-only split reads each of those
+/// as one two-alphabet word, scoring ordinary mail in its own language. A
+/// homoglyph is substituted flush against its Latin neighbours (the "е" in
+/// "WorkSpaСе" has no separator to hide behind), so nothing real is lost.
 bool hasConfusableWord(const QString &s)
 {
-    const QStringList words = s.split(QRegularExpression(QStringLiteral("\\s+")),
+    const QStringList words = s.split(QRegularExpression(QStringLiteral("[^\\p{L}\\p{M}]+")),
                                       Qt::SkipEmptyParts);
     for (const QString &word : words) {
         QSet<int> scripts;
@@ -404,9 +412,16 @@ bool hasConfusableWord(const QString &s)
 /// because it is not ASCII would be both wrong and insulting. Punycode alone
 /// says nothing either — what has no legitimate use is a *single label* built
 /// from two alphabets, which is how "раypal.com" is made.
+///
+/// A hyphen ends a label for this purpose, exactly as it ends a word in
+/// hasConfusableWord(): "it-услуги.рф" and "sms-рассылка.ru" are ordinary
+/// registered domains that join a Latin abbreviation to a Cyrillic noun, and
+/// the dot-only split read each as one two-alphabet label. The substitution
+/// this rule exists for has no separator to hide behind.
 bool hasConfusableLabel(const QString &domain)
 {
-    const QStringList labels = domain.split(QLatin1Char('.'), Qt::SkipEmptyParts);
+    const QStringList labels = domain.split(QRegularExpression(QStringLiteral("[.-]")),
+                                            Qt::SkipEmptyParts);
     for (const QString &label : labels) {
         QSet<int> scripts;
         for (const QChar c : label) {
@@ -1338,6 +1353,22 @@ Score score(const Message &msg, const Context &ctx)
         return out;
     }
 
+    // ------------------------------------------------------------------
+    // The user's own junk folder, by content: the same text they already
+    // threw away, arriving again under a fresh envelope. Sender rules miss
+    // exactly this — a campaign rotates addresses and domains faster than
+    // any list moves — but the body is the product being sent, and it
+    // travels unchanged. Decisive at the default threshold on purpose: the
+    // match is against mail the user (or the backfill of their junk folder)
+    // has already judged, not against a pattern. Deliberately after Rule 0:
+    // a known correspondent re-sending text that was once junked is a person,
+    // not a campaign.
+    // ------------------------------------------------------------------
+    if (ctx.junkContentMatch) {
+        hit("junk-content-match", 50,
+            QStringLiteral("Its text is identical to a message you moved to spam"));
+    }
+
     // --- Authentication ------------------------------------------------
     if (ctx.knownCorrespondent && authFailed) {
         // Decisive on its own: forging an address the user actually corresponds
@@ -1861,10 +1892,22 @@ Score score(const Message &msg, const Context &ctx)
             return false;
         };
         const bool inSubject = cyrillicIn(subject);
-        if (inSubject || cyrillicIn(displayName)) {
+        const bool inName = cyrillicIn(displayName);
+        if (inSubject || inName) {
+            // Same evidence, two very different mails. Russian-language bulk
+            // is Cyrillic throughout; a homograph attack is Latin text with a
+            // handful of Cyrillic look-alikes substituted in, which reads as
+            // "written in Cyrillic" to the test above and as nonsense to the
+            // user staring at an English subject line. hasConfusableWord()
+            // separates them: only substitution mixes scripts inside one word.
+            const QString &field = inSubject ? subject : displayName;
+            const bool disguised = hasConfusableWord(field);
+            const QString what = inSubject ? QStringLiteral("The subject")
+                                           : QStringLiteral("The sender's name");
             hit("cyrillic-script", 50,
-                inSubject ? QStringLiteral("The subject is written in Cyrillic")
-                          : QStringLiteral("The sender's name is written in Cyrillic"));
+                disguised ? QStringLiteral("%1 disguises Latin letters as Cyrillic "
+                                           "look-alikes: \"%2\"").arg(what, field)
+                          : QStringLiteral("%1 is written in Cyrillic").arg(what));
         }
     }
 
@@ -2216,6 +2259,51 @@ Score score(const Message &msg, const Context &ctx)
         : out.total >= UnsureThreshold        ? Verdict::Unsure
                                               : Verdict::Ham;
     return out;
+}
+
+QString contentHash(const QString &text)
+{
+    // simplified() folds the whitespace tricks (soft wraps, padding runs) that
+    // vary between sends of the same campaign; lowercasing folds the cheapest
+    // of the rest. Below 32 characters what is left is boilerplate ("Sent from
+    // my iPhone"), not identity, and must never match anything.
+    const QString norm = text.simplified().toLower();
+    if (norm.size() < 32)
+        return {};
+    return QString::fromLatin1(
+        QCryptographicHash::hash(norm.toUtf8(), QCryptographicHash::Sha256).toHex());
+}
+
+bool folderNameLooksJunk(const QString &mailBox)
+{
+    static const QStringList junkNames = {
+        QStringLiteral("spam"),         QStringLiteral("junk"),
+        QStringLiteral("junk e-mail"),  QStringLiteral("junk email"),
+        QStringLiteral("junk mail"),    QStringLiteral("bulk mail"),
+        QStringLiteral("bulk"),         QStringLiteral("quarantine"),
+        // Localized names used by the major providers' web UIs
+        QStringLiteral("correo no deseado"), QStringLiteral("no deseado"),
+        QStringLiteral("courrier indésirable"), QStringLiteral("indésirables"),
+        QStringLiteral("pourriel"),     QStringLiteral("unerwünscht"),
+        QStringLiteral("posta indesiderata"), QStringLiteral("indesiderata"),
+        QStringLiteral("lixo eletrônico"), QStringLiteral("lixo eletronico"),
+        QStringLiteral("ongewenst"),    QStringLiteral("ongewenste e-mail"),
+        QStringLiteral("uønsket e-post"), QStringLiteral("skräppost"),
+        QStringLiteral("roskaposti"),   QStringLiteral("uønsket post"),
+        QStringLiteral("wiadomości-śmieci"), QStringLiteral("niechciane"),
+        QStringLiteral("nevyžádaná pošta"), QStringLiteral("nevyžiadaná pošta"),
+        QStringLiteral("levélszemét"),  QStringLiteral("спам"),
+        QStringLiteral("нежелательная почта"), QStringLiteral("垃圾邮件"),
+        QStringLiteral("垃圾郵件"),      QStringLiteral("迷惑メール"),
+        QStringLiteral("스팸")};
+    const QChar sep = mailBox.contains(QLatin1Char('/')) ? QLatin1Char('/')
+                                                         : QLatin1Char('.');
+    const QString leaf = mailBox.section(sep, -1).toLower();
+    if (junkNames.contains(leaf))
+        return true;
+    // Providers decorate the leaf ("Spam (2)", "Junk-E-Mail"); a substring test
+    // on these two roots costs nothing and catches the decorated variants.
+    return leaf.contains(QLatin1String("spam")) || leaf.contains(QLatin1String("junk"));
 }
 
 } // namespace SpamHeuristics

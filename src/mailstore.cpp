@@ -275,6 +275,13 @@ bool MailStore::open()
     q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS not_spam_senders ("
                           " addr_norm TEXT PRIMARY KEY, added INTEGER NOT NULL DEFAULT 0)"));
 
+    // Fingerprints of mail the user moved to the junk folder — the spam
+    // scorer's junk-content-match signal (SpamHeuristics::contentHash()).
+    // Learned from the move gesture, seeded once by junk_hash1 from what
+    // already sat in junk folders, forgotten again when a message is rescued.
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS junk_content_hashes ("
+                          " hash TEXT PRIMARY KEY, added INTEGER NOT NULL DEFAULT 0)"));
+
     // How much mail each sending organization has a history of here — the
     // spam scorer's familiarity signal (SpamHeuristics::Context::seenFromOrg).
     //
@@ -591,12 +598,21 @@ QList<MailStore::Migration> MailStore::pendingMigrations(const QString &account)
         out.append({QStringLiteral("softdelete_index1"),
                     tr("Rebuilding the message list index")});
     }
+    // Also last, and also invisible in the list until it matters: seeding the
+    // junk-content corpus from mail already filed as spam. Runs fine after
+    // everything above; before legacy_adopt1 it would merely see fewer junk
+    // folders, which the ordering rules out anyway.
+    if (!migrationDone(m_db, QStringLiteral("junk_hash1"))) {
+        out.append({QStringLiteral("junk_hash1"),
+                    tr("Learning the mail already in your spam folders")});
+    }
     return out;
 }
 
 void MailStore::runMigration(QSqlDatabase &db, const Migration &step, const QString &account,
                              const std::function<void(int)> &progress,
-                             const std::function<bool()> &cancelled)
+                             const std::function<bool()> &cancelled,
+                             const std::function<QString(const QByteArray &)> &bodyHash)
 {
     // Every step below works in chunks against a total counted up front, even
     // where one statement would have done the job. Two reasons, and the modal
@@ -957,6 +973,95 @@ void MailStore::runMigration(QSqlDatabase &db, const Migration &step, const QStr
             return seen;
         }, total, done, progress, cancelled);
         if (ok)
+            markMigrationDone(db, step.flag);
+        return;
+    }
+
+    if (step.flag == QLatin1String("junk_hash1")) {
+        // One-time seed for the junk-content-match rule: every body already
+        // sitting in a junk-named folder gets its plain text fingerprinted
+        // into junk_content_hashes, so the rule knows the spam the user filed
+        // before the rule existed. Junk-ness is the shared name heuristic —
+        // the server's \Junk answer is not in the cache, and these are every
+        // account's folders, not just the open one's. Like attach_backfill
+        // this reads blobs by cursor; unlike it, each blob is fully parsed,
+        // which is what \a bodyHash is for.
+        if (!bodyHash) {
+            // No parser, no backfill — leave the flag unset so a launch that
+            // has one (any real client) picks it up, rather than latching the
+            // step done with nothing learned.
+            return;
+        }
+        QStringList junk;
+        QSqlQuery folders(db);
+        folders.exec(QStringLiteral("SELECT DISTINCT folder FROM bodies"));
+        while (folders.next()) {
+            const QString key = folders.value(0).toString();
+            if (SpamHeuristics::folderNameLooksJunk(key.section(QChar(0x1f), -1)))
+                junk.append(key);
+        }
+        qint64 total = 0;
+        for (const QString &f : std::as_const(junk)) {
+            QSqlQuery n(db);
+            n.prepare(QStringLiteral("SELECT COUNT(*) FROM bodies WHERE folder = ?"));
+            n.addBindValue(f);
+            if (n.exec() && n.next())
+                total += n.value(0).toLongLong();
+        }
+        log.rows = total;
+        if (total == 0) {
+            markMigrationDone(db, step.flag);
+            return;
+        }
+        qint64 done = 0;
+        bool stopped = false;
+        for (const QString &f : std::as_const(junk)) {
+            qint64 cursor = 0;
+            const bool ok = runInChunks([&] {
+                QSqlQuery bodies(db);
+                bodies.prepare(QStringLiteral(
+                    "SELECT uid, raw FROM bodies WHERE folder = ? AND uid > ?"
+                    " ORDER BY uid LIMIT ?"));
+                bodies.addBindValue(f);
+                bodies.addBindValue(cursor);
+                bodies.addBindValue(kMigrationChunk);
+                if (!bodies.exec())
+                    return -1;
+                QStringList hashes;
+                int seen = 0;
+                while (bodies.next()) {
+                    ++seen;
+                    cursor = bodies.value(0).toLongLong();
+                    const QString h = bodyHash(bodies.value(1).toByteArray());
+                    if (!h.isEmpty())
+                        hashes.append(h);
+                }
+                if (seen == 0)
+                    return 0;
+                if (!hashes.isEmpty()) {
+                    db.transaction();
+                    QSqlQuery ins(db);
+                    ins.prepare(QStringLiteral(
+                        "INSERT OR IGNORE INTO junk_content_hashes (hash, added)"
+                        " VALUES (?, ?)"));
+                    const qint64 now = QDateTime::currentSecsSinceEpoch();
+                    for (const QString &h : std::as_const(hashes)) {
+                        ins.addBindValue(h);
+                        ins.addBindValue(now);
+                        ins.exec();
+                    }
+                    db.commit();
+                }
+                return seen;
+            }, total, done, progress, cancelled);
+            if (!ok) {
+                // Cancelled or failed: the flag stays unset and the whole seed
+                // repeats next launch — INSERT OR IGNORE makes the repeat free.
+                stopped = true;
+                break;
+            }
+        }
+        if (!stopped)
             markMigrationDone(db, step.flag);
         return;
     }
@@ -3285,6 +3390,38 @@ void MailStore::setNotSpamSender(const QString &address, bool notSpam)
         q.addBindValue(norm);
     }
     q.exec();
+}
+
+void MailStore::addJunkContentHash(const QString &hash)
+{
+    if (!m_db.isOpen() || hash.isEmpty())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("INSERT OR IGNORE INTO junk_content_hashes (hash, added)"
+                             " VALUES (?, ?)"));
+    q.addBindValue(hash);
+    q.addBindValue(QDateTime::currentSecsSinceEpoch());
+    q.exec();
+}
+
+void MailStore::removeJunkContentHash(const QString &hash)
+{
+    if (!m_db.isOpen() || hash.isEmpty())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM junk_content_hashes WHERE hash = ?"));
+    q.addBindValue(hash);
+    q.exec();
+}
+
+bool MailStore::junkContentHashKnown(const QString &hash)
+{
+    if (!m_db.isOpen() || hash.isEmpty())
+        return false;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT 1 FROM junk_content_hashes WHERE hash = ? LIMIT 1"));
+    q.addBindValue(hash);
+    return q.exec() && q.next();
 }
 
 int MailStore::clearSpamVerdictsFrom(const QString &address)

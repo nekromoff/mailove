@@ -89,14 +89,63 @@ void MaintenanceScheduler::queueBodyWrite(MailStore::BodyWrite &&write)
         QMutexLocker lock(&m_bodyWriteMutex);
         m_bodyWriteQueue.append(std::move(write));
     }
-    if (!m_bodyWriterThread) {
-        m_bodyWriterStop.storeRelaxed(0);
-        m_bodyWriterThread = QThread::create([this] { runBodyWriter(); });
-        // Priority goes to start(): setPriority() on a thread that is not
-        // running yet does nothing but warn ("Cannot set priority").
-        m_bodyWriterThread->start(QThread::LowPriority);
-    }
+    reviveBodyWriter();
     m_bodyWriteWake.wakeOne();
+}
+
+void MaintenanceScheduler::reviveBodyWriter()
+{
+    // A VACUUM needs every other writer *finished*, not merely asked to stop,
+    // and waits for exactly that (writersIdle). Reviving one under it would
+    // hold the exclusive lock off forever.
+    if (m_reclaiming)
+        return;
+    // Non-null is not the same as running. Both pause paths set the stop flag
+    // and deliberately do not join — the GUI thread has to keep serving the
+    // event loop — so they leave a *finished* QThread behind. Restarting only
+    // when the pointer was null therefore never fired: the flag stayed 1, the
+    // dead thread stayed non-null, and the writer was gone for the rest of the
+    // session, with every fetched body queued here and never written. The
+    // visible cost was in the reading pane, which fell back to a network fetch
+    // for messages that should have been cached.
+    if (m_bodyWriterThread && m_bodyWriterThread->isFinished()) {
+        m_bodyWriterThread->wait(); // already finished; returns at once
+        delete m_bodyWriterThread;
+        m_bodyWriterThread = nullptr;
+    }
+    if (m_bodyWriterThread)
+        return; // still running, or still flushing — it will take the queue
+    bool pending = false;
+    {
+        QMutexLocker lock(&m_bodyWriteMutex);
+        pending = !m_bodyWriteQueue.isEmpty();
+    }
+    if (!pending)
+        return;
+    m_bodyWriterStop.storeRelaxed(0);
+    m_bodyWriterThread = QThread::create([this] { runBodyWriter(); });
+    // Priority goes to start(): setPriority() on a thread that is not
+    // running yet does nothing but warn ("Cannot set priority").
+    m_bodyWriterThread->start(QThread::LowPriority);
+}
+
+/// Lifts the attachments out of each queued body. Done here rather than at
+/// queue time because hashing, compressing and writing a payload file is
+/// exactly the kind of work the GUI thread must never do; parsing a private
+/// copy also keeps the caller's message object (which may be on screen)
+/// untouched.
+static void externalizeAttachments(QList<MailStore::BodyWrite> &batch)
+{
+    for (MailStore::BodyWrite &w : batch) {
+        KMime::Message copy;
+        copy.setContent(KMime::CRLFtoLF(w.raw));
+        copy.parse();
+        w.parts = MimeUtils::stripAttachments(&copy);
+        if (!w.parts.isEmpty()) {
+            copy.assemble();
+            w.raw = copy.encodedContent();
+        }
+    }
 }
 
 void MaintenanceScheduler::runBodyWriter()
@@ -122,16 +171,7 @@ void MaintenanceScheduler::runBodyWriter()
         // compressing and writing a payload file is exactly the kind of work
         // the GUI thread must never do. Parsing a private copy also keeps the
         // caller's message object (which may be on screen) untouched.
-        for (MailStore::BodyWrite &w : batch) {
-            KMime::Message copy;
-            copy.setContent(KMime::CRLFtoLF(w.raw));
-            copy.parse();
-            w.parts = MimeUtils::stripAttachments(&copy);
-            if (!w.parts.isEmpty()) {
-                copy.assemble();
-                w.raw = copy.encodedContent();
-            }
-        }
+        externalizeAttachments(batch);
         MailStore::writeBodiesOn(db, batch);
         // A body indexed while the folded index is being built lands in the old
         // table, and the copy may already be past that row — so queue it for
@@ -145,6 +185,11 @@ void MaintenanceScheduler::runBodyWriter()
         QMutexLocker lock(&m_bodyWriteMutex);
         rest.swap(m_bodyWriteQueue);
     }
+    // Through the same door as the loop's batches: a body flushed on the way
+    // out was previously written with its attachments still inline and no part
+    // refs, so it missed externalisation entirely. Rare while this only ran at
+    // quit; the migration pause made it a per-launch path.
+    externalizeAttachments(rest);
     MailStore::writeBodiesOn(db, rest);
     db.close();
     // Drop the handle before removeDatabase — a live one is "still in use"
@@ -703,7 +748,8 @@ int MaintenanceScheduler::runRecipientBackfill(
 }
 
 void MaintenanceScheduler::startCacheMigrations(const QString &account,
-                                                std::function<bool(const QString &)> isOutgoing)
+                                                std::function<bool(const QString &)> isOutgoing,
+                                                std::function<QString(const QByteArray &)> bodyHash)
 {
     if (m_migrationThread)
         return;
@@ -757,7 +803,8 @@ void MaintenanceScheduler::startCacheMigrations(const QString &account,
     }
 
     m_migrationThread = QThread::create([this, steps, account, quietWriters,
-                                         isOutgoing = std::move(isOutgoing)] {
+                                         isOutgoing = std::move(isOutgoing),
+                                         bodyHash = std::move(bodyHash)] {
         QElapsedTimer runClock;
         runClock.start();
         const QString connection = QStringLiteral("mailstore-migrations");
@@ -795,7 +842,7 @@ void MaintenanceScheduler::startCacheMigrations(const QString &account,
                 QMetaObject::invokeMethod(this, [this, percent] {
                     reportMigration(percent);
                 }, Qt::QueuedConnection);
-            }, cancelled);
+            }, cancelled, bodyHash);
         }
 
         int recipients = 0;
@@ -816,6 +863,12 @@ void MaintenanceScheduler::startCacheMigrations(const QString &account,
             if (quietWriters) {
                 m_reindexTimer.start();
                 Q_EMIT syncResumeRequested();
+                // Explicitly, not "on its own once there is something to
+                // write": a body that arrived *during* the pause is already
+                // sitting in the queue with nothing left to drain it, and
+                // waiting for the next fetch to revive the writer strands it
+                // for as long as no new mail comes in.
+                reviveBodyWriter();
             }
             if (recipients > 0)
                 Q_EMIT statusMessage(tr("Recipients read for %1 cached messages").arg(recipients));

@@ -370,6 +370,12 @@ public:
     /// attachment (.eml) — the original bytes, untouched: the full-fidelity
     /// forward. {to, cc, subject, body, attachments}.
     Q_INVOKABLE QVariantMap forwardAsAttachmentData();
+    /// The same, for a selection of list rows: one .eml attachment each,
+    /// taken from the cache (the open row from its loaded context, so it
+    /// forwards decrypted). Rows with no cached body, and encrypted rows
+    /// that are not the open one, are left out and reported — the caller
+    /// gets what could be attached, never a silently shorter forward.
+    Q_INVOKABLE QVariantMap forwardRowsAsAttachmentData(const QVariantList &rows);
     /// Frees a composer quote-preview slot handed out in reply/forwardData
     /// (quotePreviewSlot) once the composer is done with it.
     Q_INVOKABLE void releaseQuotePreview(quint64 slot);
@@ -378,6 +384,12 @@ public:
     /// and makes that the clipboard text. Polls briefly — the renderer fills
     /// the clipboard asynchronously.
     Q_INVOKABLE void clipboardSelectionToMarkdown(int attempt = 0);
+    /// "Copy message as Markdown": the whole shown message rather than a
+    /// selection, converted from its sanitized HTML part (or handed over
+    /// verbatim when the mail is plain text). False when nothing is shown or
+    /// the message has no text at all. Synchronous — unlike the selection
+    /// path there is no renderer to wait for.
+    Q_INVOKABLE bool copyMessageAsMarkdown();
     /// Compose prefill for editing the currently shown message as a draft:
     /// {to, cc, bcc, subject, body, uid} — the message verbatim, not quoted.
     /// uid is the draft's own uid so the old copy can be removed on send.
@@ -1089,6 +1101,9 @@ private:
     QVariantMap replyDataFor(MessageContext *ctx, bool replyAll);
     QVariantMap forwardDataFor(MessageContext *ctx);
     QVariantMap forwardAsAttachmentDataFor(MessageContext *ctx);
+    /// Writes \a raw out as a .eml temp file for the composer to attach,
+    /// named from \a subject. Empty URL when it could not be written.
+    QUrl writeForwardEml(const QByteArray &raw, const QString &subject);
     /// The message quoted for reply/forward, full HTML fidelity: returned
     /// whole when the editor can lay it out in one pass, else empty with
     /// \a appendQuote filled for send-time appending (see quotedBody's comment).
@@ -1172,6 +1187,15 @@ private:
     /// account in the cache, not just the open one — and for an account that
     /// is not open there is no configured Sent folder to consult, only a name.
     static bool folderNameIsOutgoing(const QString &folder);
+    /// SpamHeuristics::contentHash() of a raw RFC 5322 body's plain text —
+    /// the one pipeline (KMime parse, collectBodies, contentHash) that both
+    /// sides of the junk-content corpus must share, or learned fingerprints
+    /// would never match scored ones. Static and self-contained so the
+    /// junk_hash1 backfill can call it from the migration worker.
+    static QString rawBodyHash(const QByteArray &raw);
+    /// rawBodyHash() of the cached body of \a uid in the selected folder.
+    /// Empty when no body is cached — a message junked unread teaches nothing.
+    QString cachedBodyHash(qint64 uid);
     /// True when \a accountKey names an imported archive rather than a server
     /// account. Spam scoring is skipped for those entirely — see scoresSpamIn().
     bool isLocalAccountKey(const QString &accountKey) const;

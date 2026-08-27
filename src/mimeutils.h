@@ -122,4 +122,16 @@ QString plainTextWithLinks(const QString &html);
 /// as `|`-furniture that reads as garbage wherever it is pasted.
 QString flattenMarkdownTables(const QString &markdown);
 
+/// HTML to GitHub-dialect Markdown, as both "Copy as Markdown" actions
+/// produce it: the selection one converts what the renderer put on the
+/// clipboard, the whole-message one converts the sanitized HTML part. Same
+/// output for the same markup, which is the point of them sharing this.
+///
+/// Images are dropped, keeping their alt text. A mail's images are either
+/// cid: parts — whose references mean nothing once the text leaves mailove —
+/// or remote URLs, and pasting those into a document that fetches them would
+/// hand the sender the read receipt the viewer spent its remote-content
+/// policy refusing. Neither survives the paste usefully, so neither goes.
+QString htmlToMarkdown(const QString &html);
+
 } // namespace MimeUtils
