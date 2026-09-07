@@ -874,6 +874,15 @@ QStringList localImageFiles(const QMimeData *mime)
     return out;
 }
 
+/// A local file that can go into the message inline. Anything else — a PDF,
+/// an archive, a remote URL — has no place in a QTextDocument and is attached.
+bool isLocalImage(QMimeDatabase &mimeDb, const QUrl &url)
+{
+    const QString path = url.toLocalFile();
+    return !path.isEmpty()
+        && mimeDb.mimeTypeForFile(path).name().startsWith(QLatin1String("image/"));
+}
+
 QString suffixOf(const QString &path)
 {
     const qsizetype dot = path.lastIndexOf(QLatin1Char('.'));
@@ -939,6 +948,38 @@ bool DocumentHandler::pasteImage()
         inserted = insertImage(file.readAll(), suffixOf(path)) || inserted;
     }
     return inserted;
+}
+
+bool DocumentHandler::hasNonImageFile(const QList<QUrl> &urls) const
+{
+    QMimeDatabase mimeDb;
+    for (const QUrl &url : urls) {
+        if (!isLocalImage(mimeDb, url))
+            return true;
+    }
+    return false;
+}
+
+QList<QUrl> DocumentHandler::insertImageFiles(const QList<QUrl> &urls)
+{
+    QMimeDatabase mimeDb;
+    QList<QUrl> rest;
+    for (const QUrl &url : urls) {
+        if (!isLocalImage(mimeDb, url)) {
+            rest.append(url);
+            continue;
+        }
+        const QString path = url.toLocalFile();
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) {
+            Q_EMIT imagePasteFailed(tr("Could not read %1.").arg(path));
+            continue;
+        }
+        // An image too large to inline reports itself and says to attach it —
+        // the same answer paste gives, so one rule covers both ways in.
+        insertImage(file.readAll(), suffixOf(path));
+    }
+    return rest;
 }
 
 bool DocumentHandler::insertImage(const QByteArray &data, const QString &suffix)

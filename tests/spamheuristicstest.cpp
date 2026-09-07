@@ -895,9 +895,10 @@ void testJunkContentMatch()
     check(!fired(quiet, "junk-content-match"),
           QStringLiteral("...and stays quiet without the match"));
 
-    // Rule 0 outranks it: a known correspondent re-sending once-junked text is
-    // a person, not a campaign.
+    // Rule 0 outranks it: an authenticated known correspondent re-sending
+    // once-junked text is a person, not a campaign.
     ctx.knownCorrespondent = true;
+    ctx.authPassed = true;
     const SpamHeuristics::Score exempt = SpamHeuristics::score(m, ctx);
     check(exempt.exempt,
           QStringLiteral("the known-correspondent exemption still outranks it"));
@@ -1050,12 +1051,37 @@ void testKnownCorrespondentExemption()
 {
     SpamHeuristics::Context ctx;
     ctx.knownCorrespondent = true;
+    ctx.authPassed = true;
     const SpamHeuristics::Score s = SpamHeuristics::score(
         headOnly("From: Alice <alice@sender.test>\r\nSubject: hi\r\n"), ctx);
     check(s.exempt && s.verdict == SpamHeuristics::Verdict::Ham,
-          QStringLiteral("a known correspondent is exempt (%1)").arg(s.exemptReason));
+          QStringLiteral("an authenticated known correspondent is exempt (%1)")
+              .arg(s.exemptReason));
+
+    // Without a pass the correspondence is credit, not a verdict: anyone can
+    // type an address the user has mailed, and a server that stamps no
+    // Authentication-Results at all leaves nothing to revoke the old
+    // unconditional exemption with.
+    SpamHeuristics::Context unverified;
+    unverified.knownCorrespondent = true;
+    const SpamHeuristics::Score credit = SpamHeuristics::score(
+        headOnly("Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
+                 " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+                 "From: Alice <alice@sender.test>\r\n"
+                 "To: You <you@example.org>\r\n"
+                 "Subject: hi\r\n"
+                 "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+                 "Message-ID: <k0@sender.test>\r\n"),
+        unverified);
+    check(!credit.exempt && fired(credit, "known-contact"),
+          QStringLiteral("without a pass a known correspondent is credited, not exempt (%1)")
+              .arg(hitList(credit)));
+    check(credit.verdict == SpamHeuristics::Verdict::Ham,
+          QStringLiteral("...and ordinary mail from them still lands as ham (total %1)")
+              .arg(credit.total));
 
     // Unless the message failed authentication while claiming to be them.
+    ctx.authPassed = false;
     ctx.authFailed = true;
     const SpamHeuristics::Score forged = SpamHeuristics::score(
         headOnly("Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
@@ -1070,6 +1096,104 @@ void testKnownCorrespondentExemption()
           QStringLiteral("a spoofed known contact is marked (total %1: %2)")
               .arg(forged.total)
               .arg(hitList(forged)));
+}
+
+/// The user's own address in the From line with nothing vouching for it: the
+/// "I sent this from your account" extortion. Decisive at the header stage,
+/// whether or not the user ever mailed themselves, and never argued down by
+/// Rule 0 — which used to exempt exactly this message when the server stamped
+/// no Authentication-Results at all.
+void testOwnAddressSpoof()
+{
+    const char *selfMail =
+        "Received: from [134.17.138.81] by mx104.nameserver.sk with esmtp (Exim 4.94.2)"
+        " (envelope-from <you@example.org>) id 1x2YOt-001kAS-MW"
+        " for you@example.org; Fri, 04 Sep 2026 20:12:35 +0200\r\n"
+        "Received: from gnarzcp ([193.63.219.152]) by 26290.com with MailEnable ESMTP;"
+        " Fri, 4 Sep 2026 21:12:29 +0300\r\n"
+        "From: you@example.org\r\n"
+        "To: you@example.org\r\n"
+        "Subject: YOU GOT RECORDED!\r\n"
+        "Date: Fri, 4 Sep 2026 21:12:29 +0300\r\n"
+        "Message-ID: <315575.315575@26290.com>\r\n";
+
+    SpamHeuristics::Context ctx;
+    ctx.ownAddresses = {QStringLiteral("you@example.org")};
+    ctx.knownCorrespondent = true; // the user has mailed themselves before
+    const SpamHeuristics::Score s = SpamHeuristics::score(headOnly(selfMail), ctx);
+    check(!s.exempt && fired(s, "own-address-unverified")
+              && s.verdict == SpamHeuristics::Verdict::Spam,
+          QStringLiteral("own address with no auth verdict is marked, not exempt (total %1: %2)")
+              .arg(s.total)
+              .arg(hitList(s)));
+    check(!fired(s, "known-contact"),
+          QStringLiteral("...and having mailed oneself earns no credit (%1)").arg(hitList(s)));
+
+    // An outright failure is the same fact stated by the server.
+    SpamHeuristics::Context failed = ctx;
+    failed.authFailed = true;
+    const SpamHeuristics::Score f = SpamHeuristics::score(headOnly(selfMail), failed);
+    check(fired(f, "own-address-forged") && !fired(f, "known-contact-spoofed")
+              && f.verdict == SpamHeuristics::Verdict::Spam,
+          QStringLiteral("own address failing auth is own-address-forged alone (%1)")
+              .arg(hitList(f)));
+
+    // Mail the user really did send themselves passes at their own server.
+    SpamHeuristics::Context genuine = ctx;
+    genuine.authPassed = true;
+    const SpamHeuristics::Score g = SpamHeuristics::score(headOnly(selfMail), genuine);
+    check(g.exempt && g.verdict == SpamHeuristics::Verdict::Ham,
+          QStringLiteral("authenticated self-mail is exempt (%1)").arg(g.exemptReason));
+    SpamHeuristics::Context relayed = ctx;
+    relayed.arcPassed = true;
+    check(!fired(SpamHeuristics::score(headOnly(selfMail), relayed), "own-address-unverified"),
+          QStringLiteral("arc=pass vouches for a relayed self-mail"));
+
+    // Somebody else's address is not this rule's business.
+    SpamHeuristics::Context stranger;
+    stranger.ownAddresses = {QStringLiteral("other@example.org")};
+    check(!fired(SpamHeuristics::score(headOnly(selfMail), stranger), "own-address-unverified"),
+          QStringLiteral("the rule reads only the user's own addresses"));
+}
+
+/// The body half of the same scam: a wallet address and the pitch around it.
+void testCryptoExtortion()
+{
+    SpamHeuristics::Message m;
+    m.head = QByteArray(plainHead());
+    m.text = QStringLiteral(
+        "Some time ago, your device was infected with my private Trojan.\n"
+        "I RECORDED YOU (through your camera)!\n"
+        "All you need is $800 USD in Bitcoin, transferred to my wallet address.\n"
+        "My Bitcoin wallet address is: 1DFN2R8w1Qos6Cwi4kp68ACZLSHHFeaRFq\n");
+    const SpamHeuristics::Score s = SpamHeuristics::score(m, {});
+    check(fired(s, "crypto-extortion") && s.verdict == SpamHeuristics::Verdict::Spam,
+          QStringLiteral("wallet address plus extortion vocabulary is decisive (total %1: %2)")
+              .arg(s.total)
+              .arg(hitList(s)));
+
+    // bech32 spelling, HTML body.
+    m.text.clear();
+    m.html = QStringLiteral("<p>Your webcam recorded everything. Pay to "
+                            "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq now.</p>");
+    check(fired(SpamHeuristics::score(m, {}), "crypto-extortion"),
+          QStringLiteral("bech32 address in HTML is read the same way"));
+
+    // An address on its own is only a weak signal: exchanges quote them.
+    m.html.clear();
+    m.text = QStringLiteral("Your withdrawal to 1DFN2R8w1Qos6Cwi4kp68ACZLSHHFeaRFq is complete.");
+    const SpamHeuristics::Score ex = SpamHeuristics::score(m, {});
+    check(fired(ex, "crypto-wallet") && !fired(ex, "crypto-extortion")
+              && ex.verdict == SpamHeuristics::Verdict::Ham,
+          QStringLiteral("a bare wallet address is weak (total %1: %2)")
+              .arg(ex.total)
+              .arg(hitList(ex)));
+
+    // Ordinary text with none of it.
+    m.text = QStringLiteral("The camera you ordered has been recorded as shipped.");
+    check(!fired(SpamHeuristics::score(m, {}), "crypto-wallet")
+              && !fired(SpamHeuristics::score(m, {}), "crypto-extortion"),
+          QStringLiteral("no wallet address, no rule"));
 }
 
 /// The tooltip's arithmetic. Every hit gets a row, the total gets a row, and
@@ -1166,6 +1290,7 @@ void testUnfamiliarTld()
     // on which country they are in.
     SpamHeuristics::Context correspondent = ctx;
     correspondent.knownCorrespondent = true;
+    correspondent.authPassed = true;
     check(SpamHeuristics::score(headOnly(fromHr), correspondent).exempt,
           QStringLiteral("a known correspondent in an unusual TLD stays exempt"));
 }
@@ -1432,10 +1557,11 @@ void testSoftfailRule()
     check(s.total < SpamHeuristics::spamThreshold(),
           QStringLiteral("softfail alone cannot mark (total %1)").arg(s.total));
 
-    // A known contact whose forwarded mail softfails stays exempt — the case
-    // the split exists for.
+    // A known contact whose forwarded mail softfails (SPF) but passes DKIM
+    // stays exempt — the case the split exists for.
     SpamHeuristics::Context knownSoft = soft;
     knownSoft.knownCorrespondent = true;
+    knownSoft.authPassed = true;
     const SpamHeuristics::Score known = SpamHeuristics::score(headOnly(ordinary), knownSoft);
     check(known.exempt,
           QStringLiteral("a known contact's softfail keeps the exemption (total %1)")
@@ -1540,6 +1666,8 @@ int main(int argc, char **argv)
     testLinkGroupIsCapped();
     testHamStaysUnmarked();
     testKnownCorrespondentExemption();
+    testOwnAddressSpoof();
+    testCryptoExtortion();
     testExplanationRows();
     testRuleWeightOverrides();
     testHackedPhpShapes();

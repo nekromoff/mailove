@@ -8,6 +8,7 @@
 #include <QTemporaryDir>
 #include <QTextCursor>
 #include <QTextListFormat>
+#include <QUrl>
 
 #include <memory>
 
@@ -100,6 +101,19 @@ public:
 
     /// Whether pasteImage() would do anything — for the "Paste image" hint.
     Q_INVOKABLE bool clipboardHasImage() const;
+
+    /// Files dropped *on the body*: the images among them go into the message
+    /// inline, at the cursor, exactly as a pasted one does. Returns the URLs it
+    /// did not take — everything that is not a local image — so the caller can
+    /// attach those instead. Judged per file rather than all-or-nothing like
+    /// the clipboard path: dropping a photo and a PDF together is deliberate,
+    /// and each half has an obvious place to land.
+    Q_INVOKABLE QList<QUrl> insertImageFiles(const QList<QUrl> &urls);
+
+    /// Whether any of \a urls would come back from insertImageFiles() — i.e.
+    /// whether a drop on the body would attach something rather than inline all
+    /// of it. Lets the composer name the outcome before the drop happens.
+    Q_INVOKABLE bool hasNonImageFile(const QList<QUrl> &urls) const;
 
     /// The document's edit revision — bumped by every change, free to read.
     /// The composer's modified check compares this instead of body text:

@@ -101,6 +101,25 @@ int main(int argc, char *argv[])
             UpdateCheck::setRunningVersion(QString::fromLocal8Bit(argv[i]).section(u'=', 1));
     }
 
+    // The message preview turns black — and stays black for the rest of the
+    // session — as soon as a drag passes over the application: QtWebEngine's
+    // GPU compositor loses the view's texture when the drag takes the context
+    // and nothing brings it back. Not a Wayland fault; xcb does it too.
+    //
+    // Only the compositing comes off the GPU. Rasterization stays on it: the
+    // full --disable-gpu cures this as well, but gives up more than the bug
+    // costs, and this narrower flag was enough to survive a drag.
+    //
+    // Appended rather than assigned, so flags set in the environment still
+    // reach Chromium; skipped entirely when they already say --disable-gpu
+    // (in either form), which also keeps this from stacking up on itself.
+    const QByteArray chromiumFlags = qgetenv("QTWEBENGINE_CHROMIUM_FLAGS");
+    if (!chromiumFlags.contains("--disable-gpu")) {
+        const QByteArray flag("--disable-gpu-compositing");
+        qputenv("QTWEBENGINE_CHROMIUM_FLAGS",
+                chromiumFlags.isEmpty() ? flag : chromiumFlags + " " + flag);
+    }
+
     ViewerSchemeHandler::registerScheme();
     QtWebEngineQuick::initialize();
 

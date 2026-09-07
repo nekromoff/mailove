@@ -89,6 +89,22 @@ Kirigami.ApplicationWindow {
         return sequence !== "" ? " (" + sequence + ")" : ""
     }
 
+    // The forwarded arrow, drawn at half the weight of the other row markers:
+    // the paperclip and the lock say what a message contains, this one says
+    // what was done with it, and at the same size the three read as one class
+    // of fact. Rounded and floored so it never collapses on a small icon
+    // theme. Named once — both list layouts draw the same glyph.
+    readonly property real forwardedGlyphSize:
+        Math.max(6, Math.round(Kirigami.Units.iconSizes.small / 2))
+
+    // The marker glyphs pack tight: a Row skips the ones that are not showing,
+    // so a row with one marker spends the width of one marker and the rest
+    // shuffle up. The column is sized to the busiest loaded row
+    // (messageModel.markerCount) and to nothing more — a folder of plain mail
+    // gives it no width at all and the space goes to Subject. The order is
+    // fixed whatever is showing: forwarded, lock, invitation, paperclip.
+    readonly property int markerGlyphSpacing: 1
+
     // Mail-list row height from the density setting
     readonly property real listRowHeight:
         Kirigami.Units.gridUnit * [1.15, 1.4, 1.9][uiSettings.rowDensity]
@@ -2381,14 +2397,29 @@ Kirigami.ApplicationWindow {
 
                             // Column layout shared by the header row and every message row.
                             // Order is user-adjustable by dragging headers; weight 0 marks
-                            // the fixed-width attachment icon column.
+                            // the fixed-width marker column.
                             property ListModel columns: ListModel {
                                 ListElement { colId: "attach"; title: ""; sortCol: 3; weight: 0 }
                                 ListElement { colId: "subject"; title: "Subject"; sortCol: 2; weight: 4 }
                                 ListElement { colId: "from"; title: "From"; sortCol: 1; weight: 3 }
                                 ListElement { colId: "date"; title: "Date"; sortCol: 0; weight: 2 }
                             }
-                            property real fixedColumnWidth: Kirigami.Units.gridUnit * 2
+                            // As wide as the busiest loaded row needs and no wider, but
+                            // never under two icons' worth. The floor is what keeps the
+                            // list from re-flowing under the reader: a folder of plain
+                            // mail would otherwise have no marker column at all, and the
+                            // first signed or forwarded message to arrive would shift
+                            // every subject line sideways. Two icons is also where the
+                            // (i) header sits, so the column always has something in it.
+                            readonly property int markerCount: Mail.messageModel.markerCount
+                            property real fixedColumnWidth: {
+                                // Monotonic in the glyph count, so the floor is applied to
+                                // the count rather than to two widths.
+                                const n = Math.max(2, markerCount)
+                                return n * Kirigami.Units.iconSizes.small
+                                    + (n - 1) * root.markerGlyphSpacing
+                                    + Kirigami.Units.smallSpacing
+                            }
 
                             function saveColumnOrder() {
                                 const ids = []
@@ -2681,14 +2712,35 @@ Kirigami.ApplicationWindow {
                                                 Drag.source: headerContent
                                                 Drag.hotSpot: Qt.point(width / 2, height / 2)
 
+                                                // The marker column heads with an (i). It
+                                                // used to wear a paperclip, from when a
+                                                // paperclip was the only thing under it; it
+                                                // now carries the lock, the invitation, the
+                                                // forwarded arrow and the attachment, and a
+                                                // heading naming one of four is worse than
+                                                // one that names none of them and says
+                                                // "facts about the message" instead. What
+                                                // those are is on the tooltip. Sorting and
+                                                // dragging still work — the whole cell is
+                                                // the target, not the glyph.
                                                 Kirigami.Icon {
                                                     visible: headerCell.colId === "attach"
                                                     anchors.centerIn: parent
-                                                    source: "mail-attachment"
+                                                    // Symbolic and masked, for the same
+                                                    // reason as the sort arrow below: the
+                                                    // full-color artwork does not recolor
+                                                    // and disappears on a dark header.
+                                                    source: "documentinfo-symbolic"
+                                                    isMask: true
+                                                    color: Kirigami.Theme.textColor
                                                     width: Kirigami.Units.iconSizes.small
                                                     height: width
                                                     opacity: 0.7
                                                 }
+                                                QQC2.ToolTip.text: qsTr("Attachment, invitation, encryption, forwarded")
+                                                QQC2.ToolTip.visible: headerCell.colId === "attach"
+                                                                      && markerHeaderHover.hovered
+                                                HoverHandler { id: markerHeaderHover }
                                                 // Title and sort arrow travel together:
                                                 // parked on the column's right edge the
                                                 // arrow sat far from the word it qualifies,
@@ -3572,8 +3624,19 @@ Kirigami.ApplicationWindow {
                                         readonly property string correspondent:
                                             (Mail.viewingOutgoing && to !== "") ? to : from
                                         required property bool seen
+                                        /// $Forwarded: this message has been
+                                        /// forwarded, from here or from any
+                                        /// other client that sets the keyword.
+                                        required property bool forwarded
                                         required property bool hasAttachment
                                         required property bool calendarAttachment
+                                        /// Attachments counted from the body; 0 until the
+                                        /// message has been opened once, where the paperclip
+                                        /// itself comes from the head and needs no body.
+                                        required property int attachmentCount
+                                        /// The .ics invitations among them, counted apart:
+                                        /// they have their own slot in the marker column.
+                                        required property int calendarCount
                                         /// PgpMime::StoredKind: 0 none, 1 encrypted, 2 signed,
                                         /// 3 both. 1 and 3 both draw the lock — what matters at
                                         /// list level is that it is encrypted.
@@ -3592,6 +3655,42 @@ Kirigami.ApplicationWindow {
                                         // Shown as a row background tint rather than as the
                                         // text color, so text keeps full theme contrast and
                                         // an arbitrary user color never becomes unreadable.
+                                        // One tooltip for the whole marker column, one line
+                                        // per glyph actually showing, in the order they are
+                                        // drawn. Four separate tooltips over four adjacent
+                                        // 8-16px targets would be four things to hunt for;
+                                        // this is one hover that answers the column.
+                                        readonly property string markerTooltip: {
+                                            const lines = []
+                                            if (forwarded)
+                                                lines.push("You forwarded this message")
+                                            if (crypto === 3)
+                                                lines.push("Encrypted and signed")
+                                            else if (crypto === 2)
+                                                lines.push("Signed")
+                                            else if (crypto === 1)
+                                                lines.push("Encrypted")
+                                            // An invitation and an attachment are two
+                                            // separate facts and get a line each — a mail
+                                            // can carry the .ics and the agenda together.
+                                            if (calendarAttachment) {
+                                                lines.push(calendarCount > 1
+                                                           ? calendarCount + " calendar invitations"
+                                                           : "Calendar invitation")
+                                            }
+                                            if (hasAttachment) {
+                                                if (attachmentCount === 1)
+                                                    lines.push("1 attachment")
+                                                else if (attachmentCount > 1)
+                                                    lines.push(attachmentCount + " attachments")
+                                                else
+                                                    // Only the body carries the number, and
+                                                    // this message's has never been cached.
+                                                    lines.push("Attachments")
+                                            }
+                                            return lines.join("\n")
+                                        }
+
                                         readonly property string markColor:
                                             colorLabel > 0 ? root.scaleColorOf(colorLabel) : ""
 
@@ -3782,20 +3881,56 @@ Kirigami.ApplicationWindow {
                                                     Row {
                                                         visible: rowCell.colId === "attach"
                                                         anchors.centerIn: parent
-                                                        spacing: 2
+                                                        spacing: root.markerGlyphSpacing
 
-                                                        Kirigami.Icon { // encrypted / signed marker
+                                                        QQC2.ToolTip.text: msgDelegate.markerTooltip
+                                                        QQC2.ToolTip.visible: markerHover.hovered
+                                                                              && msgDelegate.markerTooltip !== ""
+                                                        Timer {
+                                                            id: countFill
+                                                            interval: 400
+                                                            onTriggered: Mail.ensureAttachmentCount(msgDelegate.index)
+                                                        }
+                                                        HoverHandler {
+                                                            id: markerHover
+                                                            // Only once the pointer has settled:
+                                                            // filling the count reads and parses the
+                                                            // cached body on the GUI thread, and a
+                                                            // mouse crossing the list would otherwise
+                                                            // fire that for every row it passed over.
+                                                            onHoveredChanged: {
+                                                                if (hovered && msgDelegate.hasAttachment
+                                                                    && msgDelegate.attachmentCount === 0)
+                                                                    countFill.restart()
+                                                                else
+                                                                    countFill.stop()
+                                                            }
+                                                        }
+
+                                                        Kirigami.Icon { // forwarded by you
+                                                            visible: msgDelegate.forwarded
+                                                            source: "mail-forwarded"
+                                                            width: root.forwardedGlyphSize
+                                                            height: width
+                                                            opacity: 0.7
+                                                        }
+                                                        Kirigami.Icon { // encrypted / signed
                                                             visible: msgDelegate.crypto > 0
-                                                            source: msgDelegate.crypto === 2
-                                                                    ? "mail-signed" : "mail-encrypted"
+                                                            source: msgDelegate.crypto === 2 ? "mail-signed" : "mail-encrypted"
                                                             width: Kirigami.Units.iconSizes.small
                                                             height: width
                                                             opacity: 0.7
                                                         }
-                                                        Kirigami.Icon { // paperclip / calendar-invite
+                                                        Kirigami.Icon { // calendar invitation
+                                                            visible: msgDelegate.calendarAttachment
+                                                            source: "view-calendar"
+                                                            width: Kirigami.Units.iconSizes.small
+                                                            height: width
+                                                            opacity: 0.7
+                                                        }
+                                                        Kirigami.Icon { // paperclip
                                                             visible: msgDelegate.hasAttachment
-                                                            source: msgDelegate.calendarAttachment
-                                                                    ? "view-calendar" : "mail-attachment"
+                                                            source: "mail-attachment"
                                                             width: Kirigami.Units.iconSizes.small
                                                             height: width
                                                             opacity: 0.7
@@ -3927,21 +4062,65 @@ Kirigami.ApplicationWindow {
                                                         font.bold: !msgDelegate.seen
                                                         color: msgDelegate.rowTextColor
                                                     }
-                                                    Kirigami.Icon { // encrypted / signed
-                                                        visible: msgDelegate.crypto > 0
-                                                        source: msgDelegate.crypto === 2
-                                                                ? "mail-signed" : "mail-encrypted"
-                                                        implicitWidth: Kirigami.Units.iconSizes.small
-                                                        implicitHeight: implicitWidth
+                                                    // The same three glyphs as the wide
+                                                    // list's marker column, in the same
+                                                    // order and under the same one tooltip.
+                                                    Row {
+                                                        spacing: root.markerGlyphSpacing
+                                                        Layout.alignment: Qt.AlignVCenter
+
+                                                        QQC2.ToolTip.text: msgDelegate.markerTooltip
+                                                        QQC2.ToolTip.visible: markerHoverNarrow.hovered
+                                                                              && msgDelegate.markerTooltip !== ""
+                                                        Timer {
+                                                            id: countFill
+                                                            interval: 400
+                                                            onTriggered: Mail.ensureAttachmentCount(msgDelegate.index)
+                                                        }
+                                                        HoverHandler {
+                                                            id: markerHoverNarrow
+                                                            // Only once the pointer has settled:
+                                                            // filling the count reads and parses the
+                                                            // cached body on the GUI thread, and a
+                                                            // mouse crossing the list would otherwise
+                                                            // fire that for every row it passed over.
+                                                            onHoveredChanged: {
+                                                                if (hovered && msgDelegate.hasAttachment
+                                                                    && msgDelegate.attachmentCount === 0)
+                                                                    countFill.restart()
+                                                                else
+                                                                    countFill.stop()
+                                                            }
+                                                        }
+
+                                                    Kirigami.Icon { // forwarded by you
+                                                        visible: msgDelegate.forwarded
+                                                        source: "mail-forwarded"
+                                                        width: root.forwardedGlyphSize
+                                                        height: width
                                                         opacity: 0.7
                                                     }
-                                                    Kirigami.Icon { // paperclip / calendar-invite
-                                                        visible: msgDelegate.hasAttachment
-                                                        source: msgDelegate.calendarAttachment
-                                                                ? "view-calendar" : "mail-attachment"
-                                                        implicitWidth: Kirigami.Units.iconSizes.small
-                                                        implicitHeight: implicitWidth
+                                                    Kirigami.Icon { // encrypted / signed
+                                                        visible: msgDelegate.crypto > 0
+                                                        source: msgDelegate.crypto === 2 ? "mail-signed" : "mail-encrypted"
+                                                        width: Kirigami.Units.iconSizes.small
+                                                        height: width
                                                         opacity: 0.7
+                                                    }
+                                                    Kirigami.Icon { // calendar invitation
+                                                        visible: msgDelegate.calendarAttachment
+                                                        source: "view-calendar"
+                                                        width: Kirigami.Units.iconSizes.small
+                                                        height: width
+                                                        opacity: 0.7
+                                                    }
+                                                    Kirigami.Icon { // paperclip
+                                                        visible: msgDelegate.hasAttachment
+                                                        source: "mail-attachment"
+                                                        width: Kirigami.Units.iconSizes.small
+                                                        height: width
+                                                        opacity: 0.7
+                                                    }
                                                     }
                                                 }
                                             }

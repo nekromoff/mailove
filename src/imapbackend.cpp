@@ -268,6 +268,15 @@ void ImapBackend::disconnectAccount()
 void ImapBackend::updateAccessToken(const QString &accessToken)
 {
     m_credentials.accessToken = accessToken;
+    // A fresh token retires the most common reason the extra connections were
+    // refused: their login raced a token that had expired while the main
+    // session — authenticated long ago — sailed on. Give them another chance
+    // now rather than waiting out the cooldown.
+    if (m_bodyPoolBroken)
+        qCDebug(logTrace, "body pool: un-latched by token renewal");
+    m_bodyPoolBroken = false;
+    if (m_connected && !m_syncSession)
+        startSyncSession();
 }
 
 void ImapBackend::connectAccount(const Credentials &credentials)
@@ -327,12 +336,15 @@ void ImapBackend::startSyncSession()
 {
     if (m_syncSession || !m_connected)
         return;
+    qCDebug(logTrace, "sync connection: opening");
     m_syncSession = new KIMAP::Session(m_credentials.host, quint16(m_credentials.port), this);
     const auto drop = [this] {
         // A connection dropped while a background fetch was in flight is the
         // server pushing back on heavy fetching (Gmail does this rather than
         // failing the job cleanly). Reported as throttling so the caller grows
         // its backoff instead of reconnecting and hammering at full speed.
+        qCDebug(logTrace, "sync connection: dropped (was %s)",
+                m_syncReady ? "ready" : "logging in");
         m_syncReady = false;
         m_syncFolder.clear();
     m_syncQueuedFolder.clear();
@@ -352,6 +364,7 @@ void ImapBackend::startSyncSession()
             drop();
             return;
         }
+        qCDebug(logTrace, "sync connection: ready");
         m_syncReady = true;
     });
     login->start();
@@ -361,6 +374,11 @@ void ImapBackend::withSyncSession(const QString &folder,
                                   const std::function<void(KIMAP::Session *)> &fn)
 {
     if (!m_syncSession || !m_syncReady) {
+        // Answer "nothing to run on" for this call, but start putting the
+        // connection back together so a later one has it. No-op while a login
+        // is already in flight.
+        if (m_connected)
+            startSyncSession();
         fn(nullptr);
         return;
     }
@@ -772,6 +790,11 @@ static QByteArray imapFlag(const QString &flag)
         {QStringLiteral("draft"), QByteArrayLiteral("\\Draft")},
         {QStringLiteral("flagged"), QByteArrayLiteral("\\Flagged")},
         {QStringLiteral("answered"), QByteArrayLiteral("\\Answered")},
+        // A keyword, not a system flag: RFC 5788 registers $Forwarded and
+        // every other client writes it that way. A server whose mailbox does
+        // not advertise \\* in PERMANENTFLAGS will refuse to keep it, and the
+        // op retires like any other refused change rather than pretending.
+        {QStringLiteral("forwarded"), QByteArrayLiteral("$Forwarded")},
     };
     const auto it = known.constFind(flag.toLower());
     return it != known.cend() ? it.value() : flag.toUtf8();
@@ -1006,10 +1029,28 @@ void ImapBackend::withReadSession(const QString &folder, bool background,
         withSyncSession(folder, fn);
         return;
     }
-    // The queued selection again: m_selectedFolder is what the connection has
-    // finished selecting, which during any overlap names the folder it is
-    // about to leave.
+    // No usable background connection: begin reopening it for the next tick…
+    if (m_connected)
+        startSyncSession();
+    // …and for now, the queued selection again: m_selectedFolder is what the
+    // connection has finished selecting, which during any overlap names the
+    // folder it is about to leave.
     fn(m_queuedFolder == folder ? m_session.data() : nullptr);
+}
+
+bool ImapBackend::sessionHasSelected(KIMAP::Session *session, const QString &folder) const
+{
+    if (session == m_syncSession.data())
+        return m_syncFolder == folder;
+    if (session == m_session.data())
+        return m_selectedFolder == folder;
+    for (const auto &conn : m_bodyPool) {
+        if (conn->session.data() == session)
+            return conn->folder == folder;
+    }
+    // A session this backend no longer tracks is torn down or being torn
+    // down; nothing delivered on it can be trusted to any mailbox.
+    return false;
 }
 
 void ImapBackend::runHeaderFetch(KIMAP::Session *session, const QString &folder,
@@ -1026,7 +1067,18 @@ void ImapBackend::runHeaderFetch(KIMAP::Session *session, const QString &folder,
     fetch->setScope(scope);
 
     connect(fetch, &KIMAP::FetchJob::messagesAvailable, this,
-            [this, folder, minUid](const QMap<qint64, KIMAP::Message> &messages) {
+            [this, session, folder, minUid](const QMap<qint64, KIMAP::Message> &messages) {
+                // The wrong-mailbox hole: a FETCH whose SELECT failed runs
+                // against whatever the session had open before. Storing its
+                // messages under \a folder would file another mailbox's mail
+                // under this one's uids — drop the batch, the next pass
+                // re-asks. See sessionHasSelected().
+                if (!sessionHasSelected(session, folder)) {
+                    qCWarning(logTrace, "header fetch for %s answered with another "
+                                        "mailbox selected - batch dropped",
+                              qUtf8Printable(folder));
+                    return;
+                }
                 QList<HeaderInfo> out;
                 out.reserve(messages.size());
                 for (auto it = messages.cbegin(); it != messages.cend(); ++it) {
@@ -1053,6 +1105,8 @@ void ImapBackend::runHeaderFetch(KIMAP::Session *session, const QString &folder,
                             h.flags.append(QStringLiteral("flagged"));
                         else if (flag.compare("\\Answered", Qt::CaseInsensitive) == 0)
                             h.flags.append(QStringLiteral("answered"));
+                        else if (flag.compare("$Forwarded", Qt::CaseInsensitive) == 0)
+                            h.flags.append(QStringLiteral("forwarded"));
                     }
                     out.append(h);
                 }
@@ -1096,7 +1150,7 @@ void ImapBackend::fetchHeaderWindow(const QString &folder, int fromNewest, int c
 }
 
 void ImapBackend::fetchHeadersSince(const QString &folder, const QString &sinceRemoteId,
-                                    const OpCallback &done)
+                                    const OpCallback &done, bool background)
 {
     bool ok = false;
     const qint64 sinceUid = sinceRemoteId.toLongLong(&ok);
@@ -1105,7 +1159,7 @@ void ImapBackend::fetchHeadersSince(const QString &folder, const QString &sinceR
     // reconnect the point is to catch up on whatever arrived, and how many
     // that is, is exactly what is not known yet.
     set.add(KIMAP::ImapInterval((ok && sinceUid > 0) ? sinceUid + 1 : 1));
-    withReadSession(folder, false, [this, folder, set, sinceUid, ok, done](KIMAP::Session *s) {
+    withReadSession(folder, background, [this, folder, set, sinceUid, ok, done](KIMAP::Session *s) {
         if (!s) {
             if (done)
                 done(Error::Connection, tr("No connection available for %1.").arg(folder));
@@ -1186,8 +1240,9 @@ void ImapBackend::shrinkBodyPool()
 {
     // Stop growing the pool, and shed one idle connection so the concurrent
     // count actually drops. A busy one is left to finish and reused; the cap
-    // flag keeps us from re-adding.
+    // flag keeps us from re-adding until its cooldown runs out.
     m_bodyPoolBroken = true;
+    m_bodyPoolBrokenSince.start();
     for (int i = 0; i < m_bodyPool.size(); ++i) {
         if (!m_bodyPool.at(i)->busy) {
             auto conn = m_bodyPool.takeAt(i);
@@ -1203,7 +1258,16 @@ void ImapBackend::shrinkBodyPool()
 void ImapBackend::ensureBodyPool()
 {
     // Extra connections only once the server has proven it grants us a second
-    // one at all (the background session), and never after a refusal.
+    // one at all (the background session), and not while a refusal is fresh.
+    // The refusal latch expires rather than holding for the session: the
+    // usual causes (an expired OAuth token, a momentary connection cap) are
+    // transient, and a latch that never lifted left every body fetch riding
+    // one connection for hours.
+    if (m_bodyPoolBroken && m_bodyPoolBrokenSince.isValid()
+        && m_bodyPoolBrokenSince.hasExpired(kBodyPoolRetryMs)) {
+        qCDebug(logTrace, "body pool: refusal cooldown over - trying again");
+        m_bodyPoolBroken = false;
+    }
     if (!m_connected || !m_syncReady || m_bodyPoolBroken)
         return;
     // Keep the total concurrent connection count low (interactive + IDLE +
@@ -1229,8 +1293,10 @@ void ImapBackend::ensureBodyPool()
             if (job->error() || !conn->session) {
                 qWarning() << "mailove: body-pool login failed:" << job->errorString();
                 // The server likely caps concurrent connections — settle for
-                // what we have until the next (re)connect.
+                // what we have until the cooldown (or a token renewal) lifts
+                // the latch.
                 m_bodyPoolBroken = true;
+                m_bodyPoolBrokenSince.start();
                 drop();
                 return;
             }
@@ -1241,7 +1307,7 @@ void ImapBackend::ensureBodyPool()
 }
 
 void ImapBackend::fetchBodies(const QString &folder, const QStringList &remoteIds,
-                              const OpCallback &done)
+                              const OpCallback &done, bool interactive)
 {
     const KIMAP::ImapSet set = uidSet(remoteIds);
     if (set.isEmpty()) {
@@ -1249,6 +1315,13 @@ void ImapBackend::fetchBodies(const QString &folder, const QStringList &remoteId
             done(Error::None, QString());
         return;
     }
+    // The background connection can be dropped on its own (Gmail sheds it as
+    // throttling pushback) and nothing but a backfill tick used to reopen it —
+    // so once the backfill went quiet, a dead sync session stayed dead and
+    // every body fetch below found nothing to run on. Reopen it whenever it is
+    // found missing; a no-op while one is already logging in.
+    if (m_connected && !m_syncReady)
+        startSyncSession();
     ensureBodyPool();
 
     // Preferred path: a free pool connection, so bulk transfer never shares a
@@ -1281,22 +1354,59 @@ void ImapBackend::fetchBodies(const QString &folder, const QStringList &remoteId
         return;
     }
 
-    // Fallback while the pool is still logging in, or was refused.
+    // Fallback while the pool is still logging in, or was refused: the
+    // background connection, when it is up and free.
+    if (!m_bodyFallbackBusy && m_syncSession && m_syncReady) {
+        m_bodyFallbackBusy = true;
+        withSyncSession(folder, [this, folder, set, done, interactive](KIMAP::Session *s) {
+            if (!s) {
+                m_bodyFallbackBusy = false;
+                if (interactive && m_session) {
+                    fetchBodiesOnMainSession(folder, set, done);
+                    return;
+                }
+                if (done)
+                    done(Error::Connection,
+                         tr("No connection available for %1.").arg(folder));
+                return;
+            }
+            startBodyFetchJob(s, folder, set, done, [this] { m_bodyFallbackBusy = false; });
+        });
+        return;
+    }
+
+    // Every background leg is down or busy. For the backfill that is an
+    // answer: declined ids come back round on a later pass. For a message the
+    // user clicked it is not — this used to end here in "No connection
+    // available for <folder>", with the interactive connection sitting idle
+    // right next to it. The user's own connection is exactly the one a request
+    // the user is waiting on may ride.
+    if (interactive && m_session) {
+        fetchBodiesOnMainSession(folder, set, done);
+        return;
+    }
     if (m_bodyFallbackBusy) {
         if (done)
             done(Error::None, QString());
         return;
     }
-    m_bodyFallbackBusy = true;
-    withSyncSession(folder, [this, folder, set, done](KIMAP::Session *s) {
-        if (!s) {
-            m_bodyFallbackBusy = false;
-            if (done)
-                done(Error::Connection, tr("No connection available for %1.").arg(folder));
-            return;
-        }
-        startBodyFetchJob(s, folder, set, done, [this] { m_bodyFallbackBusy = false; });
-    });
+    if (done)
+        done(Error::Connection, tr("No connection available for %1.").arg(folder));
+}
+
+/// Last resort for an interactive fetch: SELECT (if needed) and the body jobs
+/// go onto the main session back to back, same queue discipline as every
+/// other interactive operation. Reached only when the pool and the background
+/// connection are both unavailable, so nothing bulk is borrowing the user's
+/// connection here — this IS the user's request.
+void ImapBackend::fetchBodiesOnMainSession(const QString &folder, const KIMAP::ImapSet &set,
+                                           const OpCallback &done)
+{
+    qCDebug(logTrace, "bodies: pool and sync connection down - serving %s on the "
+                      "interactive session", qUtf8Printable(folder));
+    if (m_queuedFolder != folder)
+        issueSelect(folder, false);
+    startBodyFetchJob(m_session.data(), folder, set, done, [] {});
 }
 
 void ImapBackend::startBodyFetchJob(KIMAP::Session *session, const QString &folder,
@@ -1339,7 +1449,18 @@ void ImapBackend::startBodyFetchJob(KIMAP::Session *session, const QString &fold
     auto found = std::make_shared<QHash<qint64, RawMessage>>();
     auto sent = std::make_shared<QSet<qint64>>();
     const auto onMessages =
-        [this, folder, found, sent](const QMap<qint64, KIMAP::Message> &messages) {
+        [this, session, folder, found, sent](const QMap<qint64, KIMAP::Message> &messages) {
+            // Same wrong-mailbox hole as the header fetch: a body delivered
+            // with another mailbox selected is another message entirely, and
+            // caching it under this folder's uid is exactly the mis-filed
+            // body body_msgid_heal1 exists to clean up. Dropped instead; the
+            // backfill re-asks.
+            if (!sessionHasSelected(session, folder)) {
+                qCWarning(logTrace, "body fetch for %s answered with another "
+                                    "mailbox selected - batch dropped",
+                          qUtf8Printable(folder));
+                return;
+            }
             for (const KIMAP::Message &m : messages) {
                 if (m.uid <= 0 || sent->contains(m.uid))
                     continue;
@@ -1465,9 +1586,21 @@ void ImapBackend::fetchUnseenIds(
         // NOT SEEN. One command, and the complete answer: every id it returns
         // is unread, and every cached row it does not is read.
         search->setTerm(KIMAP::Term(KIMAP::Term::Seen).setNegated(true));
-        connect(search, &KJob::result, this, [folder, done](KJob *job) {
+        connect(search, &KJob::result, this, [this, s, folder, done](KJob *job) {
             if (job->error()) {
                 done(Error::Protocol, {}, job->errorString());
+                return;
+            }
+            // The same wrong-mailbox hole as the fetches: a SEARCH answered
+            // with another mailbox selected names that mailbox's unread, and
+            // reconciling this folder's flags against it would mark the wrong
+            // messages read. Reported as a failure so the caller leaves the
+            // flags alone.
+            if (!sessionHasSelected(s, folder)) {
+                qCWarning(logTrace, "unseen search for %s answered with another "
+                                    "mailbox selected - discarded",
+                          qUtf8Printable(folder));
+                done(Error::Protocol, {}, QStringLiteral("wrong mailbox selected"));
                 return;
             }
             const QList<qint64> uids = static_cast<KIMAP::SearchJob *>(job)->results();

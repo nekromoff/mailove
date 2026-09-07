@@ -79,12 +79,16 @@ public:
     void openFolder(const QString &folder, const QString &syncToken) override;
     void fetchHeaderWindow(const QString &folder, int fromNewest, int count,
                            bool background, const OpCallback &done) override;
+    /// \a background is IMAP's connection-routing concern; HTTP requests are
+    /// not serialized, so it changes nothing here.
     void fetchHeadersSince(const QString &folder, const QString &sinceRemoteId,
-                           const OpCallback &done) override;
+                           const OpCallback &done, bool background = false) override;
     void fetchHeadersById(const QString &folder, const QStringList &remoteIds,
                           const OpCallback &done) override;
+    /// \a interactive likewise: every JMAP request already rides the same
+    /// HTTP pipe, so there is no lesser leg to fall back from.
     void fetchBodies(const QString &folder, const QStringList &remoteIds,
-                     const OpCallback &done) override;
+                     const OpCallback &done, bool interactive = false) override;
     int freeBodySlots() const override;
     bool bodyFetchActive() const override { return m_bodiesInFlight > 0; }
     /// Connected is ready: HTTP does not serialize requests, so background

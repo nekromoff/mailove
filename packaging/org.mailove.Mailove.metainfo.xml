@@ -33,6 +33,60 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.5" date="2026-09-07" type="stable">
+      <description>
+        <ul>
+          <li>The known-correspondent exemption now needs the receiving
+              server to have authenticated the message; without a pass the
+              correspondence is credit, not a free pass. Your own address
+              as sender with nothing vouching for it is marked on that
+              alone.</li>
+          <li>A cryptocurrency wallet address beside talk of recordings,
+              webcams or your contacts is marked as the extortion scam it
+              is.</li>
+          <li>A part labelled base64 whose body is plain text - decoded by
+              a delivery path that left the label - is read as it is
+              instead of showing as noise.</li>
+          <li>Forwarding a message marks it forwarded ($Forwarded), and
+              the list shows an arrow for it - including forwards made in
+              other clients.</li>
+          <li>One marker column for attachment, invitation, encryption and
+              forwarded, sized to the busiest row, with one tooltip giving
+              the exact attachment and invitation counts.</li>
+          <li>Files can be dropped anywhere on the composer: pictures
+              dropped on the message go inline, everything else is
+              attached.</li>
+          <li>The message preview no longer turns black for the rest of
+              the session when a drag passes over the window.</li>
+          <li>A clicked message no longer fails with "No connection
+              available" while the user's own connection sits idle.</li>
+          <li>The all-folders sync pass is rate-limited and Trash is left
+              out of the history backfill; new mail still arrives through
+              per-folder delta fetches.</li>
+          <li>A dismissed GnuPG passphrase prompt is reported as a
+              cancellation instead of a failure.</li>
+        </ul>
+      </description>
+    </release>
+    <release version="3.4" date="2026-08-30" type="stable">
+      <description>
+        <ul>
+          <li>Opening a message could show a different message entirely:
+              a body fetched while new mail arrived could be cached under a
+              neighbouring row. Fixed at the root, and a one-time migration
+              finds and drops any body already filed under the wrong
+              message.</li>
+          <li>An IMAP fetch or search answered with a different mailbox
+              selected than asked for is dropped instead of stored.</li>
+          <li>Spam scoring at or past the threshold now files new arrivals
+              into the junk folder by itself. New arrivals only, exemptions
+              and your own answers outrank any score, and auto-filed mail
+              never teaches the junk corpus - only your gesture does.</li>
+          <li>The server's own filter scoring near its threshold carries
+              more weight.</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.3" date="2026-08-27" type="stable">
       <description>
         <ul>

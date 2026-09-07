@@ -141,6 +141,9 @@ static MessageListModel::Header headerFromBackend(const MailBackend::HeaderInfo 
     if (const auto *mid = msg->messageID(); mid && !mid->isEmpty())
         h.msgid = QString::fromLatin1(mid->identifier());
     h.seen = info.flags.contains(QStringLiteral("seen"));
+    // $Forwarded, whoever set it: a forward made in another client is the same
+    // fact about this message as one made here.
+    h.forwarded = info.flags.contains(QStringLiteral("forwarded"));
     // Header-only heuristic: real attachments arrive as multipart/mixed.
     // Must inspect the raw head — KMime's parsed Content-Type reports
     // text/plain for a multipart message that has no body parts yet.
@@ -391,6 +394,10 @@ void MailClient::connectBackend(MailBackend *backend)
     connect(backend, &MailBackend::bodyFetched, this,
             [this](const QString &folder, const QString &remoteId,
                    const std::shared_ptr<KMime::Message> &message) {
+                // Before anything reads a body out of it: a base64 label on a
+                // part that is not base64 is fixed here, once, for the viewer
+                // and the scorer alike. The frozen wire bytes are unaffected.
+                MimeUtils::repairTransferEncodings(message.get());
                 // Never toLongLong(): a JMAP remote id is an opaque string and
                 // parsing one yields 0, which would file every body on the
                 // same cache row.
@@ -449,6 +456,19 @@ MailClient::MailClient(QObject *parent)
     m_sync->setPendingOpsProvider([this](const QString &folder) {
         return folderHasPendingOps(folder);
     });
+    m_sync->setBackfillExclusionProvider([this](const QString &folder) {
+        // Trash history is rarely worth the pass it dominates on a large
+        // account; deltas and opening the folder still sync it. Junk stays in
+        // the pass — the spam sweep works from its cached dates.
+        if (AdvancedConfig::b("sync/backfillTrash"))
+            return false;
+        const QString trash = trashFolderName();
+        return !trash.isEmpty() && folder == trash;
+    });
+    m_sync->setArrivalFilter(
+        [this](const QString &folder, QList<MessageListModel::Header> &rows) {
+            autoFileSpamArrivals(folder, rows);
+        });
     connect(m_sync, &SyncEngine::statusMessage, this, &MailClient::setStatus);
     connect(m_sync, &SyncEngine::errorOccurred, this, &MailClient::errorOccurred);
     connect(m_sync, &SyncEngine::busyRequested, this, &MailClient::setBusy);
@@ -1878,6 +1898,18 @@ void MailClient::switchAccountInternal(int index, const QString &sessionPassword
 {
     qCDebug(logTrace, "switchAccountInternal(%d)  pendingWas=%s",
             index, qUtf8Printable(m_pendingFolder));
+    // Phase timing, on the same terms as the startup phases: five timestamps,
+    // and a line only when the switch was slow enough for the stall detector
+    // in main() to have complained about it. A switch that freezes the window
+    // for seconds is otherwise a warning with no subject — this says which
+    // call it was rather than that one of them was.
+    QElapsedTimer switchTimer;
+    switchTimer.start();
+    qint64 tTeardown = 0;
+    qint64 tFolders = 0;
+    qint64 tHeaders = 0;
+    qint64 tSecret = 0;
+
     m_accounts.setCurrentIndex(index);
 
     // Set the destination before anything is torn down, so no observer ever
@@ -1897,8 +1929,10 @@ void MailClient::switchAccountInternal(int index, const QString &sessionPassword
     Q_EMIT draftsFolderChanged();
 
     teardownSession();
+    tTeardown = switchTimer.elapsed();
     m_folderModel.setFolders({});
     m_messageModel.clear();
+    m_attachCounted.clear(); // uids belong to the account being left
     // And the reading pane with it — the same reason openFolder() does it, and
     // a stronger one: what is in the pane belongs to the account being left.
     // The list below auto-selects the switched-to account's top row, but its
@@ -1935,11 +1969,13 @@ void MailClient::switchAccountInternal(int index, const QString &sessionPassword
     // The switched-to account's sidebar and the target folder come straight
     // from cache; the network refresh merges into them once connected.
     loadCachedFolderModel();
+    tFolders = switchTimer.elapsed();
     // Cached contents of the folder being opened — not INBOX's, which is what
     // made the message list show INBOX until the server's folder list arrived.
     const auto cached = m_store.cachedHeaders(m_selectedFolder);
     updatePageAnchor(cached);
     m_messageModel.setHeaders(cached);
+    tHeaders = switchTimer.elapsed();
     if (m_acct.local) {
         // A local archive has no server and no secret — don't touch the
         // keyring, and never try to connect. The cache shown above is all
@@ -1949,6 +1985,16 @@ void MailClient::switchAccountInternal(int index, const QString &sessionPassword
         m_accounts.setSessionSecret(sessionPassword);
     } else {
         m_accounts.readSecret(m_acct);
+    }
+
+    tSecret = switchTimer.elapsed();
+    if (switchTimer.elapsed() > 500) {
+        qCWarning(logTrace,
+                  "account switch took %lldms: teardown=%lld folders=%lld headers=%lld "
+                  "secret=%lld rest=%lld",
+                  switchTimer.elapsed(), tTeardown, tFolders - tTeardown,
+                  tHeaders - tFolders, tSecret - tHeaders,
+                  switchTimer.elapsed() - tSecret);
     }
 
     Q_EMIT accountChanged();
@@ -3240,7 +3286,13 @@ QVariantMap MailClient::replyDataFor(MessageContext *ctx, bool replyAll)
             {QStringLiteral("appendQuote"), appendQuote},
             {QStringLiteral("appendStrip"), appendStrip},
             {QStringLiteral("quotePreviewUrl"), previewUrl},
-            {QStringLiteral("quotePreviewSlot"), previewSlot}};
+            {QStringLiteral("quotePreviewSlot"), previewSlot},
+            // What this is a forward OF, so the composer can hand it back on
+            // Send and the original gets its $Forwarded mark. Carried through
+            // the prefill rather than remembered here: several composers can
+            // be open at once, each on a different message.
+            {QStringLiteral("origFolder"), ctx->m_folder},
+            {QStringLiteral("origUids"), QVariantList{ctx->m_uid}}};
 }
 
 /// The message as it stands, for reopening a draft in the composer. Unlike
@@ -3414,7 +3466,13 @@ QVariantMap MailClient::forwardDataFor(MessageContext *ctx)
                  && (appendQuote.contains(QLatin1String("src=\"http"), Qt::CaseInsensitive)
                      || appendQuote.contains(QLatin1String("src='http"), Qt::CaseInsensitive))},
             {QStringLiteral("quotePreviewUrl"), previewUrl},
-            {QStringLiteral("quotePreviewSlot"), previewSlot}};
+            {QStringLiteral("quotePreviewSlot"), previewSlot},
+            // What this is a forward OF, so the composer can hand it back on
+            // Send and the original gets its $Forwarded mark. Carried through
+            // the prefill rather than remembered here: several composers can
+            // be open at once, each on a different message.
+            {QStringLiteral("origFolder"), ctx->m_folder},
+            {QStringLiteral("origUids"), QVariantList{ctx->m_uid}}};
 }
 
 QVariantMap MailClient::forwardAsAttachmentData()
@@ -3452,7 +3510,9 @@ QVariantMap MailClient::forwardAsAttachmentDataFor(MessageContext *ctx)
             {QStringLiteral("subject"), subject},
             {QStringLiteral("body"), QStringLiteral("<p><br></p>") + signatureBlock()},
             {QStringLiteral("attachments"),
-             QVariantList{attachment}}};
+             QVariantList{attachment}},
+            {QStringLiteral("origFolder"), ctx->m_folder},
+            {QStringLiteral("origUids"), QVariantList{ctx->m_uid}}};
 }
 
 QUrl MailClient::writeForwardEml(const QByteArray &raw, const QString &subject)
@@ -3488,6 +3548,9 @@ QUrl MailClient::writeForwardEml(const QByteArray &raw, const QString &subject)
 QVariantMap MailClient::forwardRowsAsAttachmentData(const QVariantList &rows)
 {
     QVariantList attachments;
+    // The messages that actually made it into the mail: a row skipped for
+    // being uncached or encrypted is not forwarded and must not be marked.
+    QVariantList origUids;
     QString firstSubject;
     int skippedUncached = 0;
     int skippedEncrypted = 0;
@@ -3504,6 +3567,7 @@ QVariantMap MailClient::forwardRowsAsAttachmentData(const QVariantList &rows)
             if (one.isEmpty())
                 continue;
             attachments.append(one.value(QStringLiteral("attachments")).toList());
+            origUids.append(uid);
             if (firstSubject.isEmpty())
                 firstSubject = m_reading->m_subject;
             continue;
@@ -3519,6 +3583,7 @@ QVariantMap MailClient::forwardRowsAsAttachmentData(const QVariantList &rows)
         auto msg = std::make_shared<KMime::Message>();
         msg->setContent(KMime::CRLFtoLF(raw));
         msg->parse();
+        MimeUtils::repairTransferEncodings(msg.get());
         const QList<MailStore::PartRef> parts = m_store.partsFor(m_selectedFolder, uid);
         if (!parts.isEmpty()) {
             if (!MimeUtils::restoreAttachments(msg.get(), parts)) {
@@ -3539,6 +3604,7 @@ QVariantMap MailClient::forwardRowsAsAttachmentData(const QVariantList &rows)
         if (url.isEmpty())
             continue;
         attachments.append(url);
+        origUids.append(uid);
         if (firstSubject.isEmpty())
             firstSubject = subject;
     }
@@ -3570,7 +3636,9 @@ QVariantMap MailClient::forwardRowsAsAttachmentData(const QVariantList &rows)
             {QStringLiteral("cc"), QString()},
             {QStringLiteral("subject"), subject},
             {QStringLiteral("body"), QStringLiteral("<p><br></p>") + signatureBlock()},
-            {QStringLiteral("attachments"), attachments}};
+            {QStringLiteral("attachments"), attachments},
+            {QStringLiteral("origFolder"), m_selectedFolder},
+            {QStringLiteral("origUids"), origUids}};
 }
 
 QStringList MailClient::recipientSuggestions(const QString &prefix)
@@ -3775,7 +3843,8 @@ void MailClient::scoreHeader(MessageListModel::Header &h, const QString &folder,
     logSpamVerdict("head", folder, h.uid, SpamHeuristics::addressOf(h.from), s);
 }
 
-void MailClient::rescoreWithBody(const QString &folder, qint64 uid, KMime::Message *msg)
+void MailClient::rescoreWithBody(const QString &folder, qint64 uid, KMime::Message *msg,
+                                 bool mayAutoFile)
 {
     if (!msg || uid <= 0 || !scoresSpamIn(folder))
         return;
@@ -3843,6 +3912,20 @@ void MailClient::rescoreWithBody(const QString &folder, qint64 uid, KMime::Messa
     m_store.setSpamVerdict(folder, uid, s.total, newState, detail);
     if (folder == m_selectedFolder)
         m_messageModel.setSpamVerdict(uid, s.total, newState, detail);
+
+    // The arrival watch: a new arrival that came in under the threshold at
+    // the header stage and crossed it now that the body rules could run.
+    // Spent by this first body verdict whichever way it goes — one look per
+    // arrival. mayAutoFile is false for the viewer's call sites: the message
+    // on screen keeps its badge and stays under the reader.
+    const auto watch = m_spamWatchArrivals.find(folder);
+    if (watch != m_spamWatchArrivals.end() && watch->remove(uid)) {
+        if (watch->isEmpty())
+            m_spamWatchArrivals.erase(watch);
+        if (mayAutoFile && newState == MessageListModel::SpamWithBody
+            && s.total >= SpamHeuristics::spamThreshold())
+            autoFileSpamMessage(folder, uid);
+    }
 }
 
 bool MailClient::listsRecipients(const QString &folder) const
@@ -4521,6 +4604,8 @@ void MailClient::applyFolderListing(const QList<MailBackend::FolderInfo> &listed
     m_draftsFolder.clear();
     m_trashFolder.clear();
     m_junkFolder.clear();
+    // Another account's arrivals must not be auto-filed on this one's scores.
+    m_spamWatchArrivals.clear();
     m_allMailFolder.clear();
 
     QList<FolderModel::Folder> folders;
@@ -4838,6 +4923,7 @@ QString MailClient::rawBodyHash(const QByteArray &raw)
     KMime::Message msg;
     msg.setContent(KMime::CRLFtoLF(raw));
     msg.parse();
+    MimeUtils::repairTransferEncodings(&msg);
     QString text;
     QString html;
     MimeUtils::collectBodies(&msg, &text, &html);
@@ -4883,6 +4969,98 @@ void MailClient::markAsJunk(const QVariantList &rows)
     const int count = journalRemoval(rows, QStringLiteral("move"), junk);
     if (count > 0)
         setStatus(tr("%n moved to spam", "", count));
+}
+
+/// Files newly arrived spam into the Junk folder (spam/autoMove). Called by
+/// the sync engine on the delta paths only — "everything newer than the
+/// cache" — so the first listing of a mailbox can never mass-move an inbox
+/// the user has already lived with: that mail keeps the badge and stays put.
+///
+/// Spam rows are stored, hidden and journalled here, and removed from
+/// \a rows so the caller neither stores them again nor shows them. Rows under
+/// the threshold are remembered instead: the body prefetch may push them over
+/// (the junk-content-match rule cannot fire before the body exists), and
+/// rescoreWithBody() finishes the job for those via autoFileSpamMessage().
+///
+/// Deliberately not taught to the junk-content corpus: that records the
+/// user's own verdicts, and a scorer feeding its own corpus would harden one
+/// false positive into a permanent +50 against everything like it.
+void MailClient::autoFileSpamArrivals(const QString &folder,
+                                      QList<MessageListModel::Header> &rows)
+{
+    if (rows.isEmpty() || !AdvancedConfig::b("spam/autoMove"))
+        return;
+    if (!scoresSpamIn(folder) || isJunkFolderKey(folder))
+        return;
+    const QString junk = junkFolderName();
+    if (junk.isEmpty())
+        return;
+    MailStore::JournalOp op;
+    QList<MessageListModel::Header> kept;
+    QList<MessageListModel::Header> spam;
+    kept.reserve(rows.size());
+    for (const MessageListModel::Header &h : std::as_const(rows)) {
+        // The same confident-tail test as the badge; exempt and user-cleared
+        // outrank any score, exactly as everywhere else.
+        if (h.spamState < MessageListModel::SpamExempt
+            && h.spamScore >= SpamHeuristics::spamThreshold()) {
+            spam.append(h);
+            op.uids.append(h.uid);
+            op.remoteIds.append(h.remoteId.isEmpty() ? QString::number(h.uid)
+                                                     : h.remoteId);
+        } else {
+            kept.append(h);
+            if (h.spamState < MessageListModel::SpamExempt)
+                m_spamWatchArrivals[folder].insert(h.uid);
+        }
+    }
+    if (spam.isEmpty())
+        return;
+    // Stored before being hidden: the soft-deleted row is what a rollback
+    // restores from if the server refuses the move.
+    m_store.storeHeaders(folder, spam);
+    m_store.softDeleteMessages(folder, op.uids);
+    op.op = QStringLiteral("move");
+    op.folder = folder;
+    op.target = junk;
+    for (const MessageListModel::Header &h : std::as_const(spam)) {
+        qCInfo(logSpam).noquote()
+            << QStringLiteral("auto %1 uid=%2 from=%3: %4 >= %5 -> moved to %6")
+                   .arg(folder.section(QChar(0x1f), -1), QString::number(h.uid),
+                        SpamHeuristics::addressOf(h.from),
+                        QString::number(h.spamScore),
+                        QString::number(SpamHeuristics::spamThreshold()), junk);
+    }
+    journalAppend(op);
+    scheduleUnreadRecount();
+    setStatus(tr("%n moved to spam", "", spam.size()));
+    rows = kept;
+}
+
+void MailClient::autoFileSpamMessage(const QString &folder, qint64 uid)
+{
+    if (!AdvancedConfig::b("spam/autoMove") || uid <= 0)
+        return;
+    const QString junk = junkFolderName();
+    if (junk.isEmpty() || isJunkFolderKey(folder))
+        return;
+    MailStore::JournalOp op;
+    op.op = QStringLiteral("move");
+    op.folder = folder;
+    op.target = junk;
+    op.uids.append(uid);
+    const QString remoteId = m_store.remoteIdFor(folder, uid);
+    op.remoteIds.append(remoteId.isEmpty() ? QString::number(uid) : remoteId);
+    m_store.softDeleteMessages(folder, {uid});
+    if (folder == m_selectedFolder)
+        m_messageModel.removeByUids({uid});
+    invalidateMissingBodies();
+    scheduleUnreadRecount();
+    qCInfo(logSpam).noquote()
+        << QStringLiteral("auto %1 uid=%2: body score crossed the threshold -> moved to %3")
+               .arg(folder.section(QChar(0x1f), -1), QString::number(uid), junk);
+    journalAppend(op);
+    setStatus(tr("%n moved to spam", "", 1));
 }
 
 void MailClient::moveMessagesTo(const QVariantList &rows, const QString &targetFolder)
@@ -5840,6 +6018,17 @@ void MailClient::refreshAccountUnreadCounts()
         // dropped to zero unread must lose its pill, which merging never does.
         qCInfo(logUnread) << "pills <- server counts for" << key << ":"
                           << describeCounts(counts);
+        // A folder whose count moved since the last look has new (or newly
+        // read) mail. The full sync pass is rate-limited now, so this is what
+        // brings the mail behind a changed pill into the cache between passes
+        // — a delta fetch for exactly the folders that moved, nothing else.
+        if (key == accountKey()) {
+            const QHash<QString, int> before = m_unreadByAccount.value(key);
+            for (auto it = counts.constBegin(); it != counts.constEnd(); ++it) {
+                if (it.value() > before.value(it.key(), 0))
+                    m_sync->refreshFolderHeaders(it.key());
+            }
+        }
         m_unreadByAccount.insert(key, counts);
         m_serverCountedAccounts.insert(key);
         reconcileSeenWithServer(key, folders, counts);
@@ -6592,6 +6781,82 @@ static bool partIsCalendar(KMime::Content *part)
     return name.toLower().endsWith(QLatin1String(".ics"));
 }
 
+/// Splits a parsed message's attachments into ordinary files and .ics
+/// invitations, and names the AttachKind that pair means. One place, because
+/// the body pass and the tooltip's hover-heal must never disagree about the
+/// same message.
+static int classifyAttachments(KMime::Message *msg, int *files, int *calendars)
+{
+    const auto parts = msg->attachments();
+    int ics = 0;
+    for (KMime::Content *part : parts) {
+        if (partIsCalendar(part))
+            ++ics;
+    }
+    const int other = int(parts.size()) - ics;
+    if (files)
+        *files = other;
+    if (calendars)
+        *calendars = ics;
+    if (parts.isEmpty())
+        return MessageListModel::ConfirmedNoAttachment;
+    if (ics == 0)
+        return MessageListModel::GenericAttachment;
+    if (other == 0)
+        return MessageListModel::CalendarAttachment;
+    // An invitation with the agenda attached: both, not one standing in for
+    // the other.
+    return MessageListModel::CalendarAndOther;
+}
+
+/// Fills in the attachment count for a listed row whose body is already
+/// cached but was cached before the count was recorded — the tooltip asks for
+/// it on hover, so nothing sweeps the cache to backfill it. One indexed body
+/// read and a parse of a stub whose payloads live in the file store; the answer
+/// is written back, so a row is only ever counted once. Rows with no cached
+/// body have no number to give: the count stays 0 and the tooltip says so.
+void MailClient::ensureAttachmentCount(int row)
+{
+    const qint64 uid = m_messageModel.uidAt(row);
+    if (uid < 0)
+        return;
+    // At most one attempt per message per session. Without this a row whose
+    // body is not cached — or is cached and turns out to hold nothing — was
+    // re-read and re-parsed on every single hover, and the bodies that reach
+    // here are by definition the ones with attachments in them.
+    QSet<qint64> &counted = m_attachCounted[m_selectedFolder];
+    if (counted.contains(uid))
+        return;
+    counted.insert(uid);
+    const QByteArray raw = m_store.cachedBody(m_selectedFolder, uid);
+    if (raw.isEmpty())
+        return;
+    KMime::Message msg;
+    msg.setContent(KMime::CRLFtoLF(raw));
+    msg.parse();
+    // The same classification refineAttachKind() makes, so the two can never
+    // disagree about the same message: the stub keeps the attachment parts,
+    // only their payloads were moved out.
+    int files = 0;
+    int calendars = 0;
+    const int kind = classifyAttachments(&msg, &files, &calendars);
+    if (files + calendars <= 0) {
+        // The head promised attachments and the body has none — the case
+        // ConfirmedNoAttachment exists for. Recording it drops the paperclip
+        // this row should never have had, which is also what stops the row
+        // from asking again.
+        m_store.setAttachKind(m_selectedFolder, uid, kind);
+        m_messageModel.setAttachKind(uid, kind);
+        return;
+    }
+    m_store.setAttachCounts(m_selectedFolder, uid, files, calendars);
+    m_messageModel.setAttachCounts(uid, files, calendars);
+    // The kind too: a body cached before CalendarAndOther existed is recorded
+    // as a plain attachment set and would show one glyph where it has two.
+    m_store.setAttachKind(m_selectedFolder, uid, kind);
+    m_messageModel.setAttachKind(uid, kind);
+}
+
 void MailClient::refineAttachKind(const QString &folder, qint64 uid, KMime::Message *msg)
 {
     if (uid < 0)
@@ -6601,24 +6866,18 @@ void MailClient::refineAttachKind(const QString &folder, qint64 uid, KMime::Mess
     // body in a mixed part — declare it and carry no attachment at all. The
     // body settles it, and the answer here is exactly the list the reading
     // pane shows (collectAttachments walks the same parts).
-    const auto parts = msg->attachments();
-    int kind = MessageListModel::ConfirmedNoAttachment;
-    if (!parts.isEmpty()) {
-        // Refined (calendar icon in the list) only when every attachment is an
-        // .ics; a mixed set keeps the head-derived generic flag.
-        kind = MessageListModel::CalendarAttachment;
-        for (KMime::Content *part : parts) {
-            if (!partIsCalendar(part)) {
-                kind = MessageListModel::GenericAttachment;
-                break;
-            }
-        }
-        if (kind == MessageListModel::GenericAttachment)
-            return; // a mixed set: leave the head's generic flag alone
-    }
+    // The counts and the kind come from one pass: a set of .ics invites gets
+    // the calendar glyph, a set with both gets both glyphs, and the tooltip
+    // gets an exact number for each.
+    int files = 0;
+    int calendars = 0;
+    const int kind = classifyAttachments(msg, &files, &calendars);
+    m_store.setAttachCounts(folder, uid, files, calendars);
     m_store.setAttachKind(folder, uid, kind);
-    if (folder == m_selectedFolder)
+    if (folder == m_selectedFolder) {
+        m_messageModel.setAttachCounts(uid, files, calendars);
         m_messageModel.setAttachKind(uid, kind);
+    }
 }
 
 /// Corrects the list's OpenPGP mark once the body is here. The head can only
@@ -6764,6 +7023,39 @@ void MailClient::markMessagesSeen(const QVariantList &rows, bool seen)
     op.op = QStringLiteral("flag");
     op.folder = m_selectedFolder;
     (seen ? op.flagsAdd : op.flagsDel).append(QStringLiteral("seen"));
+    journalAppend(op);
+}
+
+/// The composer calls this when a forward is sent, naming the message it was
+/// made from — the folder and uids the prefill carried, not a row, because the
+/// list may have moved on (or be showing another folder entirely) by the time
+/// the user presses Send.
+///
+/// The mark is recorded when Send is pressed rather than when the outbox
+/// actually drains: the outbox row carries the wire bytes and not what they
+/// were forwarded from, and holding the mark back would leave a message the
+/// user has demonstrably forwarded unmarked for as long as the queue is stuck.
+void MailClient::markForwarded(const QString &folder, const QVariantList &uids)
+{
+    if (folder.isEmpty() || uids.isEmpty())
+        return;
+    MailStore::JournalOp op;
+    for (const QVariant &v : uids) {
+        const qint64 uid = v.toLongLong();
+        // Already marked: nothing changed, so nothing is recorded. The
+        // journal's rollback is derived from the op rather than stored, and
+        // that only holds while an op describes a change that really happened.
+        if (uid < 0 || m_store.isForwarded(folder, uid))
+            continue;
+        applyForwardedLocally(folder, {uid}, true);
+        op.uids.append(uid);
+        op.remoteIds.append(m_store.remoteIdFor(folder, uid));
+    }
+    if (op.uids.isEmpty())
+        return;
+    op.op = QStringLiteral("flag");
+    op.folder = folder;
+    op.flagsAdd.append(QStringLiteral("forwarded"));
     journalAppend(op);
 }
 
@@ -7206,6 +7498,7 @@ QVariantMap MailClient::outboxEditData(qint64 id)
     auto msg = std::make_shared<KMime::Message>();
     msg->setContent(KMime::CRLFtoLF(row.wire));
     msg->parse();
+    MimeUtils::repairTransferEncodings(msg.get());
     auto addressesOf = [](const auto *header) {
         QStringList out;
         if (!header)
@@ -7403,12 +7696,30 @@ void MailClient::applySeenLocally(const QString &folder, const QList<qint64> &ui
     scheduleUnreadRecount();
 }
 
+void MailClient::applyForwardedLocally(const QString &folder, const QList<qint64> &uids,
+                                       bool forwarded)
+{
+    for (qint64 uid : uids) {
+        m_store.setForwarded(folder, uid, forwarded);
+        if (folder == m_selectedFolder)
+            m_messageModel.setForwarded(uid, forwarded);
+    }
+}
+
 void MailClient::rollbackJournalOp(const MailStore::JournalOp &op)
 {
     if (op.op == QLatin1String("flag")) {
         // The complement. An op that set \Seen is undone by clearing it, and
         // the other way round — which is exact only because the op was
         // recorded for messages that really did change state.
+        //
+        // A flag op names exactly one flag, and $Forwarded ops are their own
+        // kind: routing them through the \Seen path would read "no seen in
+        // flagsDel" as "mark these unread" and undo something nobody touched.
+        if (op.flagsAdd.contains(QLatin1String("forwarded"))) {
+            applyForwardedLocally(op.folder, op.uids, false);
+            return;
+        }
         applySeenLocally(op.folder, op.uids, op.flagsDel.contains(QLatin1String("seen")));
         return;
     }
@@ -7441,6 +7752,10 @@ void MailClient::rollbackJournalOp(const MailStore::JournalOp &op)
 void MailClient::reapplyJournalOp(const MailStore::JournalOp &op)
 {
     if (op.op == QLatin1String("flag")) {
+        if (op.flagsAdd.contains(QLatin1String("forwarded"))) {
+            applyForwardedLocally(op.folder, op.uids, true);
+            return;
+        }
         applySeenLocally(op.folder, op.uids, op.flagsAdd.contains(QLatin1String("seen")));
         return;
     }
@@ -7714,6 +8029,7 @@ void MailClient::fetchMessage(int row)
     }
     // Remembered so draftData() can name the message it came from.
     m_reading->m_uid = uid;
+    m_offlineFallback.reset(); // belongs to the previous fetch, if anything
 
     // Previously read message → serve from cache, no network needed.
     const QByteArray cachedRaw = m_store.cachedBody(m_selectedFolder, uid);
@@ -7738,9 +8054,40 @@ void MailClient::fetchMessage(int row)
         // got in (a fetch bug once did), presenting it would show a broken
         // message when one network request produces the real one.
         msg->parse();
-        if ((msg->head().isEmpty() || !MimeUtils::restoreAttachments(msg.get(), parts))
+        MimeUtils::repairTransferEncodings(msg.get());
+        // Self-heal for rows a stale-row fetch once poisoned (the body of a
+        // different message stored under this uid — see requestMessageBody):
+        // a cached body naming a Message-ID that is not this row's IS some
+        // other message. Drop it and fall through to the network fetch, which
+        // brings back the real one; offline, the "Not cached" path below says
+        // so rather than presenting a message known to be the wrong one.
+        if (const auto *mid = std::as_const(*msg).messageID(); mid && !mid->isEmpty()) {
+            const QString rowMsgid = m_messageModel.msgidAt(row);
+            if (!rowMsgid.isEmpty()
+                && QString::fromLatin1(mid->identifier()) != rowMsgid) {
+                qWarning() << "mailove: cached body under" << m_selectedFolder << uid
+                           << "belongs to a different message — dropped, refetching";
+                m_store.removeBodyOnly(m_selectedFolder, uid);
+                msg.reset();
+            }
+        }
+        if (!msg) {
+            // poisoned row, handled above — straight to the refetch
+        } else if ((msg->head().isEmpty() || !MimeUtils::restoreAttachments(msg.get(), parts))
             && connected()) {
-            m_store.removeBodyOnly(m_selectedFolder, uid);
+            if (msg->head().isEmpty()) {
+                // Unpresentable however the fetch goes; only this case still
+                // clears the row up front.
+                m_store.removeBodyOnly(m_selectedFolder, uid);
+            } else {
+                // Readable, just missing attachment payloads. The cache row is
+                // NOT cleared here any more: a successful refetch overwrites
+                // it (storeBody is INSERT OR REPLACE), and deleting first
+                // meant a fetch that then failed — the connection dying is
+                // when this path runs — left a blank pane where a perfectly
+                // readable message had been a moment before.
+                m_offlineFallback = msg;
+            }
         } else {
         // The verifier keeps its own copy, so it is told at BOTH edges — not
         // just when a check starts. The heal path re-submits from inside the
@@ -7753,7 +8100,7 @@ void MailClient::fetchMessage(int row)
         m_presentingFromCache = false;
         m_verifier->setPresentingFromCache(false);
         refineAttachKind(m_selectedFolder, uid, msg.get());
-        rescoreWithBody(m_selectedFolder, uid, msg.get());
+        rescoreWithBody(m_selectedFolder, uid, msg.get(), /*mayAutoFile=*/false);
         markMessageRead(row);
         // No status crumb for opening a cached message — it's silent, the
         // message simply appears.
@@ -7788,10 +8135,11 @@ void MailClient::fetchMessage(int row)
     setBusy(true);
     // No "loading…" crumb — the busy spinner already shows activity; only a
     // failure is worth a status.
-    requestMessageBody(row, remoteId, false);
+    requestMessageBody(row, uid, remoteId, false);
 }
 
-void MailClient::requestMessageBody(int row, const QString &remoteId, bool isRetry)
+void MailClient::requestMessageBody(int row, qint64 uid, const QString &remoteId,
+                                    bool isRetry)
 {
     // The message arrives on bodyFetched(), which is a signal rather than a
     // callback because several bodies can answer one request. This is a
@@ -7803,7 +8151,7 @@ void MailClient::requestMessageBody(int row, const QString &remoteId, bool isRet
 
     *connection = connect(
         m_backend, &MailBackend::bodyFetched, this,
-        [this, row, remoteId, connection, answered](
+        [this, uid, remoteId, connection, answered](
             const QString &folder, const QString &id,
             const std::shared_ptr<KMime::Message> &message) {
             if (id != remoteId || folder != m_selectedFolder || *answered)
@@ -7812,26 +8160,35 @@ void MailClient::requestMessageBody(int row, const QString &remoteId, bool isRet
             disconnect(*connection);
 
             setBusy(false);
+            m_offlineFallback.reset(); // the real thing arrived; stub not needed
             presentMessage(message);
             // Index text: prefer the plain part, else strip the HTML.
             const QString indexText = !m_reading->m_textBody.isEmpty()
                 ? m_reading->m_textBody
                 : QTextDocumentFragment::fromHtml(m_reading->m_htmlBody).toPlainText();
-            m_store.storeBody(m_selectedFolder, m_messageModel.uidAt(row), m_reading->m_raw,
-                              indexText);
-            refineAttachKind(m_selectedFolder, m_messageModel.uidAt(row), message.get());
-            rescoreWithBody(m_selectedFolder, m_messageModel.uidAt(row), message.get());
+            // Keyed by the uid captured with the click, never by the row: a
+            // delta sync can re-sort the list while the fetch is in flight,
+            // and uidAt(stale row) once filed this body under a different
+            // message — which then opened as this one, from cache, forever.
+            m_store.storeBody(m_selectedFolder, uid, m_reading->m_raw, indexText);
+            refineAttachKind(m_selectedFolder, uid, message.get());
+            rescoreWithBody(m_selectedFolder, uid, message.get(), /*mayAutoFile=*/false);
             setStatus({});
-            markMessageRead(row);
-            // Read-ahead: sequential reading should never wait on the network.
-            prefetchMessage(row + 1);
-            prefetchMessage(row + 2);
+            // The row-based side effects want the row this uid sits on NOW.
+            const int liveRow = m_messageModel.rowForUid(uid);
+            if (liveRow >= 0) {
+                markMessageRead(liveRow);
+                // Read-ahead: sequential reading should never wait on the
+                // network.
+                prefetchMessage(liveRow + 1);
+                prefetchMessage(liveRow + 2);
+            }
         });
 
     m_backend->fetchBodies(
         m_selectedFolder, {remoteId},
-        [this, row, remoteId, isRetry, connection, answered](MailBackend::Error error,
-                                                            const QString &message) {
+        [this, uid, remoteId, isRetry, connection, answered](MailBackend::Error error,
+                                                             const QString &message) {
             // The request finished. If bodyFetched() never came, nothing was
             // delivered — the callback is the only place that can tell, since
             // a body that never arrives emits no signal at all.
@@ -7846,9 +8203,12 @@ void MailClient::requestMessageBody(int row, const QString &remoteId, bool isRet
             // Nothing comes back round for a message the user just clicked, so
             // the one caller with a person waiting on it asks again.
             if (error == MailBackend::Error::None && !isRetry) {
-                QTimer::singleShot(250, this, [this, row, remoteId] {
-                    if (m_messageModel.remoteIdAt(row) == remoteId)
-                        requestMessageBody(row, remoteId, true);
+                QTimer::singleShot(250, this, [this, uid, remoteId] {
+                    // Still the message being read? The uid says so; the row
+                    // it sat on may have shifted under a delta sync meanwhile.
+                    if (m_reading && m_reading->m_uid == uid)
+                        requestMessageBody(m_messageModel.rowForUid(uid), uid, remoteId,
+                                           true);
                     else
                         setBusy(false); // the user moved on
                 });
@@ -7857,6 +8217,21 @@ void MailClient::requestMessageBody(int row, const QString &remoteId, bool isRet
 
             setBusy(false);
             m_detachPending = false;
+            // The network said no — but an imperfect cached copy may be
+            // waiting (fetchMessage stashes one when only attachment payloads
+            // are missing). A readable message with a caveat beats the blank
+            // pane this used to leave whenever the connection died mid-open.
+            if (m_offlineFallback && m_reading && m_reading->m_uid == uid) {
+                const auto fallback = m_offlineFallback;
+                m_offlineFallback.reset();
+                m_presentingFromCache = true;
+                m_verifier->setPresentingFromCache(true);
+                presentMessage(fallback);
+                m_presentingFromCache = false;
+                m_verifier->setPresentingFromCache(false);
+                setStatus(tr("Offline copy — some attachments unavailable"));
+                return;
+            }
             // Same as the bail-outs in fetchMessage(): the request is over and
             // nothing was presented, so the pane must not go on showing the
             // previously read message under the selected row.
@@ -7864,7 +8239,8 @@ void MailClient::requestMessageBody(int row, const QString &remoteId, bool isRet
             setStatus(tr("Message load failed"));
             if (error != MailBackend::Error::None && !message.isEmpty())
                 Q_EMIT errorOccurred(message);
-        });
+        },
+        /*interactive=*/true);
 }
 
 bool MailClient::refetchBodyForVerification(const QString &folder, qint64 uid,
@@ -7925,7 +8301,8 @@ bool MailClient::refetchBodyForVerification(const QString &folder, qint64 uid,
                 return;
             }
             done({});
-        });
+        },
+        /*interactive=*/true);
     return true;
 }
 
@@ -8003,8 +8380,7 @@ void MailClient::storeFetchedBody(const QString &folder, qint64 uid,
                                   const std::shared_ptr<KMime::Message> &message)
 {
     KMime::Message *msg = message.get();
-    if (msg->contents().isEmpty())
-        msg->parse();
+    MimeUtils::parseIfNeeded(msg);
     // A message with no header block is a broken fetch, not a message. Caching
     // it would poison everything derived from the cache — the spam score, the
     // DKIM verdict, the viewer — and each of those records its answer, so the
@@ -8079,8 +8455,7 @@ void MailClient::presentMessage(const std::shared_ptr<KMime::Message> &message)
     // parsed multipart message DESTROYS it: the body was consumed into the
     // child parts, so a re-parse from the now-empty body drops every part
     // and leaves a headers-only shell. Parse only if it hasn't happened yet.
-    if (msg->contents().isEmpty())
-        msg->parse();
+    MimeUtils::parseIfNeeded(msg);
 
     MessageContext *ctx = m_reading;
     ctx->m_handler = m_viewerHandler;

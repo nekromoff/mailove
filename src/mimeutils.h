@@ -55,6 +55,28 @@ QList<MailStore::PartRef> stripAttachments(KMime::Message *msg);
 /// which the caller treats as a cache miss.
 bool restoreAttachments(KMime::Message *msg, const QList<MailStore::PartRef> &parts);
 
+/// Fixes a part whose Content-Transfer-Encoding says base64 while its body is
+/// plainly not — a delivery path (a milter that rewrites bodies, a broken
+/// gateway) decoded the content and left the header alone. KMime would then
+/// base64-decode raw HTML into a few bytes of noise, and that is what the
+/// reader would see. Such a part is re-labelled binary so it reads as-is. The
+/// wire bytes are untouched: a frozen message still answers encodedContent()
+/// with what arrived, and the DKIM verdict keeps judging that.
+///
+/// Must run straight after parse(), before anything reads a body: KMime
+/// decodes in place on first access, and a body already "decoded" under the
+/// wrong label is noise that cannot be told from real binary.
+void repairTransferEncodings(KMime::Content *node);
+
+/// parse() only where it would create something: a multipart or encapsulated
+/// message with no children yet. The "contents().isEmpty() ? parse()" guard
+/// this replaces was wrong for every single-part message — a leaf never has
+/// contents, so it was parsed again by each consumer, and parse() rebuilds
+/// every header from the raw head text, undoing repairTransferEncodings().
+/// A leaf that was never parsed needs no parse: KMime reads its headers from
+/// the head text on demand.
+void parseIfNeeded(KMime::Content *node);
+
 /// The first text/plain and text/html parts, decoded. Used by the spam scorer
 /// and by tests/spamtool, which must see the same two strings or the tool stops
 /// measuring what the client does.

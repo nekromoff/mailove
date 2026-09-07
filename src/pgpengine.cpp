@@ -911,13 +911,23 @@ quint64 PgpEngine::signDetached(const QByteArray &data, const QString &signerFin
     connect(job, &QGpgME::SignJob::result, this,
             [this, id](const GpgME::SigningResult &result, const QByteArray &signature) {
                 jobFinished();
+                // A dismissed pinentry is reported as neither a signature nor
+                // an error — the same way key generation above reports one, and
+                // for the same reason: gpg does not always set an error code
+                // when the passphrase prompt is cancelled. The empty-signature
+                // check is not redundant. Without it a cancelled signature
+                // arrives at the send as a plain failure, and the message the
+                // user chose not to sign is not sent at all rather than going
+                // out unsigned.
+                if (result.error().isCanceled()
+                    || (!result.error() && signature.isEmpty())) {
+                    Q_EMIT signFinished(id, {}, {}, tr("Signing was cancelled."), true);
+                    return;
+                }
                 if (result.error()) {
                     Q_EMIT signFinished(
-                        id, {}, {},
-                        result.error().isCanceled()
-                            ? tr("Signing was cancelled.")
-                            : QString::fromStdString(result.error().asStdString()),
-                        result.error().isCanceled());
+                        id, {}, {}, QString::fromStdString(result.error().asStdString()),
+                        false);
                     return;
                 }
                 // RFC 3156 §5 wants the hash named on the multipart/signed, and
@@ -1026,17 +1036,24 @@ quint64 PgpEngine::decrypt(const QByteArray &cipherText)
                        const QByteArray &plainText) {
                 jobFinished();
                 const GpgME::Error err = result.error();
+                // A dismissed pinentry can come back as neither plaintext nor
+                // an error, the same way signing and key generation do — gpg
+                // does not always set an error code when the passphrase prompt
+                // is cancelled. Reported as the cancellation it is: without
+                // this the reader is told the message could not be decrypted,
+                // which reads as a broken message rather than as the answer to
+                // a prompt they chose to dismiss.
+                if (err.isCanceled() || (!err && plainText.isEmpty())) {
+                    Q_EMIT decryptFinished(id, {}, tr("Decryption was cancelled."), false);
+                    return;
+                }
                 if (err) {
                     const bool noKey = err.code() == GPG_ERR_NO_SECKEY
                         || err.code() == GPG_ERR_DECRYPT_FAILED;
                     qCDebug(logPgp, "decrypt %llu failed: %s", id,
                             err.asStdString().c_str());
                     Q_EMIT decryptFinished(
-                        id, {},
-                        err.isCanceled()
-                            ? tr("Decryption was cancelled.")
-                            : QString::fromStdString(err.asStdString()),
-                        noKey);
+                        id, {}, QString::fromStdString(err.asStdString()), noKey);
                     return;
                 }
                 // Named before the plaintext, so a receiver has the key in

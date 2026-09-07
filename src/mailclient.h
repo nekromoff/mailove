@@ -365,6 +365,14 @@ public:
     /// HTML with the original quoted. Empty map when nothing is shown.
     /// The original's attachments are NOT carried over (compose attaches
     /// local files only).
+    /// Records that the messages named by \a uids in \a folder have been
+    /// forwarded ($Forwarded), locally and on the server. Called by the
+    /// composer on Send with the origin the forward prefill carried.
+    /// Counts the attachments of a listed row from its cached body, when the
+    /// count was not recorded at the time the body was stored. Called on hover
+    /// by the marker column's tooltip; a no-op once the row has a count.
+    Q_INVOKABLE void ensureAttachmentCount(int row);
+    Q_INVOKABLE void markForwarded(const QString &folder, const QVariantList &uids);
     Q_INVOKABLE QVariantMap forwardData();
     /// Compose prefill for forwarding the shown message as a message/rfc822
     /// attachment (.eml) — the original bytes, untouched: the full-fidelity
@@ -836,7 +844,15 @@ private:
     void setUndoableSend(qint64 id, qint64 deadline);
     /// Sets or clears \Seen on cached rows and, when that folder is open, on
     /// the visible ones — the local half of a flag op, in both directions.
+    /// Messages ensureAttachmentCount() has already looked at, by folder.
+    /// Membership means "asked and answered", including answered with nothing
+    /// — the point is that the body is read and parsed at most once per
+    /// message per session, on the GUI thread, from a tooltip.
+    QHash<QString, QSet<qint64>> m_attachCounted;
     void applySeenLocally(const QString &folder, const QList<qint64> &uids, bool seen);
+    /// The $Forwarded half of the same job: cache and, when the folder is the
+    /// open one, the listed row.
+    void applyForwardedLocally(const QString &folder, const QList<qint64> &uids, bool forwarded);
     /// Shared body of markMessagesRead()/markMessagesUnread().
     void markMessagesSeen(const QVariantList &rows, bool seen);
     /// Shared body of every "this mail leaves this folder" gesture — delete,
@@ -1140,7 +1156,20 @@ private:
     /// body rule is silent there. This is the second look — the same scorer,
     /// the same context, with the parts of the message that had not arrived
     /// yet. Never called for a message the user has settled (state 3 or 4).
-    void rescoreWithBody(const QString &folder, qint64 uid, KMime::Message *msg);
+    /// \a mayAutoFile is false only for the viewer's call sites: a message
+    /// the user is looking at must never be filed away under them, however
+    /// the body re-score comes out.
+    void rescoreWithBody(const QString &folder, qint64 uid, KMime::Message *msg,
+                         bool mayAutoFile = true);
+    /// The sync engine's arrival filter (spam/autoMove): files rows scoring at
+    /// or past the threshold into the Junk folder and removes them from
+    /// \a rows; remembers the under-threshold rest so a body re-score that
+    /// crosses the threshold can finish the job (see autoFileSpamMessage).
+    void autoFileSpamArrivals(const QString &folder,
+                              QList<MessageListModel::Header> &rows);
+    /// The body-stage half of the auto-move: files one watched new arrival
+    /// whose re-score crossed the threshold.
+    void autoFileSpamMessage(const QString &folder, qint64 uid);
     /// The scoring context for one message, built from the store and the
     /// account. Shared by the header pass and the body pass so the two cannot
     /// disagree about who the sender is.
@@ -1265,7 +1294,12 @@ private:
     /// presents it. \a isRetry marks the second attempt, which is what stops a
     /// backend that declined the first one (bulk transfers all busy) from
     /// being asked forever.
-    void requestMessageBody(int row, const QString &remoteId, bool isRetry);
+    /// \a uid is captured with \a remoteId at click time and is what every
+    /// delivery-time cache write keys on: the row can shift while the fetch is
+    /// in flight (a delta sync merging new arrivals re-sorts the list), and
+    /// resolving uidAt(row) after the shift filed the fetched body under a
+    /// *different* message — from then on that row opened as this one.
+    void requestMessageBody(int row, qint64 uid, const QString &remoteId, bool isRetry);
     /// Reacts to the backend losing a connection that had been up: remembers
     /// the open folder and dials again shortly.
     void handleConnectionLost();
@@ -1320,6 +1354,12 @@ private:
     /// scratch by every folder listing, so none can outlive its account.
     QString m_trashFolder;
     QString m_junkFolder;
+    /// New arrivals that scored under the threshold at the header stage,
+    /// per folder — the candidates the body re-score may yet auto-file (the
+    /// junk-content-match rule cannot fire before the body exists). Fed only
+    /// by autoFileSpamArrivals(), so backfilled history never qualifies;
+    /// an entry is spent by its first body re-score, whichever way it goes.
+    QHash<QString, QSet<qint64>> m_spamWatchArrivals;
     /// Whether m_selectedFolder is the junk one, decided when it is set rather
     /// than on every ask — see viewingJunkFolder().
     bool m_selectedIsJunk = false;
@@ -1440,6 +1480,11 @@ private:
     /// assumed byte-identical to what arrived. Logged next to the DKIM verdict
     /// so the two paths can be told apart — see doc/roadmap.md.
     bool m_presentingFromCache = false;
+    /// An imperfect cached copy of the message being fetched (attachments
+    /// missing from the file store). Held so a failed refetch can present it
+    /// — a readable message beats the blank pane the failure used to leave —
+    /// while a successful fetch overwrites the cache row and never looks here.
+    std::shared_ptr<KMime::Message> m_offlineFallback;
     bool m_detachPending = false; ///< a double-click is waiting for its fetch
     qint64 m_detachUid = -1;      ///< the message that double-click asked for
     QString m_textPreview;

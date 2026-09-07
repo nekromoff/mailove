@@ -150,10 +150,54 @@ bool SyncEngine::restartFolderPass()
 {
     if (!m_folderBackfillPassDone || m_syncPaused)
         return false;
+    // Rate limit, measured from the last granted restart. The first pass of a
+    // connect is untouched — it starts through the backfill tick, not here,
+    // while m_folderBackfillPassDone is still false.
+    const int minMinutes = AdvancedConfig::i("sync/folderPassMinutes");
+    if (minMinutes > 0 && m_folderPassGranted.isValid()
+        && !m_folderPassGranted.hasExpired(qint64(minMinutes) * 60 * 1000))
+        return false;
+    m_folderPassGranted.start();
     m_folderBackfillPassDone = false;
     m_folderPassPrimed = false;
     scheduleBackfill(500);
     return true;
+}
+
+void SyncEngine::refreshFolderHeaders(const QString &folder)
+{
+    // The open folder has IDLE and refreshCurrentFolder(); this is for the
+    // account's *other* folders between full passes. Delta only — everything
+    // newer than the cache — and on the background connection, so a tick never
+    // re-aims the mailbox under the user. A folder with nothing cached yet is
+    // left to the full pass: it needs windows, not a delta, and it is exactly
+    // the expensive case the rate limit exists for.
+    if (!connected() || m_syncPaused || folder.isEmpty() || folder == m_selectedFolder)
+        return;
+    if (pendingOps(folder))
+        return;
+    const qint64 maxUid = m_store.maxCachedUid(folder);
+    if (maxUid <= 0)
+        return;
+    qCDebug(logTrace, "delta sync: %s (count moved between passes)",
+            qUtf8Printable(folder));
+    m_backend->fetchHeadersSince(
+        folder, QString::number(maxUid),
+        [this, folder](MailBackend::Error error, const QString &) {
+            auto rows = m_pendingHeaders.take(folder);
+            if (error != MailBackend::Error::None || rows.isEmpty())
+                return; // best-effort; the next pass covers whatever this missed
+            // New arrivals — the one moment spam may be auto-filed (see
+            // setArrivalFilter). Rows it files are removed from the list.
+            if (m_arrivalFilter)
+                m_arrivalFilter(folder, rows);
+            if (rows.isEmpty())
+                return;
+            m_store.storeHeaders(folder, rows);
+            invalidateMissingBodies();
+            Q_EMIT unreadRecountNeeded();
+        },
+        /*background=*/true);
 }
 
 void SyncEngine::restartFolderQueue()
@@ -293,7 +337,7 @@ void SyncEngine::fetchNewerThanCache(qint64 maxCachedUid, int cachedCount)
     m_backend->fetchHeadersSince(
         folder, QString::number(maxCachedUid),
         [this, folder, cachedCount](MailBackend::Error error, const QString &message) {
-            const QList<MessageListModel::Header> headers = m_pendingHeaders.take(folder);
+            QList<MessageListModel::Header> headers = m_pendingHeaders.take(folder);
             if (error != MailBackend::Error::None) {
                 Q_EMIT busyRequested(false);
                 Q_EMIT statusMessage(tr("Fetching headers failed"));
@@ -301,6 +345,11 @@ void SyncEngine::fetchNewerThanCache(qint64 maxCachedUid, int cachedCount)
                 return;
             }
             Q_EMIT busyRequested(false);
+            // New arrivals — the one moment spam may be auto-filed (see
+            // setArrivalFilter). Rows it files are removed from the list, so
+            // the merge below never shows them.
+            if (m_arrivalFilter)
+                m_arrivalFilter(folder, headers);
             m_store.storeHeaders(folder, headers);
             invalidateMissingBodies();
             Q_EMIT unreadRecountNeeded(); // freshly synced headers change the pills
@@ -391,18 +440,24 @@ bool SyncEngine::backfillBodies(const QString &folder)
         }
         return false; // nothing left in this folder
     }
-    if (folder == m_selectedFolder)
+    if (folder == m_selectedFolder) {
         m_bodyBackfill = true;
-    // Compose with any header-sync progress so this doesn't clobber the
-    // "N of M synced" figure while both phases are running.
-    const QString composed = openFolderSyncStatus(folder);
-    if (!composed.isEmpty()) {
-        Q_EMIT statusMessage(composed);
+        // Compose with any header-sync progress so this doesn't clobber the
+        // "N of M synced" figure while both phases are running. Only the open
+        // folder's progress is the user's news — the pass caching some other
+        // folder goes to the trace, same as its header windows.
+        const QString composed = openFolderSyncStatus(folder);
+        if (!composed.isEmpty()) {
+            Q_EMIT statusMessage(composed);
+        } else {
+            const int remaining = missingBodiesIn(folder);
+            Q_EMIT statusMessage(remaining == 1
+                          ? tr("%1 — caching 1 body").arg(folder)
+                          : tr("%1 — caching %2 bodies").arg(folder).arg(remaining));
+        }
     } else {
-        const int remaining = missingBodiesIn(folder);
-        Q_EMIT statusMessage(remaining == 1
-                      ? tr("%1 — caching 1 body").arg(folder)
-                      : tr("%1 — caching %2 bodies").arg(folder).arg(remaining));
+        qCDebug(logTrace, "backfill: %s caching %d bodies", qUtf8Printable(folder),
+                int(missing.size()));
     }
     for (qint64 uid : missing) {
         const auto item = qMakePair(folder, uid);
@@ -539,6 +594,10 @@ void SyncEngine::continueFolderBackfill()
             // restarts on the next connect or folder-list refresh, and
             // MailClient restarts it outright when the queue drains.
             if (pendingOps(next))
+                continue;
+            // Folders excluded from full-history backfill (Trash, unless
+            // sync/backfillTrash). Deltas and clicks still sync them.
+            if (m_backfillExcluded && m_backfillExcluded(next))
                 continue;
             if (next != m_selectedFolder) {
                 m_backfillFolder = next;
@@ -692,7 +751,14 @@ void SyncEngine::requestHeaderWindow(const QString &folder, qint64 fromNewest, i
                                      bool append, bool background)
 {
     m_headerFetch = true;
-    if (background) {
+    if (background && folder != m_selectedFolder) {
+        // The pass walking a folder nobody is looking at is not the user's
+        // news. Announcing every folder here kept the status bar cycling
+        // through the whole account each pass — which read as the client
+        // stuck "checking all folders" — so it goes to the trace instead.
+        qCDebug(logTrace, "backfill: %s from %lld (+%d)", qUtf8Printable(folder),
+                fromNewest, count);
+    } else if (background) {
         // Show header-sync AND body-caching progress together, so the two
         // background phases don't overwrite each other's numbers.
         const QString composed = openFolderSyncStatus(folder);

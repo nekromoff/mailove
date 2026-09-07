@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <QElapsedTimer>
 #include <QHash>
 #include <QPointer>
 #include <QString>
@@ -96,7 +97,7 @@ public:
     void fetchHeaderWindow(const QString &folder, int fromNewest, int count,
                            bool background, const OpCallback &done) override;
     void fetchHeadersSince(const QString &folder, const QString &sinceRemoteId,
-                           const OpCallback &done) override;
+                           const OpCallback &done, bool background = false) override;
     void fetchHeadersById(const QString &folder, const QStringList &remoteIds,
                           const OpCallback &done) override;
 
@@ -106,7 +107,7 @@ public:
     qint64 messageCount(const QString &folder) const;
 
     void fetchBodies(const QString &folder, const QStringList &remoteIds,
-                     const OpCallback &done) override;
+                     const OpCallback &done, bool interactive = false) override;
     int freeBodySlots() const override;
     bool bodyFetchActive() const override;
     /// The dedicated background connection being up and logged in. When it is
@@ -173,7 +174,14 @@ private:
         bool busy = false; ///< a body batch is streaming on it
     };
     QList<std::shared_ptr<BodyConn>> m_bodyPool;
-    bool m_bodyPoolBroken = false; ///< server refused extra connections — stop trying
+    bool m_bodyPoolBroken = false; ///< server refused extra connections — pause trying
+    /// When the pool was last latched broken. A refusal is often transient —
+    /// an OAuth token that expired mid-session, a momentary connection cap —
+    /// so the latch expires (see kBodyPoolRetryMs) instead of holding for the
+    /// whole session as it used to, which left every body fetch riding the
+    /// one background connection until the next full reconnect.
+    QElapsedTimer m_bodyPoolBrokenSince;
+    static constexpr qint64 kBodyPoolRetryMs = 10 * 60 * 1000;
     bool m_bodyFallbackBusy = false; ///< a batch is running on the sync connection
     /// Opens the missing pool connections (best effort, once per connect).
     void ensureBodyPool();
@@ -182,9 +190,23 @@ private:
     void shrinkBodyPool();
     /// The streaming multi-id body FETCH itself; \a release frees the issuing
     /// connection and is called exactly once.
+    /// Interactive-only last resort: serves a body fetch on the main session
+    /// when the pool and the background connection are both unavailable.
+    void fetchBodiesOnMainSession(const QString &folder, const KIMAP::ImapSet &set,
+                                  const OpCallback &done);
     void startBodyFetchJob(KIMAP::Session *session, const QString &folder,
                            const KIMAP::ImapSet &set, const OpCallback &done,
                            const std::function<void()> &release);
+    /// Whether \a folder is what \a session actually has selected — the
+    /// delivery-time answer, from the SELECT that *completed*, not the one
+    /// that was queued. A FETCH is queued behind its SELECT and normally runs
+    /// against the right mailbox; the one hole is a SELECT that fails with
+    /// the FETCH already queued behind it — the FETCH then runs against
+    /// whatever was selected before, and its messages, stored under the
+    /// folder the request named, would put another mailbox's mail under this
+    /// one's uids. Every fetch delivery checks this and drops the batch
+    /// instead; the next pass re-asks with the mailbox actually open.
+    bool sessionHasSelected(KIMAP::Session *session, const QString &folder) const;
     /// Reports one folder write's outcome through \a done, exactly once.
     void finishFolderOp(KJob *job, const OpCallback &done);
     /// Runs \a then once \a folder is selected on the interactive connection

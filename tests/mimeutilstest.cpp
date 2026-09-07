@@ -422,6 +422,76 @@ int main(int argc, char **argv)
         check(MimeUtils::htmlToMarkdown(QString()).isEmpty(), "empty html converts to nothing");
     }
 
+    // --- repairTransferEncodings ------------------------------------------
+    // A delivery path decoded the base64 body and left the header: KMime would
+    // read raw HTML as base64 and hand the viewer a few bytes of noise.
+    {
+        auto lied = std::make_shared<KMime::Message>();
+        lied->setContent(KMime::CRLFtoLF(QByteArrayLiteral(
+            "From: b2b@shop.test\r\n"
+            "Subject: hi\r\n"
+            "MIME-Version: 1.0\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Content-Transfer-Encoding: base64\r\n"
+            "\r\n"
+            "<!doctype html>\r\n<html><body><p>V\xc3\xa1\xc5\xbe" "en\xc3\xbd z\xc3\xa1kazn\xc3\xadk</p></body></html>\r\n")));
+        lied->setFrozen(true);
+        lied->parse();
+        const QByteArray wire = lied->encodedContent();
+        // Straight after parse(), before any read: KMime decodes the body in
+        // place the first time anything asks for it, and a body already
+        // decoded under the wrong label is noise nobody can undo — which is
+        // why every caller runs the repair first.
+        MimeUtils::repairTransferEncodings(lied.get());
+        // What presentMessage() and storeFetchedBody() do next: a leaf has no
+        // contents, so their guard parses again, and parse() rebuilds every
+        // header from the raw head. The repair has to survive that.
+        MimeUtils::parseIfNeeded(lied.get());
+        check(lied->decodedText().contains(QStringLiteral("V\u00e1\u017een\u00fd z\u00e1kazn\u00edk")),
+              "a base64 label on a raw body is ignored and the text shows");
+        check(lied->encodedContent() == wire,
+              "...while the wire bytes DKIM judges are untouched");
+
+        auto honest = std::make_shared<KMime::Message>();
+        honest->setContent(KMime::CRLFtoLF(QByteArrayLiteral(
+            "From: b2b@shop.test\r\n"
+            "Subject: hi\r\n"
+            "MIME-Version: 1.0\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Content-Transfer-Encoding: base64\r\n"
+            "\r\n"
+            "PHA+aGVsbG88L3A+\r\n")));
+        honest->parse();
+        MimeUtils::repairTransferEncodings(honest.get());
+        check(honest->decodedText() == QStringLiteral("<p>hello</p>"),
+              "genuine base64 still decodes");
+
+        auto multi = std::make_shared<KMime::Message>();
+        multi->setContent(KMime::CRLFtoLF(QByteArrayLiteral(
+            "From: b2b@shop.test\r\n"
+            "MIME-Version: 1.0\r\n"
+            "Content-Type: multipart/alternative; boundary=\"b\"\r\n"
+            "\r\n"
+            "--b\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Transfer-Encoding: base64\r\n"
+            "\r\n"
+            "plain words, not base64\r\n"
+            "--b\r\n"
+            "Content-Type: text/html\r\n"
+            "Content-Transfer-Encoding: base64\r\n"
+            "\r\n"
+            "PHA+aGVsbG88L3A+\r\n"
+            "--b--\r\n")));
+        multi->parse();
+        MimeUtils::repairTransferEncodings(multi.get());
+        QString text;
+        QString html;
+        MimeUtils::collectBodies(multi.get(), &text, &html);
+        check(text.contains(QStringLiteral("plain words")) && html == QStringLiteral("<p>hello</p>"),
+              "each leaf is judged on its own body");
+    }
+
     out << (failures == 0 ? "all mime utils tests passed\n"
                           : QStringLiteral("%1 check(s) failed\n").arg(failures));
     out.flush();

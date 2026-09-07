@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <QElapsedTimer>
 #include <QHash>
 #include <QList>
 #include <QObject>
@@ -147,8 +148,35 @@ public:
     void setSyncPaused(bool paused);
     /// The all-folders pass latches itself done once per connect; the poll
     /// timer re-arms it so mail in a folder nobody has open still reaches the
-    /// cache. Returns false when a pass is already due.
+    /// cache. Returns false when a pass is already due — or ran recently:
+    /// re-arming on every tick made the client re-open every folder of the
+    /// account every few minutes, which on a large account never finished and
+    /// was exactly the sustained load servers answer by dropping connections.
+    /// A pass now runs at most every sync/folderPassMinutes; the cheap per-
+    /// tick freshness in between is refreshFolderHeaders().
     bool restartFolderPass();
+    /// Cheap catch-up for one non-open folder whose STATUS count moved
+    /// between passes: everything newer than the cache, on the background
+    /// connection, nothing older. Fills the gap the rate-limited pass leaves.
+    void refreshFolderHeaders(const QString &folder);
+    /// Folders the full history backfill leaves out (Trash by default — see
+    /// sync/backfillTrash). New mail in them still lands via
+    /// refreshFolderHeaders and a click still syncs them like any folder.
+    void setBackfillExclusionProvider(std::function<bool(const QString &)> excluded)
+    {
+        m_backfillExcluded = std::move(excluded);
+    }
+    /// Runs over freshly arrived rows on the delta paths — the "everything
+    /// newer than the cache" fetches — before they are stored or shown. The
+    /// callee may file rows elsewhere (spam auto-move) and removes what it
+    /// filed from the list; deliberately not called for backfill windows, so
+    /// the first listing of a mailbox can never mass-move an inbox the user
+    /// has already lived with.
+    void setArrivalFilter(
+        std::function<void(const QString &, QList<MessageListModel::Header> &)> filter)
+    {
+        m_arrivalFilter = std::move(filter);
+    }
     /// A fresh folder list restarts the all-folders background sync pass.
     void restartFolderQueue();
     /// The background connection dropped mid-fetch: the server pushing back.
@@ -223,6 +251,10 @@ private:
     MailBackend *m_backend = nullptr;
     std::function<bool()> m_isBusy;
     std::function<bool(const QString &)> m_hasPendingOps;
+    std::function<bool(const QString &)> m_backfillExcluded;
+    std::function<void(const QString &, QList<MessageListModel::Header> &)> m_arrivalFilter;
+    /// When the last all-folders pass was granted, for the rate limit above.
+    QElapsedTimer m_folderPassGranted;
 
     QString m_selectedFolder;
     bool m_searchActive = false;

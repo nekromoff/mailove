@@ -59,9 +59,13 @@ QVariant MessageListModel::data(const QModelIndex &index, int role) const
     case AuthInfoRole:
         return h.authInfo;
     case AttachmentRole:
-        return kindHasAttachment(h.attachKind);
+        return kindHasFile(h.attachKind);
     case CalendarRole:
-        return h.attachKind == CalendarAttachment;
+        return kindHasCalendar(h.attachKind);
+    case AttachCountRole:
+        return h.attachCount;
+    case CalendarCountRole:
+        return h.calendarCount;
     case ColorLabelRole:
         return h.colorLabel;
     case CryptoRole:
@@ -73,6 +77,8 @@ QVariant MessageListModel::data(const QModelIndex &index, int role) const
         return h.spamState < SpamExempt && h.spamScore >= SpamHeuristics::spamThreshold();
     case SpamDetailRole:
         return h.spamDetail;
+    case ForwardedRole:
+        return h.forwarded;
     }
     return {};
 }
@@ -90,10 +96,13 @@ QHash<int, QByteArray> MessageListModel::roleNames() const
         {AuthInfoRole, "authInfo"},
         {AttachmentRole, "hasAttachment"},
         {CalendarRole, "calendarAttachment"},
+        {AttachCountRole, "attachmentCount"},
+        {CalendarCountRole, "calendarCount"},
         {ColorLabelRole, "colorLabel"},
         {CryptoRole, "crypto"},
         {SpamRole, "spam"},
         {SpamDetailRole, "spamDetail"},
+        {ForwardedRole, "forwarded"},
     };
 }
 
@@ -118,6 +127,35 @@ void MessageListModel::setDateFormat(const QString &format)
         Q_EMIT dataChanged(index(0), index(m_rows.size() - 1), {DateRole});
 }
 
+int MessageListModel::markerGlyphsOf(const Header &h)
+{
+    return int(h.forwarded) + int(h.crypto > 0) + int(kindHasCalendar(h.attachKind))
+        + int(kindHasFile(h.attachKind));
+}
+
+void MessageListModel::refreshMarkerCount()
+{
+    int most = 0;
+    for (const Header &h : std::as_const(m_all)) {
+        most = std::max(most, markerGlyphsOf(h));
+        if (most == 4)
+            break; // nothing can need more
+    }
+    if (most == m_markerCount)
+        return;
+    m_markerCount = most;
+    Q_EMIT markerCountChanged();
+}
+
+void MessageListModel::noteMarkers(const Header &h)
+{
+    const int need = markerGlyphsOf(h);
+    if (need <= m_markerCount)
+        return;
+    m_markerCount = need;
+    Q_EMIT markerCountChanged();
+}
+
 void MessageListModel::setHeaders(QList<Header> headers)
 {
     m_all = std::move(headers);
@@ -125,6 +163,7 @@ void MessageListModel::setHeaders(QList<Header> headers)
         primeKeys(h);
     reindex();
     rebuildVisible();
+    refreshMarkerCount();
 }
 
 int MessageListModel::appendHeaders(const QList<Header> &headers)
@@ -213,6 +252,8 @@ int MessageListModel::appendHeaders(const QList<Header> &headers)
         qWarning() << "messagelist: SLOW append" << headers.size() << "rows (" << added
                    << "new ) at" << m_all.size() << "total," << totalMs << "ms";
     }
+    for (const Header &h : headers)
+        noteMarkers(h);
     return added;
 }
 
@@ -224,6 +265,7 @@ void MessageListModel::clear()
     m_byUid.clear();
     m_filter = QRegularExpression();
     endResetModel();
+    refreshMarkerCount();
 }
 
 void MessageListModel::applyFilter(const QRegularExpression &pattern)
@@ -468,6 +510,7 @@ void MessageListModel::setCrypto(qint64 uid, int kind)
     if (it == m_byUid.constEnd() || m_all.at(it.value()).crypto == kind)
         return;
     m_all[it.value()].crypto = kind;
+    noteMarkers(m_all.at(it.value()));
     const int row = visibleRowOf(it.value());
     if (row >= 0) {
         const QModelIndex idx = index(row);
@@ -481,6 +524,7 @@ void MessageListModel::setAttachKind(qint64 uid, int kind)
     if (it == m_byUid.constEnd() || m_all.at(it.value()).attachKind == kind)
         return;
     m_all[it.value()].attachKind = kind;
+    noteMarkers(m_all.at(it.value()));
     const int row = visibleRowOf(it.value());
     if (row >= 0) {
         const QModelIndex idx = index(row);
@@ -488,9 +532,31 @@ void MessageListModel::setAttachKind(qint64 uid, int kind)
     }
 }
 
+void MessageListModel::setAttachCounts(qint64 uid, int files, int calendars)
+{
+    const auto it = m_byUid.constFind(uid);
+    if (it == m_byUid.constEnd())
+        return;
+    Header &h = m_all[it.value()];
+    if (h.attachCount == files && h.calendarCount == calendars)
+        return;
+    h.attachCount = files;
+    h.calendarCount = calendars;
+    const int row = visibleRowOf(it.value());
+    if (row >= 0) {
+        const QModelIndex idx = index(row);
+        Q_EMIT dataChanged(idx, idx, {AttachCountRole, CalendarCountRole});
+    }
+}
+
 QString MessageListModel::fromAt(int row) const
 {
     return (row >= 0 && row < m_rows.size()) ? m_all.at(m_rows.at(row)).from : QString();
+}
+
+QString MessageListModel::msgidAt(int row) const
+{
+    return (row >= 0 && row < m_rows.size()) ? m_all.at(m_rows.at(row)).msgid : QString();
 }
 
 void MessageListModel::clearSpam(qint64 uid)
@@ -605,6 +671,27 @@ void MessageListModel::markUnseen(int row)
     m_all[m_rows.at(row)].seen = false;
     const QModelIndex idx = index(row);
     Q_EMIT dataChanged(idx, idx, {SeenRole});
+}
+
+bool MessageListModel::forwardedAt(int row) const
+{
+    if (row < 0 || row >= m_rows.size())
+        return false;
+    return m_all.at(m_rows.at(row)).forwarded;
+}
+
+void MessageListModel::setForwarded(qint64 uid, bool on)
+{
+    const int row = rowForUid(uid);
+    if (row < 0)
+        return;
+    Header &h = m_all[m_rows.at(row)];
+    if (h.forwarded == on)
+        return;
+    h.forwarded = on;
+    noteMarkers(h);
+    const QModelIndex idx = index(row);
+    Q_EMIT dataChanged(idx, idx, {ForwardedRole});
 }
 
 void MessageListModel::markSeen(int row)

@@ -253,6 +253,10 @@ const AdvancedConfig::Knob kSchema[] = {
     // "very strict" — it would mark every message in the mailbox.
     {"spam/threshold", Type::Int, 50, 1, 1000, Reload::Live,
      "Score at which a message is marked spam. Lower catches more and errs more."},
+    {"spam/autoMove", Type::Bool, true, {}, {}, Reload::Live,
+     "Move newly arrived mail that reaches the threshold into the Junk folder "
+     "instead of only marking it. Applies to new arrivals only — mail already "
+     "sitting in the inbox keeps the mark and stays put."},
     {"spam/familiarCount", Type::Int, 20, 1, 10000, Reload::Live,
      "Messages from a domain before it counts as familiar and is trusted more."},
     {"spam/familiarDays", Type::Int, 60, 1, 3650, Reload::Live,
@@ -357,9 +361,26 @@ const AdvancedConfig::Knob kSchema[] = {
      "The message is already in a junk folder. Far above the threshold on purpose: it is "
      "a decision you or your server made, not a guess. 0 makes junk folders score like "
      "any other."},
+    {"spamrules/known-contact", Type::Int, -15, -999, 999, Reload::Live,
+     "Somebody you have written to, but the receiving server did not authenticate the "
+     "message as theirs. Credit, not an exemption: the exemption needs a pass, because "
+     "anyone can type an address you have mailed."},
     {"spamrules/known-contact-spoofed", Type::Int, 60, -999, 999, Reload::Live,
      "Claims to be somebody you have written to, while failing authentication. Decisive "
      "on its own — forging an address you correspond with is targeted."},
+    {"spamrules/own-address-forged", Type::Int, 100, -999, 999, Reload::Live,
+     "Claims to be sent from one of your own addresses and fails authentication. Twice "
+     "the threshold: nothing may argue a self-spoof down."},
+    {"spamrules/own-address-unverified", Type::Int, 100, -999, 999, Reload::Live,
+     "Claims to be sent from one of your own addresses with no SPF/DKIM/DMARC/ARC pass "
+     "to show for it. Your own server vouches for your own mail; the \"I sent this "
+     "from your account\" extortion arrives with nothing."},
+    {"spamrules/crypto-extortion", Type::Int, 50, -999, 999, Reload::Live,
+     "A cryptocurrency wallet address in the body beside talk of recordings, malware "
+     "or your contacts — the webcam extortion scam. Decisive at the default threshold."},
+    {"spamrules/crypto-wallet", Type::Int, 15, -999, 999, Reload::Live,
+     "A cryptocurrency wallet address in the body with no extortion around it. Weak: "
+     "exchanges quote wallet addresses routinely."},
     {"spamrules/link-text-mismatch", Type::Int, 25, -999, 999, Reload::Live,
      "A link's visible text names one domain while it goes to another. Not read in list "
      "mail, whose click trackers do this legitimately."},
@@ -410,7 +431,7 @@ const AdvancedConfig::Knob kSchema[] = {
      "low to mark anything by itself."},
     {"spamrules/upstream-ham", Type::Int, -15, -999, 999, Reload::Live,
      "Your mail server's own filter scored this well below its threshold."},
-    {"spamrules/upstream-near-threshold", Type::Int, 12, -999, 999, Reload::Live,
+    {"spamrules/upstream-near-threshold", Type::Int, 30, -999, 999, Reload::Live,
      "Your mail server's own filter came close to its threshold without calling it."},
     {"spamrules/upstream-spam", Type::Int, 40, -999, 999, Reload::Live,
      "Your mail server's own filter marked this as spam."},
@@ -444,6 +465,13 @@ const AdvancedConfig::Knob kSchema[] = {
      "Pause between body-fetch batches."},
     {"sync/backfillIdleMs", Type::Int, 4000, 100, 600000, Reload::Restart,
      "How long the backfill waits after going idle before resuming."},
+    {"sync/folderPassMinutes", Type::Int, 60, 0, 1440, Reload::Live,
+     "Shortest gap between full all-folders sync passes. New mail still arrives "
+     "between passes (STATUS + delta fetch each refresh); 0 restores a pass per "
+     "refresh tick."},
+    {"sync/backfillTrash", Type::Bool, false, {}, {}, Reload::Live,
+     "Include Trash in the full history backfill. Off keeps deleted mail from "
+     "dominating the pass on large accounts."},
     {"sync/backoffBaseMs", Type::Int, 1000, 100, 60000, Reload::Live,
      "First wait after the server throttles; doubles per attempt."},
     {"sync/backoffCapMs", Type::Int, 64000, 1000, 600000, Reload::Live,

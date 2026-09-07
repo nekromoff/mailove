@@ -205,6 +205,17 @@ Item {
         Mail.sendMail(toField.text, ccField.text, bccField.text,
                       subjectField.text, bodyEdit.text, attachments,
                       pgpSign, pgpEncrypt, resolvedAppendQuote(), appendStrip)
+        markForwardedSource()
+    }
+
+    /// Marks the message this was a forward of, once — a composer reopened
+    /// from the outbox or reused for another mail has already cleared these.
+    function markForwardedSource() {
+        if (forwardedFolder === "" || !forwardedUids || forwardedUids.length === 0)
+            return
+        Mail.markForwarded(forwardedFolder, forwardedUids)
+        forwardedFolder = ""
+        forwardedUids = []
     }
 
     /// The deferred quote as the send should carry it: with remote off the
@@ -357,10 +368,16 @@ Item {
 
     function openNew() {
         docHandler.cancelQuoteStream() // reused sheet: whatever was streaming is gone
+        // A reused composer must not carry the last forward's origin into an
+        // unrelated draft — that would mark a message nobody forwarded.
+        forwardedFolder = ""
+        forwardedUids = []
         appendQuote = ""
         appendStrip = false
         releasePreview()
         sourceDraftUid = -1
+        forwardedFolder = ""
+        forwardedUids = []
         titleBase = "Compose"
         toField.text = ""
         ccField.text = ""
@@ -382,6 +399,13 @@ Item {
     /// uid of the Drafts message this composer was opened from, so the stale
     /// copy can be removed once its replacement is stored. -1 for a new message.
     property real sourceDraftUid: -1
+
+    /// What this composer is a forward OF, straight from the forward prefill:
+    /// the folder and the uids of the messages it carries. Handed back to
+    /// Mail.markForwarded() when the mail is actually sent, which is what puts
+    /// the $Forwarded arrow on the original. Empty for every other composer.
+    property string forwardedFolder: ""
+    property var forwardedUids: []
 
     /// d = Mail.draftData(): {to, cc, bcc, subject, body, uid}. Nothing is
     /// quoted or prefixed — the draft is resumed exactly as it was saved.
@@ -416,6 +440,8 @@ Item {
             return
         const t0 = Date.now()
         sourceDraftUid = -1
+        forwardedFolder = ""
+        forwardedUids = []
         titleBase = "Reply"
         toField.text = r.to
         ccField.text = r.cc
@@ -460,6 +486,8 @@ Item {
             return
         const t0 = Date.now()
         sourceDraftUid = -1
+        forwardedFolder = ""
+        forwardedUids = []
         titleBase = "Forward"
         toField.text = r.to
         ccField.text = r.cc
@@ -469,6 +497,8 @@ Item {
         bodyEdit.text = r.body
         const t2 = Date.now()
         attachments = r.attachments ? r.attachments : []
+        forwardedFolder = r.origFolder ? r.origFolder : ""
+        forwardedUids = r.origUids ? r.origUids : []
         const t3 = Date.now()
         content.ccExpanded = r.cc.length > 0
         focusBodyOnOpen = false // recipient is still to be chosen
@@ -658,6 +688,7 @@ Item {
                     Mail.sendMail(toField.text, ccField.text, bccField.text,
                                   subjectField.text, bodyEdit.text, sheet.attachments,
                                   sheet.pgpSign, false)
+                    sheet.markForwardedSource()
                 }
             }
             QQC2.Button {
@@ -1104,7 +1135,17 @@ Item {
             QQC2.ToolButton {
                 activeFocusOnTab: true
                 icon.name: "mail-attachment"
-                text: "Attach"
+                // Doubles as the drop indicator: files can be dropped anywhere
+                // on the composer, and this is what says so while a drag is
+                // held (see the DropArea at the end of this file).
+                // Offered whenever the drop would attach something: always
+                // outside the body, and inside it too for anything that cannot
+                // be inlined. The only drag it stays quiet for is pictures over
+                // the message, which go in rather than alongside.
+                readonly property bool dropAttaches: fileDropArea.containsDrag
+                    && (!fileDropArea.overBody || fileDropArea.hasAttachable)
+                text: dropAttaches ? "Drop to attach" : "Attach"
+                highlighted: dropAttaches
                 onClicked: attachDialog.open()
                 QQC2.ToolTip.text: "Attach a file (" +
                     (sheet.ui ? sheet.ui.shortcutAttach : "Ctrl+Shift+A") + ")"
@@ -1461,5 +1502,97 @@ Item {
                 }
             }
         }
+    }
+
+    // Files dropped anywhere on the composer become attachments. The key
+    // filter is what keeps this out of the way of everything else that can be
+    // dragged into a composer: only a uri-list drag is claimed here, so
+    // dragging text (or a selection inside the body) still reaches the editor
+    // underneath untouched.
+    DropArea {
+        id: fileDropArea
+        anchors.fill: parent
+        keys: ["text/uri-list"]
+
+        // Local files only. A link dragged from a browser also arrives as a
+        // uri-list, and an http URL is not something that can be attached —
+        // rather than attaching a broken entry, leave such a drag unclaimed.
+        function localFiles(drag) {
+            const out = []
+            if (!drag.hasUrls)
+                return out
+            // Compared as strings throughout: url is a value type, and two
+            // url values for the same file are not necessarily the same object.
+            const have = sheet.attachments.map(a => String(a))
+            for (const u of drag.urls) {
+                const s = String(u)
+                if (s.startsWith("file:") && have.indexOf(s) < 0) {
+                    have.push(s)
+                    out.push(u)
+                }
+            }
+            return out
+        }
+
+        /// True while the drag is over the body editor, where a picture goes
+        /// into the message rather than beside it.
+        property bool overBody: false
+
+        /// Whether this drag carries anything that cannot go inline. Settled
+        /// once when the drag arrives rather than per mouse move: the files do
+        /// not change while it is held, and deciding costs a look at each one
+        /// on disk. Together with overBody it is what the Attach button reads —
+        /// a drag of anything but pictures attaches wherever it is dropped, and
+        /// saying so only outside the body made the offer flicker on and off as
+        /// the pointer crossed into the message.
+        property bool hasAttachable: false
+
+        /// Whether a point in this area is over the visible body. Tested
+        /// against the scroll view, not the editor: a long message makes the
+        /// editor taller than its viewport, so a drop on the toolbar below
+        /// would otherwise still land "inside" the body.
+        function onBody(x, y) {
+            return bodyScroll.contains(mapToItem(bodyScroll, x, y))
+        }
+
+        onEntered: drag => {
+            const files = localFiles(drag)
+            if (files.length === 0) {
+                drag.accepted = false
+                return
+            }
+            hasAttachable = docHandler.hasNonImageFile(files)
+            overBody = onBody(drag.x, drag.y)
+        }
+
+        onPositionChanged: drag => overBody = onBody(drag.x, drag.y)
+        onExited: overBody = false
+
+        onDropped: drop => {
+            let files = localFiles(drop)
+            overBody = false
+            if (files.length === 0)
+                return
+            // Dropped on the message itself: pictures belong in it, where they
+            // land at the point they were dropped rather than wherever the
+            // cursor happened to be left. Whatever is not a picture comes back
+            // to be attached, which is what a drop anywhere else does with
+            // everything.
+            if (onBody(drop.x, drop.y)) {
+                const p = mapToItem(bodyEdit, drop.x, drop.y)
+                bodyEdit.forceActiveFocus()
+                bodyEdit.cursorPosition = bodyEdit.positionAt(p.x, p.y)
+                files = docHandler.insertImageFiles(files)
+            }
+            for (const f of files)
+                sheet.attachments.push(f)
+            drop.acceptProposedAction()
+        }
+
+        // No overlay is drawn over the page while a drag is held: an
+        // item painted across the whole window drops the render node of the
+        // WebEngineView living in the same window (the message preview), which
+        // then stays black. The feedback is the Attach button instead — it is
+        // already in the layout, so showing it costs no new layer.
     }
 }

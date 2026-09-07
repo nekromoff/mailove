@@ -181,6 +181,8 @@ QStringList JmapBackend::flagsFromKeywords(const QJsonObject &keywords)
         flags.append(QStringLiteral("draft"));
     if (keywords.value(QLatin1String("$flagged")).toBool())
         flags.append(QStringLiteral("flagged"));
+    if (keywords.value(QLatin1String("$forwarded")).toBool())
+        flags.append(QStringLiteral("forwarded"));
     // No "deleted": JMAP has no such keyword. A message is deleted by being
     // removed from every mailbox, which is a move, not a flag.
     return flags;
@@ -598,7 +600,7 @@ void JmapBackend::fetchHeaderWindow(const QString &folder, int fromNewest, int c
 }
 
 void JmapBackend::fetchHeadersSince(const QString &folder, const QString &sinceRemoteId,
-                                    const OpCallback &done)
+                                    const OpCallback &done, bool)
 {
     // sinceRemoteId is IMAP's way of asking this question — everything above a
     // uid — and JMAP has a better one: the server's own change log, which also
@@ -804,7 +806,7 @@ int JmapBackend::freeBodySlots() const
 }
 
 void JmapBackend::fetchBodies(const QString &folder, const QStringList &remoteIds,
-                              const OpCallback &done)
+                              const OpCallback &done, bool)
 {
     if (remoteIds.isEmpty()) {
         report(done, Error::None, QString());
@@ -1150,6 +1152,8 @@ QString JmapBackend::keywordForFlag(const QString &flag)
         return QStringLiteral("$draft");
     if (flag == QLatin1String("flagged"))
         return QStringLiteral("$flagged");
+    if (flag == QLatin1String("forwarded"))
+        return QStringLiteral("$forwarded");
     // "deleted" lands here, and answering empty is the point. IMAP deletes by
     // flagging and expunging; JMAP by removing a message from every mailbox,
     // which is deleteMessages(). Inventing a `$deleted` nobody honours would

@@ -1,3 +1,115 @@
+mailove (3.5) unstable; urgency=medium
+
+  * The known-correspondent exemption now requires the receiving server to
+    have authenticated the message (SPF/DKIM/DMARC pass). It used to stand
+    on the mere absence of a failure, which let a sextortion mail forging
+    your own address as sender - through a server that stamps no
+    Authentication-Results at all - walk in as "you have sent mail to
+    this address". Without a pass the correspondence is credit (-15), not
+    a free pass.
+  * Your own address as sender with nothing vouching for it is now marked
+    on that alone (+100, twice the threshold), and +100 again when
+    authentication outright fails. Nobody but your own server sends mail
+    from your address, and your own server would have said so.
+  * A cryptocurrency wallet address beside talk of recordings, webcams,
+    malware or your contacts is marked as the extortion scam it is (+50).
+    A wallet address on its own is only a weak signal (+15) - exchanges
+    quote them routinely.
+  * A message whose header says base64 while its body is plain text - a
+    delivery path decoded it and left the label - showed as a few bytes of
+    noise. Such a part is now read as it is; the wire bytes DKIM judges
+    are untouched, so "Modified after DKIM" still tells you it happened.
+
+  * Forwarding a message now marks it as forwarded, and the list shows an
+    arrow beside it. The $Forwarded keyword every other client writes
+    (RFC 5788 on IMAP, $forwarded on JMAP), so a forward made anywhere
+    else shows here too, and one made here shows there. The mark is set
+    when Send is pressed, and only for the messages that really went into
+    the mail.
+  * The list's marker column is now one column for all four facts -
+    forwarded, encrypted, invitation, attachment - packed tight, sized to
+    the busiest row on screen and to nothing more. A folder of plain mail
+    gives the whole width back to the subject. One hover answers the
+    column: a line per glyph showing, with the attachment count and the
+    invitations counted apart, so an invitation that arrives with its
+    agenda attached says both.
+  * An invitation arriving with ordinary attachments no longer shows as
+    one or the other - both glyphs, and the exact numbers on the tooltip.
+  * Files can be dropped anywhere on the composer. Pictures dropped on the
+    message go into it inline, at the cursor; everything else is attached,
+    wherever it lands. The Attach button says which will happen while the
+    drag is held. Text dragged into the body still reaches the editor
+    untouched.
+  * The message preview turned black - and stayed black for the rest of
+    the session - as soon as any drag passed over the window. QtWebEngine
+    loses the view's texture to the drag and nothing brings it back;
+    compositing now runs off the GPU, rasterization still on it.
+  * "No connection available" on a clicked message. The connection the
+    user's clicks ride on was the one connection a body fetch would never
+    use, so a click could fail with it sitting idle. A message a person is
+    waiting on now goes out on any leg there is, that one included, while
+    the backfill still keeps off it. A dropped background connection is
+    reopened whenever it is found missing rather than only by a backfill
+    tick, and a refusal to open extra connections expires instead of
+    latching for the whole session - a renewed OAuth token lifts it at once.
+  * The all-folders sync pass is rate-limited (sync/folderPassMinutes,
+    60 by default). It used to re-arm every tick, which on a large account
+    meant re-opening every folder every few minutes, never finishing, and
+    was exactly the load servers answer by dropping connections. New mail
+    between passes arrives through the folder counts: a folder whose count
+    moved gets a delta fetch, and nothing else does.
+  * Trash is left out of the full history backfill (sync/backfillTrash to
+    include it). Deleted mail dominated the pass on large accounts; new
+    mail there still arrives, and opening the folder still syncs it.
+  * A cancelled passphrase prompt is reported as a cancellation again.
+    gpg does not always set an error code when pinentry is dismissed, so
+    declining to sign read as a failed send and declining to decrypt read
+    as a broken message.
+  * A cached message whose attachment payloads have gone missing is kept
+    on screen while it is refetched, instead of being cleared first and
+    leaving a blank pane when the connection dies mid-fetch.
+  * Opening a message re-checks the Message-ID of what the cache hands
+    back; a body that belongs to another message is dropped and refetched
+    rather than shown.
+  * Switching accounts now times its own phases and says which one was
+    slow when the window froze for it.
+
+ -- dusoft <dusoft@bastadigital.com>  Mon, 07 Sep 2026 12:00:00 +0200
+
+mailove (3.4) unstable; urgency=medium
+
+  * Opening a message could show a different message entirely. When new mail
+    arrived while a body fetch was in flight, the delivery resolved its row
+    again in a list that had just been re-sorted, and cached the fetched body
+    - and the spam verdict derived from it - under the neighbouring row's
+    uid. From then on that row opened as the wrong message, from cache,
+    forever. Deliveries are now keyed by the uid captured at click time, a
+    row is never resolved twice.
+  * A one-time migration checks every cached body against its own message
+    row and drops any filed under the wrong message; the next open fetches
+    the real one. Verdicts derived from a wrong body - spam score, DKIM -
+    are cleared to be re-derived. Opening a message also re-checks the
+    Message-ID of what the cache hands back, so a mis-filed body can never
+    be shown even if one slips through again.
+  * The same hole is closed on the wire: an IMAP fetch or unseen search
+    answered with a different mailbox selected than the one it was issued
+    for is dropped instead of stored - another mailbox's messages can no
+    longer be filed under this one's uids by a failed SELECT.
+  * Spam scoring at or past the threshold now files new arrivals into the
+    junk folder by itself, instead of leaving them marked in the inbox.
+    New arrivals only - the first sync of an existing mailbox moves
+    nothing - and only mail the scorer is sure about: exemptions, your own
+    "not spam" answers and known correspondents outrank any score. A
+    message that crosses the threshold once its body arrives is filed at
+    that moment, unless it is open in front of you. Auto-filed mail is
+    deliberately not fed back into the junk-content corpus: only your own
+    gesture teaches it. Off switch: spam/autoMove in Advanced settings.
+  * Your mail server's own filter scoring a message near its threshold now
+    carries the weight it deserves (12 -> 30): corroboration from the one
+    party that saw the message before mailove did.
+
+ -- dusoft <dusoft@bastadigital.com>  Sat, 30 Aug 2026 01:30:00 +0200
+
 mailove (3.3) unstable; urgency=medium
 
   * A message whose plain text is identical to one you moved to spam is now

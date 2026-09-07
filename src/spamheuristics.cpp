@@ -1336,20 +1336,30 @@ Score score(const Message &msg, const Context &ctx)
     }
 
     // ------------------------------------------------------------------
-    // Rule 0: someone the user has written to is not a spammer.
+    // Rule 0: someone the user has written to is not a spammer — once the
+    // message is shown to be from them.
     //
-    // The one thing that can revoke it is the message failing authentication
-    // at our own receiving server. That is not a weakening of the rule — a
-    // message claiming to be from a known contact while failing SPF/DKIM/DMARC
-    // is precisely *not* from that contact, and an unconditional allowlist
-    // would hand a free pass to anyone who guesses an address the user has
-    // mailed. Absent auth data (no trusted Authentication-Results at all) the
-    // exemption stands: no evidence is not evidence of forgery.
+    // The exemption needs a *positive* verdict from our own receiving server:
+    // spf/dkim/dmarc = pass on a trusted Authentication-Results header. It
+    // used to stand on the absence of a failure, and that handed a free pass
+    // to anyone who guesses an address the user has mailed — which the
+    // sextortion kits do by construction, forging the user's own address as
+    // both From and To through a server that stamps no Authentication-Results
+    // at all. "No evidence" was read as "not forged". It is neither.
+    //
+    // Without a pass the correspondence still counts, as ham credit below
+    // (known-contact), but it no longer ends the scoring: a forged known
+    // address then has to survive every other rule like any stranger's mail.
+    // On an account whose server never stamps trusted auth results — or with
+    // authVerification switched off — that is the only form Rule 0 takes.
     // ------------------------------------------------------------------
-    if (ctx.knownCorrespondent && !authFailed && !ctx.alwaysScore && !ctx.inJunkFolder) {
+    if (ctx.knownCorrespondent && ctx.authPassed && !authFailed && !ctx.alwaysScore
+        && !ctx.inJunkFolder) {
         out.exempt = true;
         out.verdict = Verdict::Ham;
-        out.exemptReason = QStringLiteral("You have sent mail to %1.").arg(fromAddr);
+        out.exemptReason =
+            QStringLiteral("You have sent mail to %1, and sender authentication passed.")
+                .arg(fromAddr);
         return out;
     }
 
@@ -1370,7 +1380,27 @@ Score score(const Message &msg, const Context &ctx)
     }
 
     // --- Authentication ------------------------------------------------
-    if (ctx.knownCorrespondent && authFailed) {
+    // The user's own address in the From line. Nobody but the user's own
+    // server sends that legitimately, so it is the one sender for which "no
+    // verdict" is itself an accusation: mail the user sends themselves passes
+    // SPF at their own server as a matter of course, while the "I sent this
+    // from your account" extortion mail arrives from a bare IP in another
+    // country with nothing to show. Twice the threshold in both forms — a
+    // self-spoof is the strongest single signal this file knows, no ham
+    // credit may argue it down, and the header stage sees it before any body
+    // arrives. Neither branch
+    // waits on knownCorrespondent: the user need never have mailed themselves
+    // for the forgery to be one.
+    const bool fromIsOwn = !fromAddr.isEmpty() && ctx.ownAddresses.contains(fromAddr);
+    if (fromIsOwn && authFailed) {
+        hit("own-address-forged", 100,
+            QStringLiteral("Claims to be sent from your own address %1, but sender "
+                           "authentication failed — it was not").arg(fromAddr));
+    } else if (fromIsOwn && !ctx.authPassed && !ctx.arcPassed) {
+        hit("own-address-unverified", 100,
+            QStringLiteral("Claims to be sent from your own address %1, but nothing "
+                           "vouches for it — your own server would have").arg(fromAddr));
+    } else if (ctx.knownCorrespondent && authFailed) {
         // Decisive on its own: forging an address the user actually corresponds
         // with is targeted, not incidental.
         hit("known-contact-spoofed", 60,
@@ -1388,6 +1418,16 @@ Score score(const Message &msg, const Context &ctx)
         hit("auth-softfail", 20,
             QStringLiteral("Receiving server reported a soft authentication failure "
                            "(the sending domain itself hedges its answer)"));
+    }
+    // What is left of Rule 0 when nothing vouched for the sender: the
+    // correspondence is real evidence, and it is weighed rather than obeyed.
+    // Not for the user's own address — that case is scored just above, and
+    // having once mailed oneself is no reason to trust a stranger claiming to
+    // be oneself.
+    if (ctx.knownCorrespondent && !authFailed && !fromIsOwn && !ctx.inJunkFolder) {
+        hit("known-contact", -15,
+            QStringLiteral("You have sent mail to %1, though this message was not "
+                           "authenticated as theirs").arg(fromAddr));
     }
     // --- Familiarity ---------------------------------------------------
     // "We have had mail from this domain for a long time" — the signal that
@@ -1500,7 +1540,7 @@ Score score(const Message &msg, const Context &ctx)
             // Within striking distance of the server's threshold: real
             // evidence, but the server itself declined to call it, so this can
             // only ever corroborate.
-            hit("upstream-near-threshold", 12, detail);
+            hit("upstream-near-threshold", 30, detail);
         } else if (up.score <= 0) {
             hit("upstream-ham", -15, detail);
         }
@@ -2240,6 +2280,44 @@ Score score(const Message &msg, const Context &ctx)
             out.hits.append({h.id, weight, h.detail});
             out.total += weight;
             linkTotal += weight;
+        }
+    }
+
+    // A cryptocurrency wallet address in the body, and the vocabulary of the
+    // "I recorded you through your webcam" extortion around it. The wallet
+    // address is the payload of that scam — it cannot be left out, and it is
+    // a base58 or bech32 string no ordinary message contains — and the words
+    // around it are the pitch. Together they are the whole message; decisive
+    // on purpose, like a spoofed known contact. The address alone is only a
+    // weak signal: an exchange's own mail quotes wallet addresses routinely.
+    {
+        const QString bodyText = msg.text.isEmpty() ? visibleText(msg.html) : msg.text;
+        if (!bodyText.isEmpty()) {
+            static const QRegularExpression walletRe(QStringLiteral(
+                "(?<![A-Za-z0-9])(?:bc1[qp][a-z0-9]{38,62}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})"
+                "(?![A-Za-z0-9])"));
+            static const QRegularExpression extortionRe(
+                QStringLiteral("\\b(?:recorded|webcam|camera|trojan|malware|spyware|r\\.a\\.t\\.|"
+                               "hacked|masturbat\\w*|porn\\w*|adult (?:sites?|videos?)|"
+                               "your contacts|blackmail|ransom)\\b"),
+                QRegularExpression::CaseInsensitiveOption);
+            if (walletRe.match(bodyText).hasMatch()) {
+                int extortionWords = 0;
+                auto it = extortionRe.globalMatch(bodyText);
+                while (it.hasNext() && extortionWords < 3) {
+                    it.next();
+                    ++extortionWords;
+                }
+                if (extortionWords >= 2) {
+                    hit("crypto-extortion", 50,
+                        QStringLiteral("Demands payment to a cryptocurrency wallet and talks "
+                                       "of recordings, malware or your contacts — the shape "
+                                       "of the webcam extortion scam"));
+                } else {
+                    hit("crypto-wallet", 15,
+                        QStringLiteral("The message contains a cryptocurrency wallet address"));
+                }
+            }
         }
     }
 

@@ -105,7 +105,10 @@ public:
         qint64 uid = -1;   ///< local primary key (IMAP uid; synthetic for JMAP)
         QString remoteId;  ///< the protocol's own id — MessageListModel::Header::remoteId
         std::shared_ptr<KMime::Message> message;
-        QStringList flags; ///< normalized: "seen", "deleted", "draft", "flagged"
+        /// normalized: "seen", "deleted", "draft", "flagged", "answered",
+        /// "forwarded" (the $Forwarded keyword — RFC 5788 on IMAP, $forwarded
+        /// on JMAP)
+        QStringList flags;
         qint64 size = 0;
     };
 
@@ -205,8 +208,11 @@ public:
     /// messagesVanished() during this call; one that cannot simply does not,
     /// which is why the caller must treat that signal as extra news rather than
     /// as a complete account of the folder.
+    /// \a background asks for the same routing promise as fetchHeaderWindow's
+    /// flag: serve it without touching the connection the user's clicks ride
+    /// on, and answer Error::Connection if that is not possible right now.
     virtual void fetchHeadersSince(const QString &folder, const QString &sinceRemoteId,
-                                   const OpCallback &done) = 0;
+                                   const OpCallback &done, bool background = false) = 0;
     /// Fetches the headers of specific messages, named the protocol's own way
     /// (search results, a refresh of known rows).
     virtual void fetchHeadersById(const QString &folder, const QStringList &remoteIds,
@@ -215,8 +221,15 @@ public:
     /// original bytes — IMAP as BODY.PEEK[], JMAP as a blob download — which is
     /// what lets the existing KMime parsing, viewer and DKIM paths stay
     /// untouched. Answered by bodyFetched() per message.
+    ///
+    /// \a interactive marks a request a person is waiting on — a clicked
+    /// message, a verification refetch — as opposed to the backfill. A backend
+    /// with tiered connections must serve it on *any* leg it has left, the
+    /// interactive one included: for the backfill "no capacity right now" is
+    /// an answer (the ids come back round), but for a click it is a failure
+    /// the user reads.
     virtual void fetchBodies(const QString &folder, const QStringList &remoteIds,
-                             const OpCallback &done) = 0;
+                             const OpCallback &done, bool interactive = false) = 0;
     /// How many more body batches can be started right now. A backend may keep
     /// several connections for bulk transfer (IMAP does; HTTP does not need
     /// to), and the caller paces its queue by this rather than guessing.

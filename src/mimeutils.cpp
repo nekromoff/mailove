@@ -112,6 +112,68 @@ bool restoreAttachments(KMime::Message *msg, const QList<MailStore::PartRef> &pa
     return complete;
 }
 
+/// True when the leading run of the body (whitespace aside) is drawn from the
+/// base64 alphabet. Only the first 512 significant bytes are read: raw text
+/// or HTML fails within the first line, and a genuine base64 body cannot
+/// contain anything else at any point, so nothing is gained by reading on.
+static bool looksLikeBase64(const QByteArray &body)
+{
+    int seen = 0;
+    for (const char c : body) {
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\t')
+            continue;
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+            || (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=';
+        if (!ok)
+            return false;
+        if (++seen >= 512)
+            break;
+    }
+    return true;
+}
+
+void repairTransferEncodings(KMime::Content *node)
+{
+    if (!node)
+        return;
+    const auto children = node->contents();
+    if (!children.isEmpty()) {
+        for (KMime::Content *child : children)
+            repairTransferEncodings(child);
+        return;
+    }
+    if (!node->hasHeader("Content-Transfer-Encoding"))
+        return;
+    auto *cte = node->contentTransferEncoding();
+    if (!cte || cte->encoding() != KMime::Headers::CEbase64)
+        return;
+    const QByteArray body = node->body();
+    if (body.isEmpty() || looksLikeBase64(body))
+        return;
+    // Two things, because KMime undoes each on its own: the header object,
+    // and then setBody() with the very same bytes, which drops the decoded
+    // body KMime keeps from the first read. Both allowed on a frozen message,
+    // whose encodedContent() still answers with the wire — the head text is
+    // deliberately not rewritten, because that IS the wire for the DKIM
+    // verdict and the cache. The price is that parse() would rebuild the
+    // header from the head text and undo this; parseIfNeeded() exists so no
+    // consumer parses an already-parsed message.
+    cte->setEncoding(KMime::Headers::CEbinary);
+    node->setBody(body);
+}
+
+void parseIfNeeded(KMime::Content *node)
+{
+    if (!node)
+        return;
+    if (!node->contents().isEmpty())
+        return;
+    const auto *ct = std::as_const(*node).contentType();
+    const bool container = ct && (ct->isMultipart() || ct->isMimeType("message/rfc822"));
+    if (container)
+        node->parse();
+}
+
 void collectBodies(KMime::Content *node, QString *text, QString *html)
 {
     if (!node)

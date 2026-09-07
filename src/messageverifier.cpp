@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include "messageverifier.h"
+#include "mimeutils.h"
 
 #include "mailstore.h"
 #include "messagecontext.h"
@@ -244,8 +245,7 @@ bool MessageVerifier::healCachedBody(MessageContext *ctx, HealReason reason)
             // gets.
             m_dkimHealed.insert(healKey);
             KMime::Message *msg = message.get();
-            if (msg->contents().isEmpty())
-                msg->parse();
+            MimeUtils::parseIfNeeded(msg);
             // Judge the signature against what the server actually holds. The
             // parsed message on screen is left alone: the rendered body is
             // unchanged, and re-presenting it would flicker for no gain.

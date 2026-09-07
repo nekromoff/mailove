@@ -26,8 +26,8 @@ Security-minded KDE-first IMAP and JMAP mail client, blazing fast.
 - **OpenPGP** - read and send signed and encrypted mail through GnuPG. Key manager, WKD discovery. Decrypted plaintext is never indexed, never cached, and is wiped from memory when the message closes.
 - **Keyboard-first** - arrows, Page Up/Down, Home/End, Enter to open, Ctrl+W to close a tab, and the keyboard follows the folder you open.
 - **Tabs** - Compose, Settings and opened messages are tabs. Ctrl+W closes; Compose can be set to open in a window if preferred.
-- **Folders moving** - drag a folder onto another to reparent it, or onto the account name to move it to the top level. Rename from the context menu; where the protocol forbids it, the menu says so instead.
-- **Copy as Markdown** - select content in HTML email to copy it as Markdown
+- **Folders moving** - drag a folder onto another to reparent it, or onto the account name to move it to the top level. Rename from the context menu.
+- **Copy as Markdown** - copy full messages or selection as Markdown easily
 - **Sender images** - optional Gravatar avatars, **off by default**; Turn on with `avatars/enabled` in Advanced settings.
 - **Advanced settings** - for power users. All configs missing from the Settings can be edited (sync pacing, connection counts, protocol timeouts, spam weights, cache thresholds, sender pictures) in text area with a searchable reference beside the editor. Out-of-range values are corrected, unknown keys ignored with a warning. Clearing the file restores stock behaviour.
 

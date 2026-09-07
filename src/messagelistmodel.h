@@ -14,6 +14,11 @@
 class MessageListModel : public QAbstractListModel
 {
     Q_OBJECT
+    /// The most marker glyphs any loaded row shows at once — what the marker
+    /// column has to be wide enough for, and nothing more. A folder whose mail
+    /// carries no attachments, no signatures and no forwards reports 0, and the
+    /// column takes no width at all.
+    Q_PROPERTY(int markerCount READ markerCount NOTIFY markerCountChanged)
 
 public:
     enum Roles {
@@ -38,7 +43,19 @@ public:
         /// warning glyphs in one row would be two things to learn instead of one.
         SpamRole,
         /// Multi-line "Why?" text — one line per rule that fired.
-        SpamDetailRole
+        SpamDetailRole,
+        /// How many ordinary attachments the message really has — 0 until its
+        /// body has been seen, so a row that only shows the head-derived
+        /// paperclip has a count of 0 rather than a wrong number. Invitations
+        /// are counted separately, by CalendarCountRole.
+        AttachCountRole,
+        /// The .ics invitations, counted from the same body pass.
+        CalendarCountRole,
+        /// The user forwarded this message: the $Forwarded keyword, which is
+        /// what every other client writes for the same fact (IMAP RFC 5788,
+        /// JMAP $forwarded). Set by our own forward, read back from the
+        /// server for forwards made anywhere else.
+        ForwardedRole
     };
 
     /// Attachment kinds carried in Header::attachKind. The values are ordered:
@@ -53,6 +70,11 @@ public:
         /// multipart/mixed head that wraps nothing but the message text — what
         /// Mailove itself used to send — stops showing a paperclip.
         ConfirmedNoAttachment = 3,
+        /// Body: an .ics invite AND at least one ordinary attachment — an
+        /// invitation that arrives with the agenda attached, which is common
+        /// enough that collapsing it to one or the other lost real information.
+        /// Both glyphs show for it.
+        CalendarAndOther = 4,
     };
 
     /// What a Header::spamState value means. Ordered by how much the verdict
@@ -76,10 +98,27 @@ public:
         SpamUserCleared = 4,
     };
 
-    /// Whether \a kind (an AttachKind) means "show the paperclip".
+    int markerCount() const { return m_markerCount; }
+
+    /// Whether \a kind (an AttachKind) means "this message has attachments of
+    /// any sort" — what the attachment sort orders by.
     static constexpr bool kindHasAttachment(int kind)
     {
-        return kind == GenericAttachment || kind == CalendarAttachment;
+        return kind == GenericAttachment || kind == CalendarAttachment
+            || kind == CalendarAndOther;
+    }
+
+    /// Whether \a kind means "show the paperclip": an ordinary attachment, as
+    /// opposed to an invitation, which has a glyph of its own.
+    static constexpr bool kindHasFile(int kind)
+    {
+        return kind == GenericAttachment || kind == CalendarAndOther;
+    }
+
+    /// Whether \a kind means "show the calendar glyph".
+    static constexpr bool kindHasCalendar(int kind)
+    {
+        return kind == CalendarAttachment || kind == CalendarAndOther;
     }
 
     struct Header {
@@ -92,9 +131,16 @@ public:
         QString to;
         QDateTime date;
         bool seen = false;
+        /// $Forwarded — see ForwardedRole.
+        bool forwarded = false;
         bool suspicious = false; ///< SPF/DKIM/DMARC failure reported by our server
         QString authInfo;        ///< raw Authentication-Results header
         int attachKind = NoAttachment; ///< AttachKind
+        /// Ordinary attachment parts counted from the body, invitations not
+        /// included; 0 when unknown. See AttachCountRole.
+        int attachCount = 0;
+        /// The .ics invitations among them, counted the same way.
+        int calendarCount = 0;
         int colorLabel = 0;      ///< local color-scale mark (0 = none, 1..5)
         int crypto = 0;          ///< PgpMime::StoredKind, see CryptoRole
         /// Local spam heuristics (spamheuristics.h). The score is kept rather
@@ -165,18 +211,31 @@ public:
     /// is not a mark. The context menu flips between "Mark as spam" and "Not
     /// spam" on it.
     Q_INVOKABLE bool spamAt(int row) const;
+    /// Whether the row already carries $Forwarded, so a second forward of the
+    /// same message records nothing.
+    bool forwardedAt(int row) const;
     void markSeen(int row);
     void markUnseen(int row);
     /// Marks every listed message read at once — the model side of a folder's
     /// "mark all read". Rows hidden by an active filter are marked too: the
     /// command is about the folder, not about what is on screen.
     void markAllSeen();
+    /// Sets or clears $Forwarded on the row showing \a uid (no-op when it is
+    /// not loaded). Takes a uid rather than a row because the caller is the
+    /// send path, which knows the message and not where it currently sits.
+    void setForwarded(qint64 uid, bool on);
     /// Refines a message's attachment kind in place (body-derived knowledge).
     void setAttachKind(qint64 uid, int kind);
+    /// The exact counts, learned from the same body pass: ordinary
+    /// attachments and invitations, kept apart because each has its own glyph.
+    void setAttachCounts(qint64 uid, int files, int calendars);
     /// PgpMime::StoredKind for a listed row, refined from the full body.
     void setCrypto(qint64 uid, int kind);
     /// Raw From header of a visible row, display name included.
     QString fromAt(int row) const;
+    /// The row's Message-ID as the header sync recorded it (angle brackets
+    /// stripped); empty when the message carries none.
+    QString msgidAt(int row) const;
     /// Drops a row's spam mark and settles the verdict (state 3) so a later
     /// re-score cannot bring it back.
     void clearSpam(qint64 uid);
@@ -205,7 +264,20 @@ public:
     /// Quick filter: show only rows carrying this color mark (0 = off).
     Q_INVOKABLE void setColorFilter(int color);
 
+Q_SIGNALS:
+    void markerCountChanged();
+
 private:
+    /// How many marker glyphs one row shows: the forwarded arrow, the
+    /// lock, the invitation and the paperclip, counted as drawn.
+    static int markerGlyphsOf(const Header &h);
+    /// Recomputes markerCount from every loaded row and reports a change.
+    /// Cheap enough to run on a wholesale change; the incremental setters
+    /// below only ever raise it, so a row losing a glyph leaves the column a
+    /// little wider than it strictly needs until the folder is reloaded.
+    void refreshMarkerCount();
+    /// Raises markerCount if \a h now needs more glyphs than any row so far.
+    void noteMarkers(const Header &h);
     /// Fills the derived sort keys of a header entering the model.
     static void primeKeys(Header &h);
     /// Recomputes m_rows (sort + filter) inside a model reset.
@@ -235,6 +307,8 @@ private:
     QHash<qint64, int> m_byUid; ///< uid → index into m_all
     QRegularExpression m_filter;
     int m_colorFilter = 0;
+    /// See markerCount().
+    int m_markerCount = 0;
     SortColumn m_sortColumn = SortColumn::Date;
     bool m_sortDescending = true;
 };

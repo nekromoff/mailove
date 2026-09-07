@@ -358,6 +358,21 @@ bool MailStore::open()
     // 2 signed, 3 both. Set from the raw head at header-store time and refined
     // once the body arrives, exactly like attach.
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN crypto INTEGER DEFAULT 0"));
+    // $Forwarded (RFC 5788 / JMAP $forwarded): the user forwarded this
+    // message, from here or from any other client. No backfill sweep goes with
+    // this column — the fact lives on the server, and every header window the
+    // sync walks re-upserts the rows it covers, so cached mail fills itself in
+    // as those windows come round. Nothing local could reconstruct it anyway:
+    // forwards sent before this column existed left no record here.
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN forwarded INTEGER DEFAULT 0"));
+    // How many attachments the body actually carries, for the marker column's
+    // tooltip: ordinary files and .ics invitations counted apart, because each
+    // has its own glyph and a message can hold both. Written only by the body
+    // pass that refines `attach`, never by a header refresh — the head can say
+    // "there are attachments" and cannot say how many, and 0 here means "not
+    // counted yet", not "none".
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN attach_n INTEGER DEFAULT 0"));
+    q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN ics_n INTEGER DEFAULT 0"));
     // Local spam verdict (see spamheuristics.h). The score is stored rather
     // than the verdict so that moving a threshold re-judges old mail instead of
     // freezing yesterday's opinion into the cache. spam_state says how much was
@@ -578,6 +593,10 @@ QList<MailStore::Migration> MailStore::pendingMigrations(const QString &account)
     if (!migrationDone(m_db, QStringLiteral("raw_refetch_29"))) {
         out.append({QStringLiteral("raw_refetch_29"),
                     tr("Clearing signature checks made against re-assembled mail")});
+    }
+    if (!migrationDone(m_db, QStringLiteral("body_msgid_heal1"))) {
+        out.append({QStringLiteral("body_msgid_heal1"),
+                    tr("Checking cached mail is filed under the right message")});
     }
     // Both FTS steps are pointless without an index to migrate, and their flags
     // must stay unset so they run if FTS5 turns up on a later start.
@@ -805,6 +824,106 @@ void MailStore::runMigration(QSqlDatabase &db, const Migration &step, const QStr
             return;
         }
         markMigrationDone(db, step.flag);
+        return;
+    }
+
+    if (step.flag == QLatin1String("body_msgid_heal1")) {
+        // A stale-row fetch in 3.3 could store a fetched body under the uid of
+        // a *neighbouring* message: new arrivals re-sorted the list while the
+        // fetch was in flight, and the delivery resolved its row again. The
+        // header row is right; the body under it is some other message's, and
+        // opening that row showed the wrong mail — from cache, forever. So:
+        // any cached body whose own Message-ID is not its header row's is
+        // dropped (the backfill re-fetches the real one), and the row's
+        // derived verdicts are cleared the raw_refetch_29 way, because a spam
+        // re-score or DKIM check made against the wrong body is worthless.
+        const qint64 total = countOf(db, QStringLiteral(
+            "SELECT COUNT(*) FROM bodies b JOIN messages m"
+            " ON m.folder = b.folder AND m.uid = b.uid WHERE m.msgid <> ''"));
+        log.rows = total;
+        if (total == 0) {
+            markMigrationDone(db, step.flag);
+            return;
+        }
+        // The message's own Message-ID, folded onto the next line or not.
+        // Only the header block is searched (it ends at the first blank line)
+        // so an attached message/rfc822 can never answer for the message.
+        static const QRegularExpression msgidRe(
+            QStringLiteral("^message-id:[ \\t]*(?:\\r?\\n[ \\t]+)?<([^>\\s]+)>"),
+            QRegularExpression::CaseInsensitiveOption
+                | QRegularExpression::MultilineOption);
+        qint64 cursor = 0;
+        qint64 done = 0;
+        qint64 healed = 0;
+        const bool ok = runInChunks([&] {
+            QSqlQuery scan(db);
+            scan.prepare(QStringLiteral(
+                "SELECT b.rowid, b.folder, b.uid, substr(b.raw, 1, 65536), m.msgid"
+                " FROM bodies b JOIN messages m ON m.folder = b.folder AND m.uid = b.uid"
+                " WHERE m.msgid <> '' AND b.rowid > ? ORDER BY b.rowid LIMIT ?"));
+            scan.addBindValue(cursor);
+            scan.addBindValue(kMigrationChunk);
+            if (!scan.exec())
+                return -1;
+            struct Bad {
+                QString folder;
+                qint64 uid;
+            };
+            QList<Bad> bad;
+            int seen = 0;
+            while (scan.next()) {
+                ++seen;
+                cursor = scan.value(0).toLongLong();
+                const QByteArray head = scan.value(3).toByteArray();
+                int end = head.indexOf("\r\n\r\n");
+                if (end < 0)
+                    end = head.indexOf("\n\n");
+                const QString text =
+                    QString::fromLatin1(end > 0 ? head.left(end) : head);
+                const auto m = msgidRe.match(text);
+                // No Message-ID in the body's own headers is no verdict either
+                // way — headerless stubs are ghost_sweep1's business, not ours.
+                if (!m.hasMatch())
+                    continue;
+                if (m.captured(1) != scan.value(4).toString())
+                    bad.append({scan.value(1).toString(), scan.value(2).toLongLong()});
+            }
+            if (seen == 0)
+                return 0;
+            if (!bad.isEmpty()) {
+                db.transaction();
+                for (const Bad &b : std::as_const(bad)) {
+                    releasePartsOn(db, b.folder, {b.uid});
+                    QSqlQuery del(db);
+                    del.prepare(QStringLiteral(
+                        "DELETE FROM bodies WHERE folder = ? AND uid = ?"));
+                    del.addBindValue(b.folder);
+                    del.addBindValue(b.uid);
+                    del.exec();
+                    QSqlQuery upd(db);
+                    upd.prepare(QStringLiteral(
+                        "UPDATE messages SET dkim = '', dkim_detail = '', dkim_trusted = 0,"
+                        " arc = '', arc_sealer = '', arc_detail = '', spam_score = 0,"
+                        " spam_detail = '',"
+                        " spam_state = CASE WHEN spam_state >= 3 THEN spam_state ELSE 0 END"
+                        " WHERE folder = ? AND uid = ?"));
+                    upd.addBindValue(b.folder);
+                    upd.addBindValue(b.uid);
+                    upd.exec();
+                    qCInfo(logMigrate).noquote()
+                        << "body_msgid_heal1: dropped mis-filed body"
+                        << b.folder.section(QChar(0x1f), -1) << b.uid;
+                }
+                db.commit();
+                healed += bad.size();
+            }
+            return seen;
+        }, total, done, progress, cancelled);
+        if (ok) {
+            qCInfo(logMigrate) << "body_msgid_heal1:" << healed
+                               << "mis-filed cached bodies dropped";
+            markMigrationDone(db, step.flag);
+        }
         return;
     }
 
@@ -1243,6 +1362,9 @@ static QList<MessageListModel::Header> readHeaderRows(QSqlQuery &q)
         h.spamDetail = q.value(12).toString();
         h.remoteId = q.value(13).toString();
         h.to = q.value(14).toString();
+        h.forwarded = q.value(15).toBool();
+        h.attachCount = q.value(16).toInt();
+        h.calendarCount = q.value(17).toInt();
         out.append(h);
     }
     return out;
@@ -1256,7 +1378,8 @@ QList<MessageListModel::Header> MailStore::cachedHeaders(const QString &folder, 
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
                              " color, crypto, spam_score, spam_state, spam_detail,"
-                             " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '')"
+                             " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, ''),"
+                             " forwarded, attach_n, ics_n"
                              " FROM messages WHERE folder = ? AND soft_deleted = 0"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
     q.addBindValue(scoped(folder));
@@ -1275,7 +1398,8 @@ QList<MessageListModel::Header> MailStore::cachedHeadersBefore(const QString &fo
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
                              " color, crypto, spam_score, spam_state, spam_detail,"
-                             " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '')"
+                             " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, ''),"
+                             " forwarded, attach_n, ics_n"
                              " FROM messages WHERE folder = ? AND soft_deleted = 0"
                              " AND (date < ? OR (date = ? AND uid < ?))"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
@@ -1374,7 +1498,8 @@ QList<MessageListModel::Header> MailStore::sortedHeadersOn(QSqlDatabase &db,
     QSqlQuery q(db);
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
                              " color, crypto, spam_score, spam_state, spam_detail,"
-                             " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '')"
+                             " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, ''),"
+                             " forwarded, attach_n, ics_n"
                              " FROM messages WHERE folder = ? AND soft_deleted = 0")
               + where + order + QStringLiteral(" LIMIT ?"));
     q.addBindValue(scopedFolder);
@@ -1403,7 +1528,8 @@ QList<MessageListModel::Header> MailStore::headersByColor(const QString &folder,
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
                              " color, crypto, spam_score, spam_state, spam_detail,"
-                             " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, '')"
+                             " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, ''),"
+                             " forwarded, attach_n, ics_n"
                              " FROM messages WHERE folder = ? AND color = ?"
                              " AND soft_deleted = 0"
                              " ORDER BY date DESC, uid DESC LIMIT ?"));
@@ -1481,8 +1607,8 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
     q.prepare(QStringLiteral(
         "INSERT INTO messages"
         " (folder, uid, subject, sender, date, seen, suspicious, auth, attach, msgid,"
-        " crypto, spam_score, spam_state, spam_detail, remote_id, recipients)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " crypto, spam_score, spam_state, spam_detail, remote_id, recipients, forwarded)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(folder, uid) DO UPDATE SET"
         " subject = excluded.subject, sender = excluded.sender, date = excluded.date,"
         // Never overwrite a known Message-ID with an unknown one: a header
@@ -1499,6 +1625,10 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
         // local change before it has been pushed. Two rules that disagreed
         // about the same thing are now one.
         " seen = excluded.seen,"
+        // Same rule, and for the same reason: $Forwarded is the server's to
+        // state, and a folder with an unreplayed flag op is not synced at all,
+        // so a local mark cannot be clobbered before it has been pushed.
+        " forwarded = excluded.forwarded,"
         // soft_deleted is deliberately absent from the column list above: a
         // merge must not resurrect a row the user has deleted but the server
         // has not been told about yet. Leaving it out of the INSERT defaults it
@@ -1591,6 +1721,7 @@ void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
         q.addBindValue(h.remoteId.isEmpty() ? QVariant(QMetaType(QMetaType::QString))
                                             : h.remoteId);
         q.addBindValue(h.to);
+        q.addBindValue(h.forwarded ? 1 : 0);
         q.exec();
         if (ftsAvailable) {
             ins.addBindValue(h.subject);
@@ -1713,6 +1844,20 @@ void MailStore::setAttachKind(const QString &folder, qint64 uid, int kind)
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("UPDATE messages SET attach = ? WHERE folder = ? AND uid = ?"));
     q.addBindValue(kind);
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    q.exec();
+}
+
+void MailStore::setAttachCounts(const QString &folder, qint64 uid, int files, int calendars)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "UPDATE messages SET attach_n = ?, ics_n = ? WHERE folder = ? AND uid = ?"));
+    q.addBindValue(files);
+    q.addBindValue(calendars);
     q.addBindValue(scoped(folder));
     q.addBindValue(uid);
     q.exec();
@@ -1856,6 +2001,29 @@ void MailStore::setSeen(const QString &folder, qint64 uid)
         return;
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("UPDATE messages SET seen = 1 WHERE folder = ? AND uid = ?"));
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    q.exec();
+}
+
+bool MailStore::isForwarded(const QString &folder, qint64 uid)
+{
+    if (!m_db.isOpen())
+        return false;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT forwarded FROM messages WHERE folder = ? AND uid = ?"));
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    return q.exec() && q.next() && q.value(0).toBool();
+}
+
+void MailStore::setForwarded(const QString &folder, qint64 uid, bool forwarded)
+{
+    if (!m_db.isOpen())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET forwarded = ? WHERE folder = ? AND uid = ?"));
+    q.addBindValue(forwarded ? 1 : 0);
     q.addBindValue(scoped(folder));
     q.addBindValue(uid);
     q.exec();
@@ -3676,6 +3844,9 @@ void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QS
             h.spamState = q.value(10).toInt();
             h.spamDetail = q.value(11).toString();
             h.to = q.value(12).toString();
+            h.forwarded = q.value(13).toBool();
+            h.attachCount = q.value(14).toInt();
+            h.calendarCount = q.value(15).toInt();
             batch.append(h);
             if (batch.size() < kBatch)
                 continue;
@@ -3697,7 +3868,8 @@ void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QS
         // milliseconds (EXPLAIN: LIST SUBQUERY vs SCAN f per row).
         q.prepare(QStringLiteral(
             "SELECT m.uid, m.subject, m.sender, m.date, m.seen, m.suspicious, m.auth, m.attach,"
-            " m.color, m.spam_score, m.spam_state, m.spam_detail, IFNULL(m.recipients, '')"
+            " m.color, m.spam_score, m.spam_state, m.spam_detail, IFNULL(m.recipients, ''),"
+            " m.forwarded, m.attach_n, m.ics_n"
             " FROM messages m"
             " WHERE m.rowid IN (SELECT rowid FROM fts WHERE fts MATCH ?)"
             " AND m.folder = ? AND m.soft_deleted = 0"
@@ -3730,7 +3902,8 @@ void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QS
     QSqlQuery like(db);
     like.prepare(QStringLiteral(
         "SELECT uid, subject, sender, date, seen, suspicious, auth, attach, color,"
-        " spam_score, spam_state, spam_detail, IFNULL(recipients, '') FROM messages"
+        " spam_score, spam_state, spam_detail, IFNULL(recipients, ''), forwarded,"
+        " attach_n, ics_n FROM messages"
         " WHERE folder = ? AND soft_deleted = 0"
         " AND (subject LIKE ? ESCAPE '\\' OR %1 LIKE ? ESCAPE '\\')"
         " ORDER BY date DESC LIMIT 200")

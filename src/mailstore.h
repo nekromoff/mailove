@@ -207,6 +207,18 @@ public:
     /// Marks a cached header as read, so the state survives a restart even
     /// before the next header sync confirms it from the server.
     void setSeen(const QString &folder, qint64 uid);
+    /// Records (or clears) $Forwarded on one cached message. The server is
+    /// told through the journal like every other flag change; this is the
+    /// local half of it.
+    void setForwarded(const QString &folder, qint64 uid, bool forwarded);
+    /// Whether the cached message already carries $Forwarded — what keeps a
+    /// second forward of the same mail from recording an op for a change that
+    /// did not happen.
+    bool isForwarded(const QString &folder, qint64 uid);
+    /// Records how many attachments the body turned out to carry: ordinary
+    /// files and .ics invitations apart. Body-derived like setAttachKind(),
+    /// and written by the same pass.
+    void setAttachCounts(const QString &folder, qint64 uid, int files, int calendars);
     /// Marks every cached row of \a folder read, and returns how many changed.
     /// For reconciling with the server: mail read on another device changes a
     /// folder's unseen count but not its size, and no sync path re-reads old
