@@ -132,10 +132,17 @@ static MessageListModel::Header headerFromBackend(const MailBackend::HeaderInfo 
     h.remoteId = info.remoteId;
     // Already parsed by the backend — never re-parsed here.
     const KMime::Message *msg = info.message.get();
-    if (const auto *subject = msg->subject())
-        h.subject = subject->asUnicodeString();
+    // Through repairedHeaderText(), which answers with KMime's own decoding
+    // for every honest header and re-reads the raw one only where an encoded
+    // word lied about its charset — the "Vr??tenie" case, UTF-8 posted under a
+    // us-ascii label. What is cached is what the list shows, so this is where
+    // it has to happen.
+    if (const auto *subject = msg->subject()) {
+        h.subject = MimeUtils::repairedHeaderText(msg, "Subject",
+                                                  subject->asUnicodeString());
+    }
     if (const auto *from = msg->from())
-        h.from = from->asUnicodeString();
+        h.from = MimeUtils::repairedHeaderText(msg, "From", from->asUnicodeString());
     if (const auto *date = msg->date())
         h.date = date->dateTime();
     if (const auto *mid = msg->messageID(); mid && !mid->isEmpty())
@@ -1766,10 +1773,14 @@ void MailClient::importThunderbird(const QUrl &dir)
                     return true;
                 MessageListModel::Header h;
                 h.uid = ++uid;
-                if (const auto *subject = std::as_const(msg).subject())
-                    h.subject = subject->asUnicodeString();
-                if (const auto *from = std::as_const(msg).from())
-                    h.from = from->asUnicodeString();
+                if (const auto *subject = std::as_const(msg).subject()) {
+                    h.subject = MimeUtils::repairedHeaderText(
+                        &msg, "Subject", subject->asUnicodeString());
+                }
+                if (const auto *from = std::as_const(msg).from()) {
+                    h.from = MimeUtils::repairedHeaderText(&msg, "From",
+                                                           from->asUnicodeString());
+                }
                 if (const auto *date = std::as_const(msg).date())
                     h.date = date->dateTime();
                 if (!h.date.isValid())
@@ -8543,10 +8554,20 @@ void MailClient::presentMessage(const std::shared_ptr<KMime::Message> &message)
     const QString bodyUrl = ctx->m_bodyUrl;
 
     const KMime::Message *cmsg = msg;
-    const QString subject = cmsg->subject() ? cmsg->subject()->asUnicodeString() : QString();
-    const QString from = cmsg->from() ? cmsg->from()->asUnicodeString() : QString();
-    const QString to = cmsg->to() ? cmsg->to()->asUnicodeString() : QString();
-    const QString cc = cmsg->cc() ? cmsg->cc()->asUnicodeString() : QString();
+    // Same repair as the list makes on its rows, so the pane and the row above
+    // it never disagree about the same message.
+    const QString subject = cmsg->subject()
+        ? MimeUtils::repairedHeaderText(cmsg, "Subject", cmsg->subject()->asUnicodeString())
+        : QString();
+    const QString from = cmsg->from()
+        ? MimeUtils::repairedHeaderText(cmsg, "From", cmsg->from()->asUnicodeString())
+        : QString();
+    const QString to = cmsg->to()
+        ? MimeUtils::repairedHeaderText(cmsg, "To", cmsg->to()->asUnicodeString())
+        : QString();
+    const QString cc = cmsg->cc()
+        ? MimeUtils::repairedHeaderText(cmsg, "Cc", cmsg->cc()->asUnicodeString())
+        : QString();
     QString date;
     if (cmsg->date()) {
         const QDateTime local = cmsg->date()->dateTime().toLocalTime();

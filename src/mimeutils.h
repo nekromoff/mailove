@@ -77,6 +77,22 @@ void repairTransferEncodings(KMime::Content *node);
 /// the head text on demand.
 void parseIfNeeded(KMime::Content *node);
 
+/// The text of \a field as it should read, for a message whose encoded word
+/// lies about its charset: "=?us-ascii?Q?Vr=C3=A1tenie?=" carries UTF-8 under
+/// a label that cannot hold it, and KMime — obeying the label, as it must —
+/// hands back a replacement character per byte ("Vr??tenie"). The raw head is
+/// re-read, the lying label corrected to the encoding the bytes actually are,
+/// and the word decoded again. \a decoded is returned untouched whenever
+/// nothing in the header lies, which is every ordinary message.
+///
+/// Display only. Nothing is written back to the message: the head text is what
+/// the DKIM verdict is computed over and what the cache stores, and a client
+/// that rewrote it would be answering for bytes it changed. The scorer reads
+/// the raw fields itself for the same reason — the false charset is evidence
+/// there, not a defect to be tidied away.
+QString repairedHeaderText(const KMime::Message *msg, QByteArrayView field,
+                           const QString &decoded);
+
 /// The first text/plain and text/html parts, decoded. Used by the spam scorer
 /// and by tests/spamtool, which must see the same two strings or the tool stops
 /// measuring what the client does.

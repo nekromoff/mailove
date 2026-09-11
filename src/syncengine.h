@@ -225,10 +225,15 @@ private:
                                    bool cacheDropped);
     void fetchNewerThanCache(qint64 maxCachedUid, int cachedCount);
     void fetchOlderFromServer();
+    /// \a arrivals marks the one window that lists new mail rather than
+    /// history: the top-up a push or a poll asks for on the open folder. Rows
+    /// in it that the cache has never seen go through the arrival filter, the
+    /// same as the delta fetches — this is how new mail in the folder the user
+    /// is *looking at* reaches the spam auto-move, which nothing else covers.
     void requestHeaderWindow(const QString &folder, qint64 fromNewest, int count,
-                             bool append, bool background);
+                             bool append, bool background, bool arrivals = false);
     void applyFetchedHeaders(const QString &folder, qint64 reachedFromNewest,
-                             bool append, bool background);
+                             bool append, bool background, bool arrivals = false);
     /// Idle-time body caching: queues \a folder's next few headers that have
     /// no cached body yet. Runs only after the header backfill has finished,
     /// so a fresh account always shows the full list first. Returns false when

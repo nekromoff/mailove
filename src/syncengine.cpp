@@ -556,7 +556,8 @@ void SyncEngine::applyFolderOpened(const QString &folder, qint64 messageCount,
             return;
         m_folderMessageCount = messageCount;
         // Newest few headers; appendHeaders() dedupes and updates in place.
-        requestHeaderWindow(folder, 0, 20, /*append=*/true, /*background=*/false);
+        requestHeaderWindow(folder, 0, 20, /*append=*/true, /*background=*/false,
+                            /*arrivals=*/true);
         return;
     }
 
@@ -748,7 +749,7 @@ void SyncEngine::fetchOlderFromServer()
 }
 
 void SyncEngine::requestHeaderWindow(const QString &folder, qint64 fromNewest, int count,
-                                     bool append, bool background)
+                                     bool append, bool background, bool arrivals)
 {
     m_headerFetch = true;
     if (background && folder != m_selectedFolder) {
@@ -769,8 +770,8 @@ void SyncEngine::requestHeaderWindow(const QString &folder, qint64 fromNewest, i
     }
     m_backend->fetchHeaderWindow(
         folder, int(fromNewest), count, background,
-        [this, folder, fromNewest, count, append, background](MailBackend::Error error,
-                                                              const QString &message) {
+        [this, folder, fromNewest, count, append, background, arrivals](
+            MailBackend::Error error, const QString &message) {
             m_headerFetch = false;
             if (background)
                 m_backfill = false;
@@ -796,14 +797,45 @@ void SyncEngine::requestHeaderWindow(const QString &folder, qint64 fromNewest, i
             qint64 reached = fromNewest + count;
             if (total > 0)
                 reached = qMin(reached, total);
-            applyFetchedHeaders(folder, reached, append, background);
+            applyFetchedHeaders(folder, reached, append, background, arrivals);
         });
 }
 
 void SyncEngine::applyFetchedHeaders(const QString &folder, qint64 reachedFromNewest,
-                                     bool append, bool background)
+                                     bool append, bool background, bool arrivals)
 {
-    const QList<MessageListModel::Header> headers = m_pendingHeaders.take(folder);
+    QList<MessageListModel::Header> headers = m_pendingHeaders.take(folder);
+    if (arrivals && m_arrivalFilter && !headers.isEmpty()) {
+        // New arrivals — the same moment the delta paths hand to the filter
+        // (see setArrivalFilter). This window is a *top-up*, so most of it is
+        // mail the user has already lived with: only rows above the cache's
+        // high-water mark are arrivals, and only those may be filed. Read
+        // before storeHeaders() below, which is what moves that mark.
+        const qint64 known = m_store.maxCachedUid(folder);
+        QList<MessageListModel::Header> fresh;
+        for (const MessageListModel::Header &h : std::as_const(headers)) {
+            if (h.uid > known)
+                fresh.append(h);
+        }
+        if (!fresh.isEmpty()) {
+            const int before = fresh.size();
+            m_arrivalFilter(folder, fresh);
+            if (fresh.size() != before) {
+                // Rows the filter took are filed elsewhere now: they must not
+                // be stored here, nor reach the visible list below.
+                QSet<qint64> kept;
+                for (const MessageListModel::Header &h : std::as_const(fresh))
+                    kept.insert(h.uid);
+                QList<MessageListModel::Header> survivors;
+                survivors.reserve(headers.size());
+                for (const MessageListModel::Header &h : std::as_const(headers)) {
+                    if (h.uid <= known || kept.contains(h.uid))
+                        survivors.append(h);
+                }
+                headers = survivors;
+            }
+        }
+    }
     m_store.storeHeaders(folder, headers);
     invalidateMissingBodies();
     Q_EMIT unreadRecountNeeded(); // freshly synced headers change the pills

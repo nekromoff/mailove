@@ -492,6 +492,69 @@ int main(int argc, char **argv)
               "each leaf is judged on its own body");
     }
 
+    // Encoded words that lie about their charset — the header half of the
+    // same fault repairTransferEncodings() answers in the body.
+    {
+        auto lying = std::make_shared<KMime::Message>();
+        lying->setContent(KMime::CRLFtoLF(QByteArrayLiteral(
+            "From: =?us-ascii?Q?Da=C5=88ov=C3=BD_=C3=BArad?= <tax@office.test>\r\n"
+            "Subject: =?us-ascii?Q?Vr=C3=A1tenie_preplatku?=\r\n"
+            "\r\n"
+            "body\r\n")));
+        lying->parse();
+        const QString kmimeSubject = lying->subject()->asUnicodeString();
+        check(kmimeSubject.contains(QChar::ReplacementCharacter),
+              "us-ascii label over UTF-8 is what KMime cannot decode");
+        check(MimeUtils::repairedHeaderText(lying.get(), "Subject", kmimeSubject)
+                  == QString::fromUtf8("Vrátenie preplatku"),
+              "the subject is read as the UTF-8 it actually is");
+        check(MimeUtils::repairedHeaderText(lying.get(), "From",
+                                            lying->from()->asUnicodeString())
+                  .contains(QString::fromUtf8("Daňový úrad")),
+              "and so is the display name");
+
+        // An honest header is handed back untouched, whatever it is encoded in.
+        auto honest = std::make_shared<KMime::Message>();
+        honest->setContent(KMime::CRLFtoLF(QByteArrayLiteral(
+            "From: a@b.test\r\n"
+            "Subject: =?iso-8859-2?Q?Vr=E1tenie_preplatku?=\r\n"
+            "\r\n"
+            "body\r\n")));
+        honest->parse();
+        const QString latin2 = honest->subject()->asUnicodeString();
+        check(latin2 == QString::fromUtf8("Vrátenie preplatku"),
+              "a truthful legacy charset decodes on its own");
+        check(MimeUtils::repairedHeaderText(honest.get(), "Subject", latin2) == latin2,
+              "and is returned unchanged — the repair never second-guesses it");
+
+        // Base64 in the same shape, folded across two lines, and a plain ASCII
+        // word whose label is beside the point.
+        auto folded = std::make_shared<KMime::Message>();
+        folded->setContent(KMime::CRLFtoLF(QByteArrayLiteral(
+            "From: a@b.test\r\n"
+            "Subject: =?us-ascii?B?VnLDoXRlbmll?=\r\n"
+            " =?us-ascii?B?IHByZXBsYXRrdQ==?=\r\n"
+            "\r\n"
+            "body\r\n")));
+        folded->parse();
+        check(MimeUtils::repairedHeaderText(folded.get(), "Subject",
+                                            folded->subject()->asUnicodeString())
+                  == QString::fromUtf8("Vrátenie preplatku"),
+              "base64, and folded across two lines");
+
+        auto ascii = std::make_shared<KMime::Message>();
+        ascii->setContent(KMime::CRLFtoLF(QByteArrayLiteral(
+            "From: a@b.test\r\n"
+            "Subject: =?us-ascii?Q?Refund_notice?=\r\n"
+            "\r\n"
+            "body\r\n")));
+        ascii->parse();
+        check(MimeUtils::repairedHeaderText(ascii.get(), "Subject",
+                                            ascii->subject()->asUnicodeString())
+                  == QStringLiteral("Refund notice"),
+              "an ASCII payload is nobody's evidence of a wrong label");
+    }
+
     out << (failures == 0 ? "all mime utils tests passed\n"
                           : QStringLiteral("%1 check(s) failed\n").arg(failures));
     out.flush();

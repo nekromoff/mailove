@@ -7,6 +7,7 @@
 
 #include <QHash>
 #include <QRegularExpression>
+#include <QStringDecoder>
 #include <QTextBlock>
 #include <QTextCursor>
 #include <QTextDocument>
@@ -15,6 +16,7 @@
 #include <QUuid>
 
 #include <kmime/content.h>
+#include <kmime/headers.h>
 #include <kmime/message.h>
 #include <kmime/util.h>
 
@@ -160,6 +162,151 @@ void repairTransferEncodings(KMime::Content *node)
     // consumer parses an already-parsed message.
     cte->setEncoding(KMime::Headers::CEbinary);
     node->setBody(body);
+}
+
+/// The raw, unfolded value of \a field from a message's own head text — the
+/// bytes as they arrived, before KMime read a charset off them. Empty when the
+/// head does not carry the field.
+static QByteArray rawHeaderValue(const QByteArray &head, QByteArrayView field)
+{
+    int pos = 0;
+    while (pos < head.size()) {
+        int end = head.indexOf('\n', pos);
+        if (end < 0)
+            end = head.size();
+        const QByteArrayView line = QByteArrayView(head).sliced(pos, end - pos);
+        // "Subject:" at the start of a line, case-insensitively — a folded
+        // continuation begins with whitespace and can never match.
+        if (line.size() > field.size()
+            && QByteArrayView(line).first(field.size()).compare(field, Qt::CaseInsensitive) == 0
+            && line.at(field.size()) == ':') {
+            QByteArray value = line.sliced(field.size() + 1).toByteArray();
+            // Unfold: a continuation line is joined with the space that folded
+            // it, which is what keeps an encoded word split across two lines
+            // readable as one.
+            int next = end + 1;
+            while (next < head.size() && (head.at(next) == ' ' || head.at(next) == '\t')) {
+                int lineEnd = head.indexOf('\n', next);
+                if (lineEnd < 0)
+                    lineEnd = head.size();
+                value += QByteArrayView(head).sliced(next, lineEnd - next).toByteArray();
+                next = lineEnd + 1;
+            }
+            return value.trimmed();
+        }
+        pos = end + 1;
+    }
+    return {};
+}
+
+/// The bytes an encoded word carries, whichever of the two encodings it used.
+static QByteArray encodedWordPayload(QChar encoding, const QByteArray &text)
+{
+    if (encoding == QLatin1Char('B') || encoding == QLatin1Char('b'))
+        return QByteArray::fromBase64(text);
+    // Q: "_" is a space, "=XX" is a byte, everything else stands for itself.
+    QByteArray out;
+    out.reserve(text.size());
+    for (int i = 0; i < text.size(); ++i) {
+        const char c = text.at(i);
+        if (c == '_') {
+            out += ' ';
+        } else if (c == '=' && i + 2 < text.size()) {
+            bool ok = false;
+            const int byte = text.mid(i + 1, 2).toInt(&ok, 16);
+            if (!ok)
+                return {};
+            out += char(byte);
+            i += 2;
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+/// Whether \a bytes are UTF-8 and say something a label of \a charset could
+/// not: at least one multi-byte sequence. Pure ASCII is left alone — every
+/// charset agrees about it, so there is nothing to correct and no evidence
+/// that anything is wrong.
+static bool looksLikeUtf8(const QByteArray &bytes)
+{
+    bool highBytes = false;
+    for (const char c : bytes) {
+        if (uchar(c) >= 0x80) {
+            highBytes = true;
+            break;
+        }
+    }
+    if (!highBytes)
+        return false;
+    QStringDecoder decoder(QStringDecoder::Utf8, QStringDecoder::Flag::Stateless);
+    const QString text = decoder(bytes);
+    return !decoder.hasError() && !text.contains(QChar::ReplacementCharacter);
+}
+
+/// Rewrites the charset of every encoded word in \a value that lies about what
+/// it carries. Returns an empty array when none does — the ordinary case,
+/// which the caller answers without re-decoding anything.
+static QByteArray repairEncodedWordCharsets(const QByteArray &value)
+{
+    // charset (with an optional *language suffix), encoding, payload.
+    static const QRegularExpression wordRe(
+        QStringLiteral("=\\?([^?\\s]+)\\?([QqBb])\\?([^?]*)\\?="));
+    QString text = QString::fromLatin1(value); // ASCII by construction
+    bool changed = false;
+    QString out;
+    int last = 0;
+    auto it = wordRe.globalMatch(text);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch m = it.next();
+        const QString label = m.captured(1);
+        const QString charset = label.section(QLatin1Char('*'), 0, 0).toLower();
+        // A word that already says UTF-8 has nothing to correct, and one whose
+        // charset KMime does not know already falls back to UTF-8 on its own.
+        if (charset == QLatin1String("utf-8") || charset == QLatin1String("utf8"))
+            continue;
+        if (!QStringDecoder(charset.toLatin1().constData()).isValid())
+            continue;
+        const QByteArray payload =
+            encodedWordPayload(m.captured(2).at(0), m.captured(3).toLatin1());
+        if (payload.isEmpty() || !looksLikeUtf8(payload))
+            continue;
+        // The bytes are UTF-8 and the label says otherwise. Decoded under the
+        // label they are either mojibake or replacement characters; decoded as
+        // what they are, they are the words the sender wrote.
+        const QString lang = label.contains(QLatin1Char('*'))
+            ? QLatin1Char('*') + label.section(QLatin1Char('*'), 1)
+            : QString();
+        out += text.sliced(last, m.capturedStart(1) - last);
+        out += QStringLiteral("utf-8") + lang;
+        last = m.capturedEnd(1);
+        changed = true;
+    }
+    if (!changed)
+        return {};
+    out += text.sliced(last);
+    return out.toLatin1();
+}
+
+QString repairedHeaderText(const KMime::Message *msg, QByteArrayView field,
+                           const QString &decoded)
+{
+    if (!msg)
+        return decoded;
+    const QByteArray raw = rawHeaderValue(msg->head(), field);
+    if (raw.isEmpty())
+        return decoded;
+    const QByteArray repaired = repairEncodedWordCharsets(raw);
+    if (repaired.isEmpty())
+        return decoded;
+    // Decoded by KMime again rather than by hand: the whitespace rules between
+    // adjacent encoded words are its business, and this way a repaired header
+    // reads exactly as an honestly labelled one would.
+    KMime::Headers::Generics::Unstructured header;
+    header.from7BitString(repaired);
+    const QString text = header.asUnicodeString();
+    return text.isEmpty() ? decoded : text;
 }
 
 void parseIfNeeded(KMime::Content *node)
