@@ -2591,17 +2591,24 @@ void MailStore::finishBodyIndexBatch(
 
 void MailStore::removeMessages(const QString &folder, const QList<qint64> &uids)
 {
+    removeMessagesIn(m_accountKey, folder, uids);
+}
+
+void MailStore::removeMessagesIn(const QString &account, const QString &folder,
+                                 const QList<qint64> &uids)
+{
     if (!m_db.isOpen() || uids.isEmpty())
         return;
     SlowGuard guard("removeMessages");
+    const QString key = scopedIn(account, folder);
     m_db.transaction();
     // Give back the attachment references first: once the part rows are gone
     // the payloads on disk would have no way of ever being freed.
-    releaseParts(scoped(folder), uids);
+    releaseParts(key, uids);
     // Same shape of bookkeeping for the compose autocompletion: an address is
     // only forgotten once no Sent message holds it any more. A no-op for every
     // folder but Sent, which is the only one with refs.
-    dropSentRecipients(folder, uids);
+    dropSentRecipientsScoped(key, uids);
     // fts first (rowid-keyed via messages, which must still exist), then the
     // regular tables.
     if (m_ftsAvailable) {
@@ -2610,7 +2617,7 @@ void MailStore::removeMessages(const QString &folder, const QList<qint64> &uids)
             "DELETE FROM fts WHERE rowid ="
             " (SELECT rowid FROM messages WHERE folder = ? AND uid = ?)"));
         for (qint64 uid : uids) {
-            q.addBindValue(scoped(folder));
+            q.addBindValue(key);
             q.addBindValue(uid);
             q.exec();
         }
@@ -2620,7 +2627,7 @@ void MailStore::removeMessages(const QString &folder, const QList<qint64> &uids)
         q.prepare(QStringLiteral("DELETE FROM %1 WHERE folder = ? AND uid = ?")
                       .arg(QLatin1String(table)));
         for (qint64 uid : uids) {
-            q.addBindValue(scoped(folder));
+            q.addBindValue(key);
             q.addBindValue(uid);
             q.exec();
         }
@@ -3332,6 +3339,12 @@ void MailStore::addSentRecipient(const QString &folder, qint64 uid, const QStrin
 
 void MailStore::dropSentRecipients(const QString &folder, const QList<qint64> &uids)
 {
+    dropSentRecipientsScoped(scoped(folder), uids);
+}
+
+void MailStore::dropSentRecipientsScoped(const QString &scopedFolder,
+                                        const QList<qint64> &uids)
+{
     if (!m_db.isOpen() || uids.isEmpty())
         return;
     QStringList uidList;
@@ -3340,7 +3353,7 @@ void MailStore::dropSentRecipients(const QString &folder, const QList<qint64> &u
         uidList << QString::number(u);
     dropRecipientRefs(QStringLiteral("folder = ? AND uid IN (%1)").arg(uidList.join(
                           QLatin1Char(','))),
-                      scoped(folder));
+                      scopedFolder);
 }
 
 void MailStore::forgetRecipientRefs(const QString &folder)
@@ -4616,6 +4629,12 @@ void setSoftDeleted(QSqlDatabase &db, const QString &scopedFolder, const QList<q
 void MailStore::softDeleteMessages(const QString &folder, const QList<qint64> &uids)
 {
     setSoftDeleted(m_db, scoped(folder), uids, true);
+}
+
+void MailStore::softDeleteMessagesIn(const QString &account, const QString &folder,
+                                     const QList<qint64> &uids)
+{
+    setSoftDeleted(m_db, scopedIn(account, folder), uids, true);
 }
 
 void MailStore::restoreSoftDeleted(const QString &folder, const QList<qint64> &uids)

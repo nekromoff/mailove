@@ -811,11 +811,19 @@ void SyncEngine::applyFetchedHeaders(const QString &folder, qint64 reachedFromNe
         // mail the user has already lived with: only rows above the cache's
         // high-water mark are arrivals, and only those may be filed. Read
         // before storeHeaders() below, which is what moves that mark.
+        //
+        // No mark at all (the open never cached anything — a fetch that
+        // failed, a cache voided under us) makes this window the folder's
+        // first listing, and a first listing is never filed: every row would
+        // read as an arrival, and the rule everywhere else is that mail the
+        // user has lived with keeps its badge and stays put.
         const qint64 known = m_store.maxCachedUid(folder);
         QList<MessageListModel::Header> fresh;
-        for (const MessageListModel::Header &h : std::as_const(headers)) {
-            if (h.uid > known)
-                fresh.append(h);
+        if (known > 0) {
+            for (const MessageListModel::Header &h : std::as_const(headers)) {
+                if (h.uid > known)
+                    fresh.append(h);
+            }
         }
         if (!fresh.isEmpty()) {
             const int before = fresh.size();

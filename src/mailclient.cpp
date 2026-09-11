@@ -4820,6 +4820,21 @@ QString MailClient::junkFolderName() const
     return {};
 }
 
+QString MailClient::junkFolderNameIn(const QString &account)
+{
+    if (account == accountKey())
+        return junkFolderName();
+    // The cache keeps only the names of another account's folders, not the
+    // roles its server declared — so this is the name test on its own, the
+    // same one the junk_hash1 backfill applies for the same reason.
+    const QStringList boxes = m_store.cachedFolders(account);
+    for (const QString &mailBox : boxes) {
+        if (SpamHeuristics::folderNameLooksJunk(mailBox))
+            return mailBox;
+    }
+    return {};
+}
+
 bool MailClient::isTrashFolder() const
 {
     return !m_selectedFolder.isEmpty() && m_selectedFolder == trashFolderName();
@@ -4999,14 +5014,28 @@ void MailClient::markAsJunk(const QVariantList &rows)
 void MailClient::autoFileSpamArrivals(const QString &folder,
                                       QList<MessageListModel::Header> &rows)
 {
-    if (rows.isEmpty() || !AdvancedConfig::b("spam/autoMove"))
-        return;
-    if (!scoresSpamIn(folder) || isJunkFolderKey(folder))
-        return;
-    const QString junk = junkFolderName();
-    if (junk.isEmpty())
-        return;
+    autoFileSpamArrivalsIn(accountKey(), folder, rows);
+}
+
+MailStore::JournalOp MailClient::autoFileSpamArrivalsIn(const QString &account,
+                                                        const QString &folder,
+                                                        QList<MessageListModel::Header> &rows)
+{
     MailStore::JournalOp op;
+    if (rows.isEmpty() || !AdvancedConfig::b("spam/autoMove"))
+        return op;
+    const bool open = account == accountKey();
+    // The same folder test scoresSpamIn() makes, against the account the
+    // rows belong to: the open account's `local` flag says nothing about a
+    // background one, and its \Junk mailbox is not the other account's.
+    const QString path = folder.section(QChar(0x1f), -1);
+    if (isLocalAccountKey(account))
+        return op;
+    if (path.compare(QLatin1String("INBOX"), Qt::CaseInsensitive) != 0)
+        return op;
+    const QString junk = junkFolderNameIn(account);
+    if (junk.isEmpty())
+        return op;
     QList<MessageListModel::Header> kept;
     QList<MessageListModel::Header> spam;
     kept.reserve(rows.size());
@@ -5021,31 +5050,84 @@ void MailClient::autoFileSpamArrivals(const QString &folder,
                                                      : h.remoteId);
         } else {
             kept.append(h);
-            if (h.spamState < MessageListModel::SpamExempt)
+            // The watch is keyed by the unscoped folder name and consumed by
+            // the body prefetch, which only ever runs for the open account —
+            // so only its rows go in. Another account's uids under the same
+            // "INBOX" key would collide with the open inbox's, and file the
+            // wrong message when its body came in.
+            if (open && h.spamState < MessageListModel::SpamExempt)
                 m_spamWatchArrivals[folder].insert(h.uid);
         }
     }
     if (spam.isEmpty())
-        return;
+        return op;
     // Stored before being hidden: the soft-deleted row is what a rollback
     // restores from if the server refuses the move.
-    m_store.storeHeaders(folder, spam);
-    m_store.softDeleteMessages(folder, op.uids);
+    m_store.storeHeadersIn(account, folder, spam);
+    m_store.softDeleteMessagesIn(account, folder, op.uids);
     op.op = QStringLiteral("move");
     op.folder = folder;
     op.target = junk;
+    op.account = account;
     for (const MessageListModel::Header &h : std::as_const(spam)) {
         qCInfo(logSpam).noquote()
-            << QStringLiteral("auto %1 uid=%2 from=%3: %4 >= %5 -> moved to %6")
-                   .arg(folder.section(QChar(0x1f), -1), QString::number(h.uid),
+            << QStringLiteral("auto %1 uid=%2 from=%3: %4 >= %5 -> moved to %6%7")
+                   .arg(path, QString::number(h.uid),
                         SpamHeuristics::addressOf(h.from),
                         QString::number(h.spamScore),
-                        QString::number(SpamHeuristics::spamThreshold()), junk);
+                        QString::number(SpamHeuristics::spamThreshold()), junk,
+                        open ? QString() : QStringLiteral(" (account %1)").arg(account));
     }
-    journalAppend(op);
-    scheduleUnreadRecount();
-    setStatus(tr("%n moved to spam", "", spam.size()));
     rows = kept;
+    if (open) {
+        journalAppend(op);
+        scheduleUnreadRecount();
+        setStatus(tr("%n moved to spam", "", spam.size()));
+        return op;
+    }
+    // Another account's journal is only drained when that account is the
+    // open one, so the op is recorded under its key — the change survives a
+    // crash and is replayed on the next connect either way — and handed back
+    // for the poll to send now on the connection it already holds.
+    op.id = m_store.appendJournalOp(op);
+    if (op.id == 0) {
+        qCWarning(logSpam) << "auto" << path << "for" << account
+                           << ": the move could not be journalled; the rows stay hidden"
+                              " until the next reconcile puts them back";
+    }
+    return op;
+}
+
+void MailClient::settleBackgroundSpamMove(const QString &account,
+                                          const MailStore::JournalOp &op,
+                                          MailBackend::Error error, const QString &message)
+{
+    // Success is the only reply acted on. Everything else — a refused move,
+    // a missing mailbox, a dropped connection — is left to the account's own
+    // drain when it is next opened, which has the retries, the rollback and
+    // the failed-ops list; duplicating those here for a poll nobody is
+    // watching would be a second journal.
+    if (error != MailBackend::Error::None) {
+        qCInfo(logSpam) << "auto" << op.folder << "for" << account
+                        << ": move deferred to the account's next connect —" << message;
+        return;
+    }
+    // The same finish confirmJournalOp() gives the open account's moves: the
+    // provisional rows go for good, and the op with them.
+    m_store.removeMessagesIn(account, op.folder, op.uids);
+    if (op.id != 0)
+        m_store.dropJournalOp(op.id);
+    qCInfo(logSpam) << "auto" << op.folder << "for" << account << ":" << op.uids.size()
+                    << "moved to" << op.target << "on the poll connection";
+    ++m_cachedFolderRevision;
+    Q_EMIT cachedFoldersChanged();
+    // The poll counted this account's unread before the move, and that number
+    // is pinned as the sidebar's until the next tick — which would promise
+    // the very message that just left. The cache was reconciled with the
+    // server moments ago on the same pass, so it is the better source now,
+    // exactly as reconcileUnseenIn() decides after a correction of its own.
+    m_serverCountedAccounts.remove(account);
+    scheduleUnreadRecount();
 }
 
 void MailClient::autoFileSpamMessage(const QString &folder, qint64 uid)
@@ -5855,27 +5937,61 @@ void MailClient::syncBackgroundFolders(MailBackend *backend, const QString &key,
         });
         const qint64 maxUid = m_store.maxCachedUidIn(key, folder);
         const int cached = m_store.cachedHeaderCountIn(key, folder);
-        const auto stored = [this, key, folder, rows, gen, myGen,
-                             next](MailBackend::Error error, const QString &) {
+        // Only the delta below is "new arrivals". The first page of a folder
+        // never synced is mail the user has lived with, and the same rule
+        // that keeps the open account's first listing from mass-moving an
+        // inbox applies here (see autoFileSpamArrivals).
+        const bool delta = cached > 0 && maxUid > 0;
+        const auto stored = [this, backend, key, folder, rows, gen, myGen, weakNext, next,
+                             delta](MailBackend::Error error, const QString &) {
             // A fetch that outlived its deadline: the pass moved on, and rows
             // is already collecting the next folder's headers — storing it
             // under this folder's name would file mail in the wrong place.
             if (*gen != myGen)
                 return;
             if (error == MailBackend::Error::None && !rows->isEmpty()) {
-                m_store.storeHeadersIn(key, folder, *rows);
+                // Spam among the arrivals is filed here, the one place a
+                // background account's new mail passes through: the sync
+                // engine's delta paths, where the open account's is filed,
+                // never see these rows. Left to them, the message was scored
+                // and stored as already known, so no later listing of the
+                // account treated it as an arrival — it simply stayed put.
+                MailStore::JournalOp filed;
+                if (delta)
+                    filed = autoFileSpamArrivalsIn(key, folder, *rows);
+                if (!rows->isEmpty())
+                    m_store.storeHeadersIn(key, folder, *rows);
                 // Per folder rather than once at the end, so the inbox's new
                 // mail reaches the sidebar before the rest of the pass runs.
                 // The sidebar re-reads the cached tree on this; the message
                 // list of an account that is not open has nothing to update.
                 ++m_cachedFolderRevision;
                 Q_EMIT cachedFoldersChanged();
+                if (!filed.remoteIds.isEmpty()) {
+                    // Sent on this poll's own connection, before the pass moves
+                    // on: the account's journal is otherwise only replayed
+                    // when it is opened, which could be days. The step's fetch
+                    // deadline is still armed and covers this round trip too;
+                    // a reply that outlives it still settles the cache (that
+                    // is store-only work) but no longer advances the pass.
+                    backend->moveMessages(
+                        folder, filed.remoteIds, filed.target,
+                        [this, key, filed, gen, myGen, weakNext](MailBackend::Error error,
+                                                                 const QString &message) {
+                            settleBackgroundSpamMove(key, filed, error, message);
+                            if (*gen != myGen)
+                                return;
+                            if (const auto next = weakNext.lock())
+                                (*next)();
+                        });
+                    return;
+                }
             }
             // A folder the server refused is one folder's loss, not the pass's:
             // carry on rather than leaving everything behind it unsynced.
             (*next)();
         };
-        if (cached > 0 && maxUid > 0) {
+        if (delta) {
             // Only what arrived since — the whole point of polling cheaply.
             // A folder that has not changed costs one open and an empty answer.
             backend->fetchHeadersSince(folder, QString::number(maxUid), stored);

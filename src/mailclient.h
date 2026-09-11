@@ -1167,6 +1167,16 @@ private:
     /// crosses the threshold can finish the job (see autoFileSpamMessage).
     void autoFileSpamArrivals(const QString &folder,
                               QList<MessageListModel::Header> &rows);
+    /// The same filter for \a account's rows, which may be an account that
+    /// is not open (the background poll's delta). Returns the journalled move
+    /// — id 0 when nothing was filed — so the caller can send it on whatever
+    /// connection it has; the open account's is drained the usual way.
+    MailStore::JournalOp autoFileSpamArrivalsIn(const QString &account,
+                                                const QString &folder,
+                                                QList<MessageListModel::Header> &rows);
+    /// The reply to a move the background poll sent itself for \a op.
+    void settleBackgroundSpamMove(const QString &account, const MailStore::JournalOp &op,
+                                  MailBackend::Error error, const QString &message);
     /// The body-stage half of the auto-move: files one watched new arrival
     /// whose re-score crossed the threshold.
     void autoFileSpamMessage(const QString &folder, qint64 uid);
@@ -1239,6 +1249,10 @@ private:
     QString signatureBlock() const;
     QString trashFolderName() const;
     QString junkFolderName() const;
+    /// junkFolderName() for \a account. The open one answers from the live
+    /// listing (which knows the server's \Junk); any other from its cached
+    /// folder names alone, so only the name heuristic applies there.
+    QString junkFolderNameIn(const QString &account);
     /// Junk/spam folders get hostile-content handling in the viewer.
     bool isJunkFolder(const QString &mailBox) const;
     /// Whether the folder on screen is the junk one — isJunkFolderKey(), the

@@ -155,6 +155,12 @@ public:
                         const QList<MessageListModel::Header> &headers);
     QString syncStateIn(const QString &account, const QString &folder);
     void setSyncStateIn(const QString &account, const QString &folder, const QString &state);
+    /// softDeleteMessages() / removeMessages() for another account's rows —
+    /// the local halves of a spam move the poll files on its own connection.
+    void softDeleteMessagesIn(const QString &account, const QString &folder,
+                              const QList<qint64> &uids);
+    void removeMessagesIn(const QString &account, const QString &folder,
+                          const QList<qint64> &uids);
 
     void removeMessages(const QString &folder, const QList<qint64> &uids);
     /// Refined attachment kind (MessageListModel::AttachKind) learned from the
@@ -863,6 +869,9 @@ private:
     /// Shared body of both dropSentRecipients() overloads: \a where is a
     /// recipient_refs predicate whose single bind is \a scopedFolder.
     void dropRecipientRefs(const QString &where, const QString &scopedFolder);
+    /// dropSentRecipients() on an already-scoped key, so removeMessagesIn()
+    /// can clean up another account's Sent refs without touching the scope.
+    void dropSentRecipientsScoped(const QString &scopedFolder, const QList<qint64> &uids);
 
     QSqlDatabase m_db;
     QString m_accountKey;

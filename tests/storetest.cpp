@@ -326,6 +326,31 @@ int main(int argc, char **argv)
     check(store.syncState(folder) != QLatin1String("state-42"),
           QStringLiteral("and does not overwrite the open account's"));
 
+    // The local halves of a spam move the poll files for that account: hide
+    // first (a rollback restores from the hidden row), remove once the server
+    // agrees. Both must land under the other account's key — the open one
+    // has its own rows under the same folder name.
+    store.storeHeaders(folder, {makeHeader(9001, QStringLiteral("mine"),
+                                           QStringLiteral("9001"))});
+    const int mineBefore = store.cachedHeaderCount(folder);
+    store.softDeleteMessagesIn(other, otherInbox, {9001});
+    check(store.cachedHeaderCountIn(other, otherInbox) == 0,
+          QStringLiteral("hiding another account's row takes it out of its count"));
+    check(store.maxCachedUidIn(other, otherInbox) == 9001,
+          QStringLiteral("…but a hidden row still holds the resume point"));
+    check(store.cachedHeaderCount(folder) == mineBefore,
+          QStringLiteral("the open account's row of the same uid is untouched"));
+    check(store.softDeletedIn(other).value(otherInbox) == QList<qint64>{9001},
+          QStringLiteral("the hidden row is listed under the other account"));
+    store.removeMessagesIn(other, otherInbox, {9001});
+    check(store.maxCachedUidIn(other, otherInbox) == 0,
+          QStringLiteral("removing another account's row is final"));
+    check(store.softDeletedIn(other).isEmpty(),
+          QStringLiteral("…and leaves nothing hidden behind"));
+    check(store.cachedHeaderCount(folder) == mineBefore,
+          QStringLiteral("removing it does not reach the open account's row"));
+    store.removeMessages(folder, {9001});
+
     // --- the To column ----------------------------------------------------
     //
     // In Sent and Drafts every message is from the user, so the list shows the
