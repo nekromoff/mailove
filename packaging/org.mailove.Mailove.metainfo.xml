@@ -33,6 +33,23 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.6" date="2026-09-12" type="stable">
+      <description>
+        <ul>
+          <li>Spam arriving on an account that is not the open one is now
+              moved to that account's spam folder; the background poll
+              used to score it and leave it in the inbox.</li>
+          <li>Spam pushed into the open folder by IDLE or JMAP push is
+              filed too.</li>
+          <li>Subjects and senders whose encoded words lie about their
+              charset are read back correctly instead of showing
+              replacement characters.</li>
+          <li>An RPM package is built alongside the .deb.</li>
+          <li>The AppImage bundles the Qt Wayland platform plugin and
+              falls back to X11 when Wayland cannot load.</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.5" date="2026-09-07" type="stable">
       <description>
         <ul>

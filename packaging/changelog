@@ -1,3 +1,24 @@
+mailove (3.6) unstable; urgency=medium
+
+  * Spam arriving on an account that is not the open one is now moved to
+    that account's spam folder. The background poll scored it, logged
+    "marked as spam", and left it in the inbox - the auto-move only ran
+    on the open account's sync paths. The move goes out on the poll's own
+    connection, or is replayed when the account is next opened.
+  * Spam pushed into the open folder by IDLE/JMAP push is filed too; that
+    refresh window skipped the check. A folder with nothing cached is
+    still never filed - a first listing keeps its badge and stays put.
+  * Subjects and senders whose encoded words lie about their charset
+    ("Vr??tenie": UTF-8 labelled us-ascii) are read back from the raw
+    header instead of showing replacement characters.
+  * An RPM is built alongside the .deb (cmake --build build --target
+    package-rpm), natively on Debian via rpmbuild.
+  * The AppImage bundles the Qt Wayland platform plugin; it used to die
+    on a Plasma Wayland session with 'Could not find the Qt platform
+    plugin "wayland"'. Falls back to X11 if Wayland cannot load.
+
+ -- dusoft <dusoft@bastadigital.com>  Sat, 12 Sep 2026 22:00:00 +0200
+
 mailove (3.5) unstable; urgency=medium
 
   * The known-correspondent exemption now requires the receiving server to

@@ -164,6 +164,35 @@ for theme in breeze breeze-dark; do
   done
 done
 
+# 3e. The Wayland platform plugin. linuxdeploy-plugin-qt bundles xcb only, so
+#     on a Plasma Wayland session (which sets QT_QPA_PLATFORM=wayland) the
+#     AppImage died with 'Could not find the Qt platform plugin "wayland"'.
+#     The plugin is one file under platforms/ (libqwayland.so since Qt 6.7;
+#     libqwayland-generic.so and -egl.so before) plus the client-side helper
+#     plugins it loads by directory — shell integration, decorations, graphics
+#     integration. The server-side directory is a compositor's and stays out.
+#     linuxdeploy resolves the libraries these pull in (QtWaylandClient, …)
+#     because it deploys dependencies for every ELF already in the AppDir.
+log "Bundling the Wayland platform plugin"
+wayland_found=0
+for plugin in libqwayland.so libqwayland-generic.so libqwayland-egl.so; do
+  if [[ -f "$qt_plugins/platforms/$plugin" ]]; then
+    install -Dm644 "$qt_plugins/platforms/$plugin" "$appdir/usr/plugins/platforms/$plugin"
+    wayland_found=1
+  fi
+done
+if [[ $wayland_found == 1 ]]; then
+  for dir in wayland-shell-integration wayland-decoration-client \
+             wayland-graphics-integration-client; do
+    [[ -d "$qt_plugins/$dir" ]] || continue
+    mkdir -p "$appdir/usr/plugins/$dir"
+    cp -a "$qt_plugins/$dir/." "$appdir/usr/plugins/$dir/"
+  done
+else
+  echo "warning: no Wayland platform plugin under $qt_plugins/platforms —" \
+       "install qt6-wayland; the AppImage will run on X11/XWayland only" >&2
+fi
+
 # --- 4. runtime hook: env for the bundled Qt/WebEngine/style -------------
 # linuxdeploy runs apprun-hooks/*.sh before launching the app.
 log "Writing AppRun hooks"
@@ -182,15 +211,23 @@ export QT_QUICK_CONTROLS_STYLE="org.kde.desktop"
 export QML2_IMPORT_PATH="$here/usr/qml${QML2_IMPORT_PATH:+:$QML2_IMPORT_PATH}"
 # Prefer the bundled Breeze icons.
 export XDG_DATA_DIRS="$here/usr/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+# Never die on a missing platform plugin: Qt walks a ;-separated list and
+# takes the first that loads. A session that pins QT_QPA_PLATFORM=wayland
+# (Plasma does) gets xcb as the fallback; one that pins nothing gets Wayland
+# first when there is a compositor to talk to, and X11 otherwise.
+case "${QT_QPA_PLATFORM:-}" in
+  "")            [[ -n "${WAYLAND_DISPLAY:-}" ]] && export QT_QPA_PLATFORM="wayland;xcb" ;;
+  wayland|wayland-egl) export QT_QPA_PLATFORM="$QT_QPA_PLATFORM;xcb" ;;
+esac
 HOOK
 chmod +x "$hooks/mailove-env.sh"
 
 # --- 5. deploy Qt + pack the AppImage ------------------------------------
 log "Running linuxdeploy + Qt plugin"
-# EXTRA_QT_MODULES ensures WebEngine/QuickControls2 libs are pulled even if the
-# import scanner can't see them. QML_SOURCES_PATHS points the Qt plugin at our
-# QML so it can trace imports.
-export EXTRA_QT_MODULES="waylandcompositor"   # harmless if unused; helps on wayland
+# QML_SOURCES_PATHS points the Qt plugin at our QML so it can trace imports.
+# (EXTRA_QT_MODULES="waylandcompositor" used to be set here "for wayland" —
+# that is the server-side module and never helped a client; the client plugin
+# is bundled in 3e above.)
 export QML_SOURCES_PATHS="$here/src/qml"
 # linuxdeploy drops the AppImage in the working directory; make that the
 # project root rather than wherever the caller happened to be standing.

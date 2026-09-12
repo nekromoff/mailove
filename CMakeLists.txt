@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailove VERSION 3.5 LANGUAGES CXX)
+project(mailove VERSION 3.6 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -281,6 +281,44 @@ qml6-module-qtwebengine")
 # OpenPGP wants gpg-agent's passphrase handling with it, which is why the agent
 # is named rather than left to gnupg's own dependencies.
 set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "gnupg, gpg-agent")
+
+# The RPM, built natively on Debian: rpmbuild comes from the `rpm` package
+# and CPack drives it from the same install tree as the .deb. Library
+# dependencies are soname-based on both sides, so rpmbuild's find-requires
+# fills them correctly from a Debian-linked binary; only the QML/data packages
+# the linker cannot see are named, and those are spelled the Fedora way.
+execute_process(COMMAND uname -m
+                OUTPUT_VARIABLE MAILOVE_RPM_ARCH
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+if(NOT MAILOVE_RPM_ARCH)
+    set(MAILOVE_RPM_ARCH x86_64)
+endif()
+set(CPACK_RPM_PACKAGE_ARCHITECTURE "${MAILOVE_RPM_ARCH}")
+set(CPACK_RPM_FILE_NAME "mailove-${PROJECT_VERSION}-1.${MAILOVE_RPM_ARCH}.rpm")
+set(CPACK_RPM_PACKAGE_RELEASE 1)
+set(CPACK_RPM_PACKAGE_LICENSE "LGPL-3.0-or-later")
+set(CPACK_RPM_PACKAGE_GROUP "Applications/Internet")
+set(CPACK_RPM_PACKAGE_URL "https://github.com/nekromoff/mailove")
+set(CPACK_RPM_PACKAGE_DESCRIPTION "${CPACK_DEBIAN_PACKAGE_DESCRIPTION}")
+set(CPACK_RPM_PACKAGE_AUTOREQ ON)
+# Rich dependencies (rpm >= 4.13, both Fedora and openSUSE): the KF6 names
+# agree, the rest do not — Fedora first, openSUSE Tumbleweed second. Verified
+# against packages.fedoraproject.org and the Tumbleweed oss repo listing.
+set(CPACK_RPM_PACKAGE_REQUIRES "\
+kf6-kirigami, \
+kf6-qqc2-desktop-style, \
+(breeze-icon-theme or breeze-icons), \
+(qt6-qtdeclarative or qt6-declarative-imports), \
+(qt6-qtwebengine or qt6-webengine-imports)")
+# No Recommends for gnupg2: Debian's rpmbuild rejects CPack's SUGGESTS tag,
+# and the app runs without it anyway (see the .deb Recommends above).
+# Directories the base system already owns must not be claimed by the
+# package, or rpm reports conflicts with filesystem/hicolor-icon-theme.
+set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
+    "/usr/share/applications;/usr/share/icons;/usr/share/icons/hicolor;\
+/usr/share/icons/hicolor/scalable;/usr/share/icons/hicolor/scalable/apps;\
+/usr/share/metainfo;/usr/share/man;/usr/share/man/man1;/usr/share/doc")
 include(CPack)
 
 # The version, for anything outside CMake that needs it — packaging/build-appimage.sh
@@ -291,7 +329,8 @@ file(WRITE "${CMAKE_BINARY_DIR}/mailove-version.txt" "${PROJECT_VERSION}\n")
 # builds are never hunted for inside a build tree:
 #
 #   cmake --build build --target package-deb   → mailove_<version>_<arch>.deb
-#   cmake --build build --target packages      → both, via build-appimage.sh
+#   cmake --build build --target package-rpm   → mailove-<version>-1.<arch>.rpm
+#   cmake --build build --target packages      → all three, via build-appimage.sh
 #
 # Named "packages", not "package": include(CPack) above already defines that
 # one, and it is the plain cpack run these targets wrap.
@@ -313,6 +352,20 @@ add_custom_target(package-deb
     VERBATIM)
 add_dependencies(package-deb mailove mailove-docs)
 
+# Same recipe with the RPM generator: -G overrides the DEB default in the
+# shared config, so one configure serves both packages.
+add_custom_target(package-rpm
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILOVE_CPACK_SCRATCH}"
+    COMMAND ${CMAKE_CPACK_COMMAND} -G RPM --config "${CMAKE_BINARY_DIR}/CPackConfig.cmake"
+    COMMAND ${CMAKE_COMMAND} -E rename
+            "${CMAKE_BINARY_DIR}/${CPACK_RPM_FILE_NAME}"
+            "${CMAKE_SOURCE_DIR}/${CPACK_RPM_FILE_NAME}"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILOVE_CPACK_SCRATCH}"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Packaging ${CPACK_RPM_FILE_NAME} into the project root"
+    VERBATIM)
+add_dependencies(package-rpm mailove mailove-docs)
+
 # The AppImage has its own build tree (build-appimage/, a Release configure of
 # its own) because it bundles Qt and must not inherit this one's flags. The
 # script is the whole recipe; this target only makes it reachable the same way.
@@ -325,7 +378,7 @@ add_custom_target(package-appimage
     VERBATIM)
 
 add_custom_target(packages)
-add_dependencies(packages package-deb package-appimage)
+add_dependencies(packages package-deb package-rpm package-appimage)
 
 qt_add_executable(attachmenttest tests/attachmenttest.cpp
     src/attachmentstore.cpp src/attachmentstore.h
