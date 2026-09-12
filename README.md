@@ -65,7 +65,7 @@ Every email is validated using DKIM, SPF, DMARC, ARC (and COMPAUTH)
 
 ## Installation
 
-Packaged as DEB package and AppImage. Go to https://github.com/nekromoff/mailove/releases (open assets) to download.
+Packaged as DEB and RPM packages and AppImage. Go to https://github.com/nekromoff/mailove/releases (open assets) to download.
 
 ## Technology
 
@@ -89,12 +89,36 @@ Computer-assisted development was used in the process.
 
 ## Building
 
+Debian / Ubuntu / KDE neon / KDE Linux and similar:
+
 ```bash
 sudo apt install cmake ninja-build extra-cmake-modules qt6-webengine-dev \
   kf6-kmime-dev kpim6-kimap-dev kpim6-ksmtp-dev qtkeychain-qt6-dev \
   qt6-base-dev qt6-declarative-dev kf6-kirigami-dev \
   libgpgmepp-dev libqgpgmeqt6-dev libzstd-dev
+```
 
+Fedora:
+
+```bash
+sudo dnf install cmake ninja-build extra-cmake-modules qt6-qtwebengine-devel \
+  kf6-kmime-devel kimap-devel ksmtp-devel qtkeychain-qt6-devel \
+  qt6-qtbase-devel qt6-qtdeclarative-devel kf6-kirigami-devel \
+  gpgmepp-devel qgpgme-qt6-devel libzstd-devel
+```
+
+openSUSE Tumbleweed:
+
+```bash
+sudo zypper install cmake ninja extra-cmake-modules qt6-webenginequick-devel \
+  kf6-kmime-devel kimap-devel ksmtp-devel qtkeychain-qt6-devel \
+  qt6-base-devel qt6-declarative-devel kf6-kirigami-devel \
+  gpgmepp-devel qgpgmeqt6-devel libzstd-devel
+```
+
+Then:
+
+```bash
 cmake -B build -G Ninja
 cmake --build build
 ./build/mailove
@@ -111,9 +135,16 @@ Packages are built from the same tree and land in the project root, named with
 the version from `project()`:
 
 ```bash
-cmake --build build --target package-deb   # mailove_<version>_<arch>.deb
-cmake --build build --target packages      # the .deb and the AppImage
+cmake --build build --target package-deb       # mailove_<version>_<arch>.deb
+cmake --build build --target package-rpm       # mailove-<version>-1.<arch>.rpm
+cmake --build build --target package-appimage  # Mailove-<version>-x86_64.AppImage
+cmake --build build --target packages          # all three
 ```
+
+Library dependencies are soname-based; the QML and icon packages are named for
+both Fedora and openSUSE via rich dependencies. The AppImage needs
+`qt6-wayland` on the build host to bundle the Wayland platform plugin, and
+downloads linuxdeploy into `tools/` on first run.
 
 ## Data locations
 
