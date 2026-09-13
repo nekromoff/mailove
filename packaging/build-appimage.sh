@@ -193,6 +193,44 @@ else
        "install qt6-wayland; the AppImage will run on X11/XWayland only" >&2
 fi
 
+# 3f. Cyrus SASL mechanism plugins. KIMAP authenticates through libsasl2,
+#     which linuxdeploy bundles — but the library finds its mechanisms by a
+#     path compiled in at build time (Debian: /usr/lib/<triplet>/sasl2), and
+#     on Fedora/openSUSE that directory does not exist. Every login then died
+#     with 'SASL(-4): no mechanism available: No worthy mechs found'. The
+#     plugins ship inside, and the hook below points SASL_PATH at them.
+#     Kerberos (gssapiv2, gs2) and sasldb are left out: nobody logs in to a
+#     mail server that way from here, and they would drag krb5/db in.
+log "Bundling SASL mechanisms"
+sasl_dir=""
+for cand in /usr/lib/x86_64-linux-gnu/sasl2 /usr/lib64/sasl2 /usr/lib/sasl2; do
+  [[ -d "$cand" ]] && { sasl_dir="$cand"; break; }
+done
+if [[ -n "$sasl_dir" ]]; then
+  mkdir -p "$appdir/usr/lib/sasl2"
+  for mech in plain login crammd5 digestmd5 scram ntlm anonymous kdexoauth2; do
+    cp -a "$sasl_dir"/lib"$mech".so* "$appdir/usr/lib/sasl2/" 2>/dev/null || true
+  done
+  [[ -f "$appdir/usr/lib/sasl2/libplain.so" ]] \
+    || echo "warning: no PLAIN mechanism found in $sasl_dir" >&2
+  [[ -f "$appdir/usr/lib/sasl2/libkdexoauth2.so" ]] \
+    || echo "warning: kdexoauth2 SASL plugin missing — OAuth logins will fail" >&2
+else
+  echo "warning: no sasl2 plugin directory found; IMAP logins will fail" >&2
+fi
+
+# 3g. Sonnet spell-check backend. The compose window asks Sonnet for a
+#     speller; the backends are KF6 plugins linuxdeploy-plugin-qt does not
+#     know about, so the AppImage had none ('No speller backends available').
+#     hunspell only — its dictionaries live on the target system under
+#     /usr/share/hunspell, which every distro has; the other backends need
+#     libraries nobody installs by default.
+log "Bundling the Sonnet hunspell backend"
+if [[ -f "$qt_plugins/kf6/sonnet/sonnet_hunspell.so" ]]; then
+  install -Dm644 "$qt_plugins/kf6/sonnet/sonnet_hunspell.so" \
+                 "$appdir/usr/plugins/kf6/sonnet/sonnet_hunspell.so"
+fi
+
 # --- 4. runtime hook: env for the bundled Qt/WebEngine/style -------------
 # linuxdeploy runs apprun-hooks/*.sh before launching the app.
 log "Writing AppRun hooks"
@@ -211,6 +249,10 @@ export QT_QUICK_CONTROLS_STYLE="org.kde.desktop"
 export QML2_IMPORT_PATH="$here/usr/qml${QML2_IMPORT_PATH:+:$QML2_IMPORT_PATH}"
 # Prefer the bundled Breeze icons.
 export XDG_DATA_DIRS="$here/usr/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+# The bundled libsasl2 must find the bundled mechanisms, not the build
+# distro's compiled-in directory (absent on Fedora/openSUSE: "no worthy
+# mechs found" on every IMAP login).
+export SASL_PATH="$here/usr/lib/sasl2"
 # Never die on a missing platform plugin: Qt walks a ;-separated list and
 # takes the first that loads. A session that pins QT_QPA_PLATFORM=wayland
 # (Plasma does) gets xcb as the fallback; one that pins nothing gets Wayland

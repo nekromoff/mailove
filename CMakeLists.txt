@@ -302,6 +302,15 @@ set(CPACK_RPM_PACKAGE_GROUP "Applications/Internet")
 set(CPACK_RPM_PACKAGE_URL "https://github.com/nekromoff/mailove")
 set(CPACK_RPM_PACKAGE_DESCRIPTION "${CPACK_DEBIAN_PACKAGE_DESCRIPTION}")
 set(CPACK_RPM_PACKAGE_AUTOREQ ON)
+# Dependencies through packaging/rpm-find-requires.sh, which is rpm's own
+# find-requires minus the libQt6Qml.so.6(Qt_6_PRIVATE_API) line that Fedora
+# and openSUSE deliberately never provide — without this the package could
+# not be installed at all. The script explains why it is a wrapper and not
+# %__requires_exclude. The external generator has to be selected explicitly;
+# the internal one ignores __find_requires.
+set(CPACK_RPM_SPEC_MORE_DEFINE
+    "%define _use_internal_dependency_generator 0
+%define __find_requires ${CMAKE_SOURCE_DIR}/packaging/rpm-find-requires.sh")
 # Rich dependencies (rpm >= 4.13, both Fedora and openSUSE): the KF6 names
 # agree, the rest do not — Fedora first, openSUSE Tumbleweed second. Verified
 # against packages.fedoraproject.org and the Tumbleweed oss repo listing.

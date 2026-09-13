@@ -16,6 +16,11 @@ mailove (3.6) unstable; urgency=medium
   * The AppImage bundles the Qt Wayland platform plugin; it used to die
     on a Plasma Wayland session with 'Could not find the Qt platform
     plugin "wayland"'. Falls back to X11 if Wayland cannot load.
+  * The AppImage logs in on Fedora and openSUSE: it now carries the SASL
+    mechanisms (PLAIN, LOGIN, XOAUTH2, ...) its libsasl2 used to look for
+    at Debian's path, which those distros do not have - every IMAP login
+    failed with "no worthy mechs found". Spell checking works there too
+    (hunspell backend bundled).
 
  -- dusoft <dusoft@bastadigital.com>  Sat, 12 Sep 2026 22:00:00 +0200
 
