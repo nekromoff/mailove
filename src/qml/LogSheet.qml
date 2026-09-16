@@ -40,6 +40,32 @@ Window {
         lines.positionViewAtEnd()
     }
 
+    /// Opens the log on the line that carries \a text — the status bar's
+    /// way in: the crumb it shows was logged verbatim, and the reader who
+    /// clicked it wants the lines around that one, not the end of the log.
+    /// Found nothing under the current filter (say, "Errors" while the crumb
+    /// is plain activity) falls back to the everyday filter and looks again;
+    /// still nothing means the line has scrolled out of the 5000 kept, and
+    /// the end of the log is the honest place to land.
+    function openAt(text) {
+        logSheet.show()
+        logSheet.raise()
+        logSheet.requestActivate()
+        let row = Diagnostics.lastRowContaining(text)
+        if (row < 0 && severityBox.currentIndex !== 1) {
+            severityBox.currentIndex = 1
+            severityBox.applyFilter()
+            row = Diagnostics.lastRowContaining(text)
+        }
+        if (row < 0) {
+            lines.positionViewAtEnd()
+            return
+        }
+        logSheet.selectionAnchor = row
+        logSheet.selectionHead = row
+        lines.positionViewAtIndex(row, ListView.Center)
+    }
+
     /// The mouse selection, as row indices into what the filter is showing.
     /// Whole lines rather than characters: a log is read by the line, the
     /// interesting part of one is usually its tail (the error, not the

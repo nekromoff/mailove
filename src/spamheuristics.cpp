@@ -466,10 +466,22 @@ QString orgOfDomain(const QString &domain)
     if (domain.isEmpty())
         return {};
     const QString org = PublicSuffixList::instance().organizationalDomain(domain);
-    // Falling back to the full domain can only make two names look less
-    // related than they are. That direction produces a missed rule, never a
-    // false accusation, which is the trade we want when the list is absent.
-    return org.isEmpty() ? domain : org;
+    if (!org.isEmpty())
+        return org;
+    // No list (first run before the download lands, or offline), or a name
+    // the list has no organization for. The fallback used to be the full
+    // domain, on the theory that it could only make two names look *less*
+    // related — but every rule here compares two of these for inequality, so
+    // "less related" is precisely a false accusation: with the list absent,
+    // "packeta.sk" against "www.packeta.sk" scored link-text-mismatch on an
+    // ordinary shipping notice. The last two labels are the guess that errs
+    // the other way: right for every plain TLD, and on a two-part suffix
+    // ("co.uk") it collapses unrelated names into one, which costs a missed
+    // rule and never a false one.
+    const QStringList labels = domain.split(QLatin1Char('.'), Qt::SkipEmptyParts);
+    if (labels.size() <= 2)
+        return domain;
+    return labels.mid(labels.size() - 2).join(QLatin1Char('.'));
 }
 
 /// Brands worth imitating, and the org domains each one legitimately sends
@@ -885,6 +897,17 @@ QString decodeEncodedWords(const QString &raw)
 /// The shape of a message injected straight into a relay by a script.
 bool receivedFromUnknownHost(const QString &received)
 {
+    // An authenticated submission (RFC 3848: "with ESMTPA", "ESMTPSA" and
+    // the LMTP/UTF8 variants) is the one hop that legitimately names no
+    // sending host: the server logged the client in and, as Purelymail and
+    // Proton do, left the client's address out of the header on purpose. It
+    // is the shape of the user's own mail coming back to them, and the
+    // opposite of a script talking to a relay — a script has no password.
+    static const QRegularExpression authenticatedRe(
+        QStringLiteral("\\bwith\\s+(?:UTF8)?[EL]?[SM]?MTPS?A\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+    if (authenticatedRe.match(received).hasMatch())
+        return false;
     static const QRegularExpression fromRe(
         QStringLiteral("\\bfrom\\s+([^\\s;]+)"), QRegularExpression::CaseInsensitiveOption);
     const auto m = fromRe.match(received);
@@ -1092,6 +1115,8 @@ bool authMethodTrusted(const QString &method)
         return AdvancedConfig::b("spam/trustArc");
     if (method == QLatin1String("compauth"))
         return AdvancedConfig::b("spam/trustCompauth");
+    if (method == QLatin1String("auth"))
+        return AdvancedConfig::b("spam/trustAuth");
     return true;
 }
 
@@ -1103,8 +1128,13 @@ QStringList authResultVerdicts(const QString &value)
     // by Exchange Online, and trusted here on exactly the basis every other
     // method is — this value came from a header whose authserv-id our own
     // receiving server vouched for.
+    //
+    // auth is SMTP AUTH (RFC 8601 §2.7.4): the message was *submitted* through
+    // this server by a client that logged in. It vouches for the submitter,
+    // not for the From domain — which is why authResultsPassed() ignores it
+    // and only authResultsSubmitted() reads it.
     static const QRegularExpression methodRe(
-        QStringLiteral("^\\s*(spf|dkim|dmarc|arc|compauth)\\s*=\\s*([a-z]+)"),
+        QStringLiteral("^\\s*(spf|dkim|dmarc|arc|compauth|auth)\\s*=\\s*([a-z]+)"),
         QRegularExpression::CaseInsensitiveOption);
     QStringList out;
     const QStringList fields = stripAuthCommentsAndQuotes(value).split(QLatin1Char(';'));
@@ -1128,8 +1158,9 @@ bool authResultsFailed(const QString &value)
         const QString method = verdict.section(QLatin1Char('='), 0, 0);
         const QString result = verdict.section(QLatin1Char('='), 1);
         // A broken ARC chain is not a forgery — arc only ever *excuses*
-        // failures (authResultsArcPassed), it never accuses.
-        if (method == QLatin1String("arc"))
+        // failures (authResultsArcPassed), it never accuses. Neither does
+        // auth: a submission that did not log in is ordinary inbound mail.
+        if (method == QLatin1String("arc") || method == QLatin1String("auth"))
             continue;
         if (!authMethodTrusted(method))
             continue;
@@ -1154,7 +1185,7 @@ bool authResultsSoftFailed(const QString &value)
     const QStringList verdicts = authResultVerdicts(value);
     for (const QString &verdict : verdicts) {
         const QString method = verdict.section(QLatin1Char('='), 0, 0);
-        if (method == QLatin1String("arc"))
+        if (method == QLatin1String("arc") || method == QLatin1String("auth"))
             continue;
         if (!authMethodTrusted(method))
             continue;
@@ -1169,8 +1200,10 @@ bool authResultsPassed(const QString &value)
     const QStringList verdicts = authResultVerdicts(value);
     for (const QString &verdict : verdicts) {
         const QString method = verdict.section(QLatin1Char('='), 0, 0);
-        if (method == QLatin1String("arc"))
-            continue; // arc=pass answers a different question
+        // arc=pass and auth=pass each answer a different question: see
+        // authResultsArcPassed() and authResultsSubmitted().
+        if (method == QLatin1String("arc") || method == QLatin1String("auth"))
+            continue;
         if (!authMethodTrusted(method))
             continue;
         if (verdict.endsWith(QLatin1String("=pass")))
@@ -1184,6 +1217,13 @@ bool authResultsArcPassed(const QString &value)
     if (!authMethodTrusted(QStringLiteral("arc")))
         return false;
     return authResultVerdicts(value).contains(QLatin1String("arc=pass"));
+}
+
+bool authResultsSubmitted(const QString &value)
+{
+    if (!authMethodTrusted(QStringLiteral("auth")))
+        return false;
+    return authResultVerdicts(value).contains(QLatin1String("auth=pass"));
 }
 
 QString addressOf(const QString &headerValue)
@@ -1364,6 +1404,34 @@ Score score(const Message &msg, const Context &ctx)
     }
 
     // ------------------------------------------------------------------
+    // Rule 0 for the user's own address. The own-address rules below are the
+    // strongest accusation this file makes, and they were written around one
+    // fact: the only party that can vouch for mail from the user's own
+    // address is the user's own server, and it does — for a *submission*.
+    // Mail the user sends themselves (a reply-all, a note to self, a CC of
+    // their own address) reaches the mailbox through their own server's
+    // SMTP AUTH, and the server records that as auth=pass — often with no
+    // spf/dkim/dmarc verdict beside it, since a server does not grade what
+    // it signed itself. That is the user's own server saying "this came in
+    // through a login of ours", which is exactly what the rules below accuse
+    // the message of lacking. So it is an exemption on the same terms as
+    // Rule 0: evaluated before junk-content-match, for the same reason (a
+    // person re-sending text that was once junked is a person), and before
+    // the accusations it answers.
+    // ------------------------------------------------------------------
+    const bool fromIsOwn = !fromAddr.isEmpty() && ctx.ownAddresses.contains(fromAddr);
+    if (fromIsOwn && ctx.authSubmitted && !authFailed && !ctx.alwaysScore
+        && !ctx.inJunkFolder) {
+        out.exempt = true;
+        out.verdict = Verdict::Ham;
+        out.exemptReason =
+            QStringLiteral("Sent from your own address %1 through your own server, which "
+                           "recorded the login it came in on.")
+                .arg(fromAddr);
+        return out;
+    }
+
+    // ------------------------------------------------------------------
     // The user's own junk folder, by content: the same text they already
     // threw away, arriving again under a fresh envelope. Sender rules miss
     // exactly this — a campaign rotates addresses and domains faster than
@@ -1390,13 +1458,13 @@ Score score(const Message &msg, const Context &ctx)
     // credit may argue it down, and the header stage sees it before any body
     // arrives. Neither branch
     // waits on knownCorrespondent: the user need never have mailed themselves
-    // for the forgery to be one.
-    const bool fromIsOwn = !fromAddr.isEmpty() && ctx.ownAddresses.contains(fromAddr);
+    // for the forgery to be one. A submission through the user's own server
+    // (auth=pass) was exempted above, before junk-content-match.
     if (fromIsOwn && authFailed) {
         hit("own-address-forged", 100,
             QStringLiteral("Claims to be sent from your own address %1, but sender "
                            "authentication failed — it was not").arg(fromAddr));
-    } else if (fromIsOwn && !ctx.authPassed && !ctx.arcPassed) {
+    } else if (fromIsOwn && !ctx.authPassed && !ctx.arcPassed && !ctx.authSubmitted) {
         hit("own-address-unverified", 100,
             QStringLiteral("Claims to be sent from your own address %1, but nothing "
                            "vouches for it — your own server would have").arg(fromAddr));

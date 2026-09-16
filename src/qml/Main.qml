@@ -1244,9 +1244,9 @@ Kirigami.ApplicationWindow {
                 HoverToolTip {
                     hover: statusHover
                     readonly property string logHint:
-                        "More info in the activity log."
+                        "Click to open the activity log on this line."
                         + (uiSettings.shortcutLog !== ""
-                           ? " (" + uiSettings.shortcutLog + ")" : "")
+                           ? " (" + uiSettings.shortcutLog + " opens the log)" : "")
                     text: statusLabel.truncated
                           ? statusLabel.text + "\n\n" + logHint
                           : logHint
@@ -1259,6 +1259,27 @@ Kirigami.ApplicationWindow {
                         Mail.copyToClipboard(Mail.statusText)
                         root.showPassiveNotification("Status copied", "short")
                     }
+                }
+                // Left click: the log, opened on the newest crumb. The
+                // trail is newest-first and joined with "  ·  " by
+                // MailClient::setStatus(), so the head is what the reader
+                // is looking at; each crumb was logged verbatim when it was
+                // set (mailove.status), which is how the log finds it.
+                TapHandler {
+                    acceptedButtons: Qt.LeftButton
+                    onTapped: {
+                        if (!Mail.hasAccount && !Mail.accountIsLocal)
+                            return
+                        const head = Mail.statusText.split("  ·  ")[0]
+                        if (head.length === 0)
+                            logSheet.open()
+                        else
+                            logSheet.openAt(head)
+                    }
+                }
+                HoverHandler {
+                    enabled: Mail.hasAccount || Mail.accountIsLocal
+                    cursorShape: Qt.PointingHandCursor
                 }
             }
             // The undo affordance for a send still inside its hold: large,
@@ -3330,6 +3351,27 @@ Kirigami.ApplicationWindow {
                                                 messageList.selectionAnchor = remap(messageList.selectionAnchor)
                                             if (messageList.currentIndex >= first)
                                                 messageList.currentIndex = remap(messageList.currentIndex)
+                                            // Belt and braces for the cursor: the view
+                                            // shifts its own currentIndex for an insert
+                                            // above it, and the remap above is meant to
+                                            // agree with it — but the two are applied on
+                                            // different schedules (the view's in its next
+                                            // layout pass), and if they ever disagree the
+                                            // highlight sits on one message while the
+                                            // pane shows another, with no cursor change
+                                            // to trigger a fetch. openedUid is the
+                                            // message being read; if the cursor no longer
+                                            // names it, put it back — and if the row is
+                                            // gone, re-fetch whatever is under the cursor.
+                                            if (messageList.currentIndex >= 0 && messageList.openedUid >= 0
+                                                    && Mail.messageModel.uidAt(messageList.currentIndex)
+                                                       !== messageList.openedUid) {
+                                                const back = Mail.messageModel.rowForUid(messageList.openedUid)
+                                                if (back >= 0)
+                                                    messageList.currentIndex = back
+                                                else
+                                                    fetchDebounce.restart()
+                                            }
                                             messageList.selectionRev++
                                             // Results reconcile in place while a search
                                             // runs, and an insert above the viewport

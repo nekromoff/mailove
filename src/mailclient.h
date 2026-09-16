@@ -1156,11 +1156,12 @@ private:
     /// body rule is silent there. This is the second look — the same scorer,
     /// the same context, with the parts of the message that had not arrived
     /// yet. Never called for a message the user has settled (state 3 or 4).
-    /// \a mayAutoFile is false only for the viewer's call sites: a message
-    /// the user is looking at must never be filed away under them, however
-    /// the body re-score comes out.
-    void rescoreWithBody(const QString &folder, qint64 uid, KMime::Message *msg,
-                         bool mayAutoFile = true);
+    /// A new arrival whose verdict reaches the threshold here is filed into
+    /// Junk (spam/autoMove), on every path including the viewer's: an arrival
+    /// marked spam never stays in the inbox, exactly as it does not after
+    /// "Mark as spam" on the open message. Mail that is not a watched
+    /// arrival is only ever re-marked, never moved.
+    void rescoreWithBody(const QString &folder, qint64 uid, KMime::Message *msg);
     /// The sync engine's arrival filter (spam/autoMove): files rows scoring at
     /// or past the threshold into the Junk folder and removes them from
     /// \a rows; remembers the under-threshold rest so a body re-score that
@@ -1501,6 +1502,11 @@ private:
     std::shared_ptr<KMime::Message> m_offlineFallback;
     bool m_detachPending = false; ///< a double-click is waiting for its fetch
     qint64 m_detachUid = -1;      ///< the message that double-click asked for
+    /// Bumped by every interactive body request (requestMessageBody). An
+    /// answer whose serial is no longer current belongs to a message the user
+    /// has already left, and is cached but never presented — see the handler
+    /// for the "older message shown under the newer row" this closes.
+    quint64 m_bodyRequestSerial = 0;
     QString m_textPreview;
     bool m_busy = false;
     QString m_statusText;        ///< breadcrumb shown in the UI (newest first)

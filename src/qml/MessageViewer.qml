@@ -301,7 +301,8 @@ ColumnLayout {
             "dkim":     "DKIM: Does the domain's cryptographic signature on the message hold?",
             "dmarc":    "DMARC: Does the visible From match what SPF or DKIM verified?",
             "arc":      "ARC: Did the original verdict survive forwarders and mailing lists intact?",
-            "compauth": "COMPAUTH: Does Microsoft's combined sender verification pass?"
+            "compauth": "COMPAUTH: Does Microsoft's combined sender verification pass?",
+            "auth":     "AUTH: Was the message submitted through this server by a logged-in client?"
         })
         const trusted = Mail.trustedAuthMethods()
         // Split the raw value, not a stripped copy — the comments are part of
@@ -314,7 +315,7 @@ ColumnLayout {
         let current = ""
         for (let i = 1; i < parts.length; ++i) {
             const part = parts[i].trim()
-            const m = /^(dkim|spf|dmarc|arc|compauth)\s*=\s*([a-z]+)/i.exec(part)
+            const m = /^(dkim|spf|dmarc|arc|compauth|auth)\s*=\s*([a-z]+)/i.exec(part)
             if (m) {
                 const method = m[1].toLowerCase()
                 if (trusted.indexOf(method) === -1
@@ -361,7 +362,7 @@ ColumnLayout {
             if (/^dkim\s*=/i.test(part)) {
                 lines.push(part)
                 inDkim = true
-            } else if (/^(spf|dmarc|arc|compauth)\s*=/i.test(part)) {
+            } else if (/^(spf|dmarc|arc|compauth|auth)\s*=/i.test(part)) {
                 inDkim = false
             } else if (inDkim && part.length > 0 && lines.length > 0) {
                 lines[lines.length - 1] += "; " + part // a comment's severed tail
@@ -396,7 +397,10 @@ ColumnLayout {
             // arc explains why spf/dkim may say fail, and compauth is
             // Microsoft's own composite verdict, only ever present on
             // Microsoft 365 accounts.
-            const m = /^\s*(dkim|spf|dmarc|arc|compauth)\s*=\s*([a-z]+)/i.exec(fields[i])
+            // auth is SMTP AUTH: the server's own record that the message
+            // was submitted by a login. Shown so a self-sent message's badge
+            // is not blank — it is the only verdict such mail usually has.
+            const m = /^\s*(dkim|spf|dmarc|arc|compauth|auth)\s*=\s*([a-z]+)/i.exec(fields[i])
             if (!m)
                 continue
             const method = m[1].toLowerCase()

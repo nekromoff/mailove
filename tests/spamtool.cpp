@@ -10,6 +10,7 @@
 //   ./spamtool --auth-fail msg.eml          score as if SPF/DKIM/DMARC failed
 //   ./spamtool --auth-pass msg.eml          ...or passed
 //   ./spamtool --arc-pass msg.eml           ...or failed only because of a relay (ARC)
+//   ./spamtool --auth-submitted msg.eml     ...or came in through your own server's login (auth=pass)
 //   ./spamtool --junk msg.eml               score as if it sat in the Junk folder
 //   ./spamtool --junk-content msg.eml       score as if its text matched junked mail
 //   ./spamtool --crypto 2 msg.eml           score as OpenPGP signed (1 enc, 2 sig, 3 both)
@@ -484,6 +485,8 @@ int main(int argc, char **argv)
             base.authPassed = true;
         else if (arg == QLatin1String("--arc-pass"))
             base.arcPassed = true;
+        else if (arg == QLatin1String("--auth-submitted"))
+            base.authSubmitted = true;
         else if (arg == QLatin1String("--junk"))
             base.inJunkFolder = true;
         // Simulated, like --auth-pass: a corpus on disk has no junk-content

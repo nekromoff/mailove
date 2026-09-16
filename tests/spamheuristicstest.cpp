@@ -227,6 +227,24 @@ void testEnvelopeAndRouting()
                "Message-ID: <e2@one-hop.test>\r\n",
                SpamHeuristics::Verdict::Ham);
 
+    // The same one hop with no "from" clause at all, but written by a server
+    // that logged the client in ("with ESMTPSA"): Purelymail's and Proton's
+    // submission line, which hides the client's address on purpose. This is
+    // the user's own reply-all coming back to them, and it fired the rule.
+    const SpamHeuristics::Score submitted = SpamHeuristics::score(
+        headOnly("Received: by smtp.purelymail.com (Purelymail SMTP) with ESMTPSA id -1721655070;"
+                 " (version=TLSv1.3 cipher=TLS_AES_256_GCM_SHA384);"
+                 " Wed, 16 Sep 2026 11:25:39 +0000 (UTC)\r\n"
+                 "From: Sender <s@one-hop.test>\r\n"
+                 "To: You <you@example.org>\r\n"
+                 "Subject: Re: hello\r\n"
+                 "Date: Wed, 16 Sep 2026 13:25:37 +0200\r\n"
+                 "Message-ID: <e2b@smtp.purelymail.com>\r\n"),
+        {});
+    check(!fired(submitted, "single-hop-unknown"),
+          QStringLiteral("an authenticated submission hop is not an unknown host (%1)")
+              .arg(hitList(submitted)));
+
     expectRule("undisclosed-recipients",
                "Received: from a.test (a.test [198.51.100.9]) by mx.example.org;"
                " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
@@ -1149,6 +1167,34 @@ void testOwnAddressSpoof()
     check(!fired(SpamHeuristics::score(headOnly(selfMail), relayed), "own-address-unverified"),
           QStringLiteral("arc=pass vouches for a relayed self-mail"));
 
+    // The real shape of self-sent mail: a reply-all that CCs the user's own
+    // address comes in through their own server's SMTP AUTH, which stamps
+    // "auth=pass" and — having signed the message itself — no spf/dkim/dmarc
+    // verdict at all. The server recording the login is the vouching the
+    // rule asks for, so the message is exempt outright, not merely spared.
+    SpamHeuristics::Context submitted = ctx;
+    submitted.knownCorrespondent = false; // no correspondence needed
+    submitted.authSubmitted = true;
+    const SpamHeuristics::Score sub = SpamHeuristics::score(headOnly(selfMail), submitted);
+    check(sub.exempt && sub.verdict == SpamHeuristics::Verdict::Ham
+              && !fired(sub, "own-address-unverified"),
+          QStringLiteral("auth=pass on own-address mail is exempt (%1: %2)")
+              .arg(sub.exemptReason, hitList(sub)));
+    // ...but only for the user's own address: a stranger who logged in to the
+    // same provider is a stranger.
+    SpamHeuristics::Context otherSubmitted;
+    otherSubmitted.ownAddresses = {QStringLiteral("other@example.org")};
+    otherSubmitted.authSubmitted = true;
+    check(!SpamHeuristics::score(headOnly(selfMail), otherSubmitted).exempt,
+          QStringLiteral("auth=pass exempts nobody but the user's own address"));
+    // ...and a failure beside it still wins: the server logged someone in and
+    // then found the From domain disowning the message.
+    SpamHeuristics::Context submittedButFailed = submitted;
+    submittedButFailed.authFailed = true;
+    const SpamHeuristics::Score sf = SpamHeuristics::score(headOnly(selfMail), submittedButFailed);
+    check(!sf.exempt && fired(sf, "own-address-forged"),
+          QStringLiteral("auth=pass does not outrank an outright failure (%1)").arg(hitList(sf)));
+
     // Somebody else's address is not this rule's business.
     SpamHeuristics::Context stranger;
     stranger.ownAddresses = {QStringLiteral("other@example.org")};
@@ -1492,6 +1538,18 @@ void testAuthResultParsing()
     check(!authResultsFailed(QStringLiteral("mx.example.org; arc=fail; spf=pass")),
           QStringLiteral("arc=fail is not an authentication failure"));
 
+    // The submission shape: the user's own server took the message over SMTP
+    // AUTH and stamped only that — no spf/dkim/dmarc, since it signed the
+    // message itself. auth=pass is read on its own and nowhere else.
+    const QString submitted = QStringLiteral("purelymail.com; auth=pass");
+    check(authResultsSubmitted(submitted),
+          QStringLiteral("auth=pass is extracted as a submission"));
+    check(!authResultsPassed(submitted) && !authResultsFailed(submitted)
+              && !authResultsArcPassed(submitted),
+          QStringLiteral("...and is neither a pass, a failure nor arc"));
+    check(!authResultsFailed(QStringLiteral("mx.example.org; auth=fail; spf=pass")),
+          QStringLiteral("auth=fail accuses nobody — it is ordinary inbound mail"));
+
     // Sender-supplied text must not smuggle a verdict past the parser.
     const QString smuggled = QStringLiteral(
         "mx.example.org; spf=fail smtp.mailfrom=\"x; dkim=pass\" (comment; "
@@ -1632,6 +1690,34 @@ void testProviderUpstreamHeaders()
               .arg(hitList(forged)));
 }
 
+/// Before the Public Suffix List is seeded, deliberately: what the scorer does
+/// with no list is what a fresh install does until the download lands, and
+/// what an offline one does forever. The old fallback compared full host
+/// names, so a shop's "https://packeta.sk" linking to www.packeta.sk scored
+/// link-text-mismatch on an ordinary shipping notice. The fallback may only
+/// ever under-report.
+void testNoSuffixListFallback()
+{
+    SpamHeuristics::Message m;
+    m.head = QByteArray(
+        "Received: from mta.packeta.sk (mta.packeta.sk [198.51.100.4]) by mx.example.org;"
+        " Fri, 14 Aug 2026 09:00:01 +0000\r\n"
+        "From: Packeta <noreply@packeta.sk>\r\n"
+        "Reply-To: Packeta <info@mail.packeta.sk>\r\n"
+        "To: You <you@example.org>\r\n"
+        "Subject: Your parcel\r\n"
+        "Date: Fri, 14 Aug 2026 09:00:00 +0000\r\n"
+        "Message-ID: <p1@packeta.sk>\r\n");
+    m.html = QStringLiteral("<a href=\"https://www.packeta.sk/track/1\">https://packeta.sk</a>");
+    const SpamHeuristics::Score s = SpamHeuristics::score(m, {});
+    check(!fired(s, "link-text-mismatch") && !fired(s, "reply-to-mismatch"),
+          QStringLiteral("without a suffix list, a www. host is its own domain (%1)")
+              .arg(hitList(s)));
+    check(SpamHeuristics::organizationalDomainOf(QStringLiteral("a@shop.example.co.uk"))
+              == QStringLiteral("co.uk"),
+          QStringLiteral("...and a two-part suffix over-merges rather than accusing"));
+}
+
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
@@ -1643,6 +1729,8 @@ int main(int argc, char **argv)
     qputenv("XDG_CONFIG_HOME", sandbox.toUtf8());
     QCoreApplication::setOrganizationName(QStringLiteral("mailove"));
     QCoreApplication::setApplicationName(QStringLiteral("mailove"));
+
+    testNoSuffixListFallback();
 
     // Enough of the list for every domain used below. Without it
     // organizationalDomain() returns the name unchanged, and every rule that

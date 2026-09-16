@@ -98,6 +98,14 @@ struct Context {
     /// I/O. It is trusted on exactly the same basis as \a authPassed, being
     /// read from the same header our own receiving server stamped.
     bool arcPassed = false;
+    /// The same trusted Authentication-Results reported auth=pass: the message
+    /// was submitted through our own server by a client that logged in (SMTP
+    /// AUTH, RFC 8601 §2.7.4). It vouches for the submitter, not for the From
+    /// domain — another customer of the same provider gets the same stamp —
+    /// so it is never a general pass. Its one use is the user's own address
+    /// in the From line: the server that took the user's login is the only
+    /// party that can say the user sent this, and it just did.
+    bool authSubmitted = false;
     /// The raw trusted Authentication-Results value, for the detail line.
     QString authInfo;
 
@@ -243,8 +251,9 @@ Score score(const Message &msg, const Context &ctx);
 /// sender could smuggle a verdict past the parser.
 QString stripAuthCommentsAndQuotes(const QString &value);
 /// The "method=result" verdicts of an Authentication-Results value, lowercased
-/// and in header order: spf, dkim, dmarc, arc, and compauth (Microsoft's
-/// composite verdict, stamped only by Exchange Online). Only the leading token
+/// and in header order: spf, dkim, dmarc, arc, compauth (Microsoft's
+/// composite verdict, stamped only by Exchange Online) and auth (SMTP AUTH:
+/// the message was submitted through the server by a login). Only the leading token
 /// of each ';'-delimited field counts — everything after it echoes
 /// sender-supplied data.
 QStringList authResultVerdicts(const QString &value);
@@ -270,6 +279,10 @@ bool authResultsPassed(const QString &value);
 /// True when the value carries arc=pass. See Context::arcPassed for what that
 /// is worth and why it is read apart from a plain pass.
 bool authResultsArcPassed(const QString &value);
+/// True when the value carries auth=pass (and spam/trustAuth is on). See
+/// Context::authSubmitted: it says who logged in, not whose domain this is,
+/// so authResultsPassed() deliberately does not read it.
+bool authResultsSubmitted(const QString &value);
 
 /// The bare addr-spec of a From/Reply-To style header value, lowercased and
 /// with any +tag stripped. Empty when the value carries no address.

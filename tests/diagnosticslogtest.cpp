@@ -236,8 +236,25 @@ int main(int argc, char **argv)
     const QString shown = log_.data(log_.index(0, 0), DiagnosticsLog::LineRole).toString();
     check(!shown.contains(QStringLiteral("no-reply")),
           "the rows on screen are masked, not just the clipboard");
+    // The clipboard form is a fenced block: pasted into a bug tracker or a
+    // chat it renders as a log, not as prose with its underscores eaten.
+    check(log_.codeBlockText(-1, -1, true)
+              == QStringLiteral("```\n") + shown + QStringLiteral("\n```"),
+          QStringLiteral("copy wraps the range in a ``` fence"));
+    check(log_.codeBlockText(0, -1, true).startsWith(QStringLiteral("```\n")),
+          QStringLiteral("...for a selection too"));
     check(log_.plainText(true) == shown + QStringLiteral("\n"),
           "what is copied is exactly what is shown");
+    // The status bar's lookup: the newest visible line carrying the text.
+    log(QtInfoMsg, "mailove.status", QStringLiteral("Connected to imap.example.test"));
+    log(QtInfoMsg, "mailove.status", QStringLiteral("Fetching headers"));
+    settle();
+    const int hit = log_.lastRowContaining(QStringLiteral("Connected to imap.example.test"));
+    check(hit >= 0 && hit == log_.rowCount() - 2,
+          QStringLiteral("a status crumb is found on its own visible row (%1 of %2)")
+              .arg(hit).arg(log_.rowCount()));
+    check(log_.lastRowContaining(QStringLiteral("never logged")) == -1,
+          QStringLiteral("...and an unknown crumb is -1, not row 0"));
     log_.setRedact(false);
     check(log_.data(log_.index(0, 0), DiagnosticsLog::LineRole).toString()
               .contains(QStringLiteral("no-reply")),

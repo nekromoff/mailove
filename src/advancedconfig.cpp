@@ -255,8 +255,9 @@ const AdvancedConfig::Knob kSchema[] = {
      "Score at which a message is marked spam. Lower catches more and errs more."},
     {"spam/autoMove", Type::Bool, true, {}, {}, Reload::Live,
      "Move newly arrived mail that reaches the threshold into the Junk folder "
-     "instead of only marking it. Applies to new arrivals only — mail already "
-     "sitting in the inbox keeps the mark and stays put."},
+     "instead of only marking it, whether the header rules or the body rules get "
+     "it there. Applies to new arrivals only — mail already sitting in the inbox "
+     "keeps the mark and stays put."},
     {"spam/familiarCount", Type::Int, 20, 1, 10000, Reload::Live,
      "Messages from a domain before it counts as familiar and is trusted more."},
     {"spam/familiarDays", Type::Int, 60, 1, 3650, Reload::Live,
@@ -278,6 +279,10 @@ const AdvancedConfig::Knob kSchema[] = {
     {"spam/trustArc", Type::Bool, true, {}, {}, Reload::Live,
      "Honour arc=pass as proof a relay (mailing list, forwarder) broke SPF/DKIM "
      "legitimately. 0 scores such failures like any other."},
+    {"spam/trustAuth", Type::Bool, true, {}, {}, Reload::Live,
+     "Honour auth=pass (SMTP AUTH: the message was submitted through your own server by "
+     "a login) as your server vouching for mail sent from your own address. Never a pass "
+     "for anyone else's address. 0 ignores it."},
     {"spam/trustCompauth", Type::Bool, true, {}, {}, Reload::Live,
      "Count Microsoft's compauth verdict with the others. Only ever present on "
      "Microsoft 365 accounts; 0 ignores it for a tenant whose verdicts are noisy."},
@@ -373,8 +378,9 @@ const AdvancedConfig::Knob kSchema[] = {
      "the threshold: nothing may argue a self-spoof down."},
     {"spamrules/own-address-unverified", Type::Int, 100, -999, 999, Reload::Live,
      "Claims to be sent from one of your own addresses with no SPF/DKIM/DMARC/ARC pass "
-     "to show for it. Your own server vouches for your own mail; the \"I sent this "
-     "from your account\" extortion arrives with nothing."},
+     "and no auth=pass (your own server's record of the login it was submitted on) to "
+     "show for it. Your own server vouches for your own mail; the \"I sent this from "
+     "your account\" extortion arrives with nothing."},
     {"spamrules/crypto-extortion", Type::Int, 50, -999, 999, Reload::Live,
      "A cryptocurrency wallet address in the body beside talk of recordings, malware "
      "or your contacts — the webcam extortion scam. Decisive at the default threshold."},

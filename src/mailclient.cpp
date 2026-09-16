@@ -248,6 +248,11 @@ Q_LOGGING_CATEGORY(logTrace, "mailove.trace")
 /// folder open and none while nothing changes, and without them "INBOX says 10
 /// and holds nothing" is unanswerable after the fact.
 Q_LOGGING_CATEGORY(logUnread, "mailove.unread")
+/// The status line, as the user saw it. Every crumb that reaches the top bar
+/// is logged here once, so clicking the bar can open the activity log on the
+/// very line it was announcing — and so a bug report's "it said X" can be
+/// found in the file with the lines around it that explain X.
+Q_LOGGING_CATEGORY(logStatus, "mailove.status")
 
 namespace
 {
@@ -3688,7 +3693,7 @@ int MailClient::avatarSize() const
 QStringList MailClient::trustedAuthMethods() const
 {
     QStringList out;
-    for (const char *m : {"spf", "dkim", "dmarc", "arc", "compauth"}) {
+    for (const char *m : {"spf", "dkim", "dmarc", "arc", "compauth", "auth"}) {
         if (SpamHeuristics::authMethodTrusted(QLatin1String(m)))
             out.append(QLatin1String(m));
     }
@@ -3840,6 +3845,7 @@ void MailClient::scoreHeader(MessageListModel::Header &h, const QString &folder,
     ctx.authSoftFailed = SpamHeuristics::authResultsSoftFailed(h.authInfo);
     ctx.authPassed = SpamHeuristics::authResultsPassed(h.authInfo);
     ctx.arcPassed = SpamHeuristics::authResultsArcPassed(h.authInfo);
+    ctx.authSubmitted = SpamHeuristics::authResultsSubmitted(h.authInfo);
     ctx.crypto = h.crypto;
     const SpamHeuristics::Score s = SpamHeuristics::score({head, {}, {}}, ctx);
     h.spamScore = s.total;
@@ -3854,8 +3860,7 @@ void MailClient::scoreHeader(MessageListModel::Header &h, const QString &folder,
     logSpamVerdict("head", folder, h.uid, SpamHeuristics::addressOf(h.from), s);
 }
 
-void MailClient::rescoreWithBody(const QString &folder, qint64 uid, KMime::Message *msg,
-                                 bool mayAutoFile)
+void MailClient::rescoreWithBody(const QString &folder, qint64 uid, KMime::Message *msg)
 {
     if (!msg || uid <= 0 || !scoresSpamIn(folder))
         return;
@@ -3890,6 +3895,7 @@ void MailClient::rescoreWithBody(const QString &folder, qint64 uid, KMime::Messa
     ctx.authInfo = authInfo;
     ctx.authPassed = SpamHeuristics::authResultsPassed(authInfo);
     ctx.arcPassed = SpamHeuristics::authResultsArcPassed(authInfo);
+    ctx.authSubmitted = SpamHeuristics::authResultsSubmitted(authInfo);
     if (SpamHeuristics::authResultsFailed(authInfo))
         ctx.authFailed = true;
     ctx.authSoftFailed = SpamHeuristics::authResultsSoftFailed(authInfo);
@@ -3927,13 +3933,22 @@ void MailClient::rescoreWithBody(const QString &folder, qint64 uid, KMime::Messa
     // The arrival watch: a new arrival that came in under the threshold at
     // the header stage and crossed it now that the body rules could run.
     // Spent by this first body verdict whichever way it goes — one look per
-    // arrival. mayAutoFile is false for the viewer's call sites: the message
-    // on screen keeps its badge and stays under the reader.
+    // arrival. Arrivals only, on purpose: mail the user has lived with keeps
+    // its badge and stays put however the backfill re-scores it, the same
+    // rule the header pass follows for a first listing.
+    //
+    // Whichever path brought the body in — the prefetch, or the user opening
+    // the message. The viewer's call sites used to be excused so the message
+    // on screen stayed under the reader, but the open still spent the watch
+    // entry, so an arrival opened before the prefetch reached it wore the
+    // mark and stayed in the inbox for good. An arrival that scores spam is
+    // filed, exactly as pressing "Mark as spam" on the open message removes
+    // it from under the reader.
     const auto watch = m_spamWatchArrivals.find(folder);
     if (watch != m_spamWatchArrivals.end() && watch->remove(uid)) {
         if (watch->isEmpty())
             m_spamWatchArrivals.erase(watch);
-        if (mayAutoFile && newState == MessageListModel::SpamWithBody
+        if (newState == MessageListModel::SpamWithBody
             && s.total >= SpamHeuristics::spamThreshold())
             autoFileSpamMessage(folder, uid);
     }
@@ -4178,12 +4193,16 @@ void MailClient::setStatus(const QString &text)
     if (existing >= 0) {
         if (m_statusTrail.at(existing) == text)
             return; // identical — nothing changed
+        // A progress crumb ticking its numbers is one line per tick here;
+        // the log's own repeat collapsing folds a run of them into a count.
+        qCInfo(logStatus).noquote() << text;
         // Updated in place rather than moved to the front: with two operations
         // running, promoting every update would have them swapping positions
         // on each tick, which reads as flicker even though it is only ever two
         // crumbs. Their numbers change where they stand.
         m_statusTrail[existing] = text;
     } else {
+        qCInfo(logStatus).noquote() << text;
         m_statusTrail.prepend(text);
         while (m_statusTrail.size() > maxTrail)
             m_statusTrail.removeLast();
@@ -8227,13 +8246,19 @@ void MailClient::fetchMessage(int row)
         m_presentingFromCache = false;
         m_verifier->setPresentingFromCache(false);
         refineAttachKind(m_selectedFolder, uid, msg.get());
-        rescoreWithBody(m_selectedFolder, uid, msg.get(), /*mayAutoFile=*/false);
-        markMessageRead(row);
-        // No status crumb for opening a cached message — it's silent, the
-        // message simply appears.
-        // Read-ahead: sequential reading should never wait on the network.
-        prefetchMessage(row + 1);
-        prefetchMessage(row + 2);
+        rescoreWithBody(m_selectedFolder, uid, msg.get());
+        // By uid, not by the row captured with the click: the re-score above
+        // may have filed this message into Junk and closed the gap in the
+        // list, and marking "row" read would then mark its neighbour.
+        const int liveRow = m_messageModel.rowForUid(uid);
+        if (liveRow >= 0) {
+            markMessageRead(liveRow);
+            // No status crumb for opening a cached message — it's silent,
+            // the message simply appears.
+            // Read-ahead: sequential reading should never wait on the network.
+            prefetchMessage(liveRow + 1);
+            prefetchMessage(liveRow + 2);
+        }
         return;
         }
     }
@@ -8275,10 +8300,27 @@ void MailClient::requestMessageBody(int row, qint64 uid, const QString &remoteId
     // connection here would re-present an old message under a later one.
     auto connection = std::make_shared<QMetaObject::Connection>();
     auto answered = std::make_shared<bool>(false);
+    // Whether the reader still wants this answer when it lands. Two ways for
+    // them not to: a newer request has been made (the serial moved on), or
+    // they clicked a message that was already cached, which presents at once
+    // and makes no request (m_reading names that one now). Either way the
+    // body is still worth having — the shared bodyFetched handler in the
+    // constructor caches every body the backend delivers — but presenting it
+    // would put the *previous* message under the row the user is on. That is
+    // exactly how a new arrival's row came to show the older message beneath
+    // it: the cursor had been shifted onto the older one by the insert, its
+    // fetch was still in flight, the user clicked the new (already cached)
+    // arrival, and the older body then arrived and painted over it. Clicking
+    // the same row again changes no cursor and so fetches nothing; only
+    // leaving the folder re-presented the right message.
+    const quint64 serial = ++m_bodyRequestSerial;
+    const auto stillWanted = [this, serial, uid] {
+        return serial == m_bodyRequestSerial && m_reading && m_reading->m_uid == uid;
+    };
 
     *connection = connect(
         m_backend, &MailBackend::bodyFetched, this,
-        [this, uid, remoteId, connection, answered](
+        [this, uid, remoteId, connection, answered, serial, stillWanted](
             const QString &folder, const QString &id,
             const std::shared_ptr<KMime::Message> &message) {
             if (id != remoteId || folder != m_selectedFolder || *answered)
@@ -8286,6 +8328,15 @@ void MailClient::requestMessageBody(int row, qint64 uid, const QString &remoteId
             *answered = true;
             disconnect(*connection);
 
+            if (!stillWanted()) {
+                // A newer request owns the spinner; a cached click that made
+                // none has nothing to wait for any more.
+                if (serial == m_bodyRequestSerial)
+                    setBusy(false);
+                qCDebug(logTrace) << "body for" << uid << "arrived after the reader moved on"
+                                  << "- cached, not shown";
+                return;
+            }
             setBusy(false);
             m_offlineFallback.reset(); // the real thing arrived; stub not needed
             presentMessage(message);
@@ -8299,7 +8350,7 @@ void MailClient::requestMessageBody(int row, qint64 uid, const QString &remoteId
             // message — which then opened as this one, from cache, forever.
             m_store.storeBody(m_selectedFolder, uid, m_reading->m_raw, indexText);
             refineAttachKind(m_selectedFolder, uid, message.get());
-            rescoreWithBody(m_selectedFolder, uid, message.get(), /*mayAutoFile=*/false);
+            rescoreWithBody(m_selectedFolder, uid, message.get());
             setStatus({});
             // The row-based side effects want the row this uid sits on NOW.
             const int liveRow = m_messageModel.rowForUid(uid);
@@ -8314,8 +8365,8 @@ void MailClient::requestMessageBody(int row, qint64 uid, const QString &remoteId
 
     m_backend->fetchBodies(
         m_selectedFolder, {remoteId},
-        [this, uid, remoteId, isRetry, connection, answered](MailBackend::Error error,
-                                                             const QString &message) {
+        [this, uid, remoteId, isRetry, connection, answered, serial, stillWanted](
+            MailBackend::Error error, const QString &message) {
             // The request finished. If bodyFetched() never came, nothing was
             // delivered — the callback is the only place that can tell, since
             // a body that never arrives emits no signal at all.
@@ -8323,6 +8374,15 @@ void MailClient::requestMessageBody(int row, qint64 uid, const QString &remoteId
                 return;
             *answered = true;
             disconnect(*connection);
+
+            // Same test as the delivery above. A failure for a message the
+            // user has already left must not blank the pane they moved on to,
+            // nor announce a load failure for something they are not loading.
+            if (!stillWanted()) {
+                if (serial == m_bodyRequestSerial)
+                    setBusy(false);
+                return;
+            }
 
             // A backend may decline a body request outright when its bulk
             // transfers are all busy, reporting success because for the

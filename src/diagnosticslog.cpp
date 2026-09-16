@@ -634,7 +634,30 @@ void DiagnosticsLog::copyToClipboard(bool redact) const
 void DiagnosticsLog::copyRange(int first, int last, bool redact) const
 {
     if (QClipboard *clipboard = QGuiApplication::clipboard())
-        clipboard->setText(rangeText(first, last, redact));
+        clipboard->setText(codeBlockText(first, last, redact));
+}
+
+QString DiagnosticsLog::codeBlockText(int first, int last, bool redact) const
+{
+    const QString body = rangeText(first, last, redact);
+    if (body.isEmpty())
+        return {};
+    // rangeText() ends every line with '\n', so the closing fence starts on
+    // its own line. A fence on the last line without a newline after it is
+    // what most Markdown renderers still accept, and what leaves no blank
+    // trailing line in a paste.
+    return QStringLiteral("```\n") + body + QStringLiteral("```");
+}
+
+int DiagnosticsLog::lastRowContaining(const QString &text) const
+{
+    if (text.isEmpty())
+        return -1;
+    for (int row = int(m_view.size()) - 1; row >= 0; --row) {
+        if (m_rows.at(m_view.at(row)).line.contains(text))
+            return row;
+    }
+    return -1;
 }
 
 QString DiagnosticsLog::saveTo(const QUrl &url, bool redact) const

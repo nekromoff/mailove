@@ -131,8 +131,19 @@ public:
     /// A negative \a first means all of them.
     Q_INVOKABLE QString rangeText(int first, int last, bool redact) const;
     Q_INVOKABLE void copyToClipboard(bool redact) const;
-    /// What the mouse selected, or everything when nothing is selected.
+    /// What the mouse selected, or everything when nothing is selected —
+    /// as codeBlockText(), so it pastes as a log wherever Markdown is read.
     Q_INVOKABLE void copyRange(int first, int last, bool redact) const;
+    /// rangeText() inside a ``` fence. What the clipboard gets: the place a
+    /// log is pasted is a bug tracker or a chat, both of which read Markdown,
+    /// and a log pasted bare there is reflowed into prose with its
+    /// underscores and asterisks eaten. The file (saveTo) stays bare — it is
+    /// a log file, not a document.
+    Q_INVOKABLE QString codeBlockText(int first, int last, bool redact) const;
+    /// The newest visible row whose line contains \a text, or -1. How the
+    /// status bar finds the line it is showing: the crumb is logged verbatim
+    /// under mailove.status, so the line that carries it is the one to select.
+    Q_INVOKABLE int lastRowContaining(const QString &text) const;
     /// Writes plainText() to \a url. Returns "" on success, else the reason.
     Q_INVOKABLE QString saveTo(const QUrl &url, bool redact) const;
     /// Empties both halves, in memory and on disk. What the user asks for
