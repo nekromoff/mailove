@@ -33,6 +33,28 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.6.1" date="2026-09-16" type="stable">
+      <description>
+        <ul>
+          <li>A reply-all that copies your own address is no longer marked
+              as spam: your server's own record of the authenticated
+              submission now vouches for it.</li>
+          <li>The single-hop rule no longer fires on your own server's
+              submission line, and the scorer no longer accuses www.
+              links when the Public Suffix List is not loaded yet.</li>
+          <li>A new arrival opened before the prefetch reached it is now
+              filed as spam like any other arrival; existing inbox mail
+              is still never moved.</li>
+          <li>The reading pane no longer shows the older message one row
+              down under a newly arrived one: a body fetched for a message
+              you had already left is no longer presented over the one you
+              moved to.</li>
+          <li>Clicking the status line opens the activity log on that
+              message, and copying from the log yields a fenced code
+              block.</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.6" date="2026-09-12" type="stable">
       <description>
         <ul>
