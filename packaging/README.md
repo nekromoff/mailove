@@ -10,8 +10,12 @@ cmake -B build -S . && cmake --build build --target package-deb
 
 That leaves `mailove_<version>_<arch>.deb` — the version being the one in
 `project()` — in the **project root**, not inside the build tree, and removes
-CPack's `_CPack_Packages` staging directory afterwards. `cd build && cpack -G DEB`
-still works and produces the same package, but leaves both where CPack put them.
+CPack's staging directory afterwards. Each generator stages in its own
+directory (`build/cpack-deb`, `build/cpack-rpm`) so that `--target packages`,
+which runs the .deb and .rpm steps in parallel, can't have one wipe the
+other's staging tree mid-run — that once produced a .deb with no files in it.
+`cd build && cpack -G DEB` still works and produces the same package, but
+leaves both where CPack put them.
 
 Shared-library `Depends` are computed by `dpkg-shlibdeps` from the machine
 that builds the package, so the .deb targets distros with the same-or-newer
