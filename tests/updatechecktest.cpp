@@ -60,6 +60,11 @@ int main(int argc, char *argv[])
     check(versionFrom("https://github.com/nekromoff/mailove/releases/tag/v3.1")
               == QLatin1String("3.1"),
           QStringLiteral("a future v-prefixed tag still parses"));
+    check(versionFrom("https://github.com/nekromoff/mailove/releases/tag/3.6.1")
+              == QLatin1String("3.6.1")
+              && versionFrom("https://github.com/nekromoff/mailove/releases/tag/v3.6.1")
+                     == QLatin1String("3.6.1"),
+          QStringLiteral("a three-part release tag, with or without v, yields 3.6.1"));
     check(versionFrom("https://github.com/nekromoff/mailove/releases/tag/3.1.4")
               == QLatin1String("3.1.4"),
           QStringLiteral("three components parse"));
@@ -102,6 +107,9 @@ int main(int argc, char *argv[])
         {"3.1", "3.1.0", false},
         {"3.1.0", "3.1", false},
         {"3.1.1", "3.1", true},
+        {"3.6.1", "3.6", true},   // the 3.6.1 release seen from a 3.6 install
+        {"3.6", "3.6.1", false},  // ...and not the other way round
+        {"3.6.1", "3.6.1", false},
         {"10.0", "9.9", true},
         {"4", "3.0", true},
     };

@@ -344,18 +344,26 @@ file(WRITE "${CMAKE_BINARY_DIR}/mailove-version.txt" "${PROJECT_VERSION}\n")
 # Named "packages", not "package": include(CPack) above already defines that
 # one, and it is the plain cpack run these targets wrap.
 #
-# CPack is run here rather than by hand because it also leaves _CPack_Packages
-# behind — a staging tree it repopulates from scratch every run, worth nothing
-# once the .deb exists. Removing it before and after keeps a stale layout from
-# a previous version out of the package and the build tree tidy afterwards.
-set(MAILOVE_CPACK_SCRATCH "${CMAKE_BINARY_DIR}/_CPack_Packages")
+# CPack is run here rather than by hand because it also leaves a staging tree
+# (_CPack_Packages) behind — repopulated from scratch every run, worth nothing
+# once the package exists. Removing it before and after keeps a stale layout
+# from a previous version out of the package and the build tree tidy afterwards.
+#
+# Each generator gets its own package directory (cpack -B). The `packages`
+# target runs package-deb and package-rpm in parallel under Ninja, and with a
+# shared staging tree one target's rm -rf landed between the other's install
+# and tar steps — that produced a .deb with a full Depends line and no files
+# at all (3.6.1 shipped that way once; dpkg -L reported "does not contain any
+# files"). Separate directories make the two runs independent.
+set(MAILOVE_CPACK_DEB_DIR "${CMAKE_BINARY_DIR}/cpack-deb")
 add_custom_target(package-deb
-    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILOVE_CPACK_SCRATCH}"
-    COMMAND ${CMAKE_CPACK_COMMAND} --config "${CMAKE_BINARY_DIR}/CPackConfig.cmake"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILOVE_CPACK_DEB_DIR}"
+    COMMAND ${CMAKE_CPACK_COMMAND} -B "${MAILOVE_CPACK_DEB_DIR}"
+            --config "${CMAKE_BINARY_DIR}/CPackConfig.cmake"
     COMMAND ${CMAKE_COMMAND} -E rename
-            "${CMAKE_BINARY_DIR}/${CPACK_DEBIAN_FILE_NAME}"
+            "${MAILOVE_CPACK_DEB_DIR}/${CPACK_DEBIAN_FILE_NAME}"
             "${CMAKE_SOURCE_DIR}/${CPACK_DEBIAN_FILE_NAME}"
-    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILOVE_CPACK_SCRATCH}"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILOVE_CPACK_DEB_DIR}"
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Packaging ${CPACK_DEBIAN_FILE_NAME} into the project root"
     VERBATIM)
@@ -363,13 +371,15 @@ add_dependencies(package-deb mailove mailove-docs)
 
 # Same recipe with the RPM generator: -G overrides the DEB default in the
 # shared config, so one configure serves both packages.
+set(MAILOVE_CPACK_RPM_DIR "${CMAKE_BINARY_DIR}/cpack-rpm")
 add_custom_target(package-rpm
-    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILOVE_CPACK_SCRATCH}"
-    COMMAND ${CMAKE_CPACK_COMMAND} -G RPM --config "${CMAKE_BINARY_DIR}/CPackConfig.cmake"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILOVE_CPACK_RPM_DIR}"
+    COMMAND ${CMAKE_CPACK_COMMAND} -G RPM -B "${MAILOVE_CPACK_RPM_DIR}"
+            --config "${CMAKE_BINARY_DIR}/CPackConfig.cmake"
     COMMAND ${CMAKE_COMMAND} -E rename
-            "${CMAKE_BINARY_DIR}/${CPACK_RPM_FILE_NAME}"
+            "${MAILOVE_CPACK_RPM_DIR}/${CPACK_RPM_FILE_NAME}"
             "${CMAKE_SOURCE_DIR}/${CPACK_RPM_FILE_NAME}"
-    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILOVE_CPACK_SCRATCH}"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${MAILOVE_CPACK_RPM_DIR}"
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Packaging ${CPACK_RPM_FILE_NAME} into the project root"
     VERBATIM)
