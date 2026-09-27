@@ -3860,6 +3860,14 @@ void MailClient::scoreHeader(MessageListModel::Header &h, const QString &folder,
     logSpamVerdict("head", folder, h.uid, SpamHeuristics::addressOf(h.from), s);
 }
 
+/// The arrival watch's key: account and folder path together, because every
+/// account has an "INBOX" and the same uid in two of them is two messages.
+/// \a folder may be scoped or plain; only its path is used.
+static QString spamWatchKey(const QString &account, const QString &folder)
+{
+    return account + QChar(0x1f) + folder.section(QChar(0x1f), -1);
+}
+
 void MailClient::rescoreWithBody(const QString &folder, qint64 uid, KMime::Message *msg)
 {
     if (!msg || uid <= 0 || !scoresSpamIn(folder))
@@ -3944,7 +3952,7 @@ void MailClient::rescoreWithBody(const QString &folder, qint64 uid, KMime::Messa
     // mark and stayed in the inbox for good. An arrival that scores spam is
     // filed, exactly as pressing "Mark as spam" on the open message removes
     // it from under the reader.
-    const auto watch = m_spamWatchArrivals.find(folder);
+    const auto watch = m_spamWatchArrivals.find(spamWatchKey(accountKey(), folder));
     if (watch != m_spamWatchArrivals.end() && watch->remove(uid)) {
         if (watch->isEmpty())
             m_spamWatchArrivals.erase(watch);
@@ -4375,35 +4383,6 @@ void MailClient::acquireToken(std::function<void(bool, const QString &)> done)
     }
     const auto provider = OAuthHelper::Provider(m_acct.authType);
 
-    // Built-in desktop-client IDs so sign-in needs no manual setup (same
-    // publicly-documented installed-app credentials Thunderbird ships; a
-    // clientId in the account config overrides them).
-    // Three places, most specific first: this account's own pair, then the
-    // advanced-settings pair (one registration for every account), then the
-    // built-ins. An own registration is the reason either override exists —
-    // Google's and Microsoft's quotas are per client id, not per user.
-    const bool gmail = provider == OAuthHelper::Gmail;
-    QString clientId = m_acct.clientId;
-    QString clientSecret = m_acct.clientSecret;
-    // Whether the pair in force is the advanced-settings one, whose secret is
-    // in the wallet rather than in advanced.conf and so has to be fetched.
-    bool advancedPair = false;
-    if (clientId.isEmpty()) {
-        clientId = AdvancedConfig::s(gmail ? "oauth/googleClientId" : "oauth/microsoftClientId");
-        clientSecret.clear();
-        advancedPair = !clientId.isEmpty();
-    }
-    if (clientId.isEmpty()) {
-        if (provider == OAuthHelper::Gmail) {
-            clientId = QStringLiteral(
-                "406964657835-aq8lmia8j95dhl1a2bvharmfk3t1hgqj.apps.googleusercontent.com");
-            clientSecret = QStringLiteral("kSmqreRr0qwBWJgbf5Y-PjSU");
-        } else {
-            clientId = QStringLiteral("9e5f94bc-e8a4-4e73-b8be-63364c29d753");
-            clientSecret.clear();
-        }
-    }
-
     setBusy(true);
     const auto start = [this, provider](const QString &id, const QString &secret) {
         if (!m_accounts.refreshToken().isEmpty()) {
@@ -4415,23 +4394,59 @@ void MailClient::acquireToken(std::function<void(bool, const QString &)> done)
         }
     };
 
-    if (advancedPair) {
-        // advanced.conf holds the client id and a placeholder; the secret
-        // itself is in the wallet, under the key AdvancedConfig named when it
-        // put it there. Absent is normal — most installed-app registrations
-        // have no secret — so a failed lookup carries on without one.
-        setStatus(tr("Reading sign-in details"));
-        auto *read = new QKeychain::ReadPasswordJob(kWalletService, this);
-        read->setKey(AdvancedConfig::walletKeyFor(gmail
-                                                      ? QStringLiteral("oauth/googleClientSecret")
-                                                      : QStringLiteral("oauth/microsoftClientSecret")));
-        connect(read, &QKeychain::Job::finished, this, [read, clientId, start] {
-            start(clientId, read->error() ? QString() : read->textData());
-        });
-        read->start();
-        return;
+    resolveOAuthClient(m_acct.authType, m_acct.clientId, m_acct.clientSecret, start);
+}
+
+void MailClient::resolveOAuthClient(
+    int authType, const QString &ownId, const QString &ownSecret,
+    const std::function<void(const QString &, const QString &)> &ready)
+{
+    // Built-in desktop-client IDs so sign-in needs no manual setup (same
+    // publicly-documented installed-app credentials Thunderbird ships; a
+    // clientId in the account config overrides them).
+    // Three places, most specific first: this account's own pair, then the
+    // advanced-settings pair (one registration for every account), then the
+    // built-ins. An own registration is the reason either override exists —
+    // Google's and Microsoft's quotas are per client id, not per user.
+    //
+    // Shared with the background poll on purpose: it used to pass the
+    // account's own pair alone, which is empty for every account that signed
+    // in with the defaults — so its refresh failed and the account was
+    // silently never polled.
+    const bool gmail = OAuthHelper::Provider(authType) == OAuthHelper::Gmail;
+    QString clientId = ownId;
+    QString clientSecret = ownSecret;
+    if (clientId.isEmpty()) {
+        clientId = AdvancedConfig::s(gmail ? "oauth/googleClientId" : "oauth/microsoftClientId");
+        clientSecret.clear();
+        if (!clientId.isEmpty()) {
+            // advanced.conf holds the client id and a placeholder; the secret
+            // itself is in the wallet, under the key AdvancedConfig named when
+            // it put it there. Absent is normal — most installed-app
+            // registrations have no secret — so a failed lookup carries on
+            // without one.
+            auto *read = new QKeychain::ReadPasswordJob(kWalletService, this);
+            read->setKey(AdvancedConfig::walletKeyFor(
+                gmail ? QStringLiteral("oauth/googleClientSecret")
+                      : QStringLiteral("oauth/microsoftClientSecret")));
+            connect(read, &QKeychain::Job::finished, this, [read, clientId, ready] {
+                ready(clientId, read->error() ? QString() : read->textData());
+            });
+            read->start();
+            return;
+        }
     }
-    start(clientId, clientSecret);
+    if (clientId.isEmpty()) {
+        if (gmail) {
+            clientId = QStringLiteral(
+                "406964657835-aq8lmia8j95dhl1a2bvharmfk3t1hgqj.apps.googleusercontent.com");
+            clientSecret = QStringLiteral("kSmqreRr0qwBWJgbf5Y-PjSU");
+        } else {
+            clientId = QStringLiteral("9e5f94bc-e8a4-4e73-b8be-63364c29d753");
+            clientSecret.clear();
+        }
+    }
+    ready(clientId, clientSecret);
 }
 
 void MailClient::connectAccount()
@@ -4634,8 +4649,9 @@ void MailClient::applyFolderListing(const QList<MailBackend::FolderInfo> &listed
     m_draftsFolder.clear();
     m_trashFolder.clear();
     m_junkFolder.clear();
-    // Another account's arrivals must not be auto-filed on this one's scores.
-    m_spamWatchArrivals.clear();
+    // The arrival watch is deliberately not among them: it is keyed by
+    // account (see spamWatchKey), and clearing it here threw away what the
+    // background poll had recorded for the very account now being opened.
     m_allMailFolder.clear();
 
     QList<FolderModel::Folder> folders;
@@ -5069,13 +5085,15 @@ MailStore::JournalOp MailClient::autoFileSpamArrivalsIn(const QString &account,
                                                      : h.remoteId);
         } else {
             kept.append(h);
-            // The watch is keyed by the unscoped folder name and consumed by
-            // the body prefetch, which only ever runs for the open account —
-            // so only its rows go in. Another account's uids under the same
-            // "INBOX" key would collide with the open inbox's, and file the
-            // wrong message when its body came in.
-            if (open && h.spamState < MessageListModel::SpamExempt)
-                m_spamWatchArrivals[folder].insert(h.uid);
+            // A background account's rows go in too, under that account's
+            // key. The body prefetch only runs for the open account, so
+            // theirs wait until the account is opened — but the poll stores
+            // them as already known, so no listing of the opened account
+            // ever calls them arrivals again, and without an entry here a
+            // body verdict over the threshold marked them and left them in
+            // the inbox for good.
+            if (h.spamState < MessageListModel::SpamExempt)
+                m_spamWatchArrivals[spamWatchKey(account, folder)].insert(h.uid);
         }
     }
     if (spam.isEmpty())
@@ -5777,29 +5795,40 @@ void MailClient::pollAccount(const QVariantMap &account, const std::function<voi
         // under the cache key, which for an imported account differs.
         read->setKey(QStringLiteral("oauth-refresh:") + user + QLatin1Char('@') + host);
         connect(read, &QKeychain::Job::finished, this,
-                [this, read, account, connectWith, done] {
+                [this, read, account, key, connectWith, done] {
             if (read->error() || read->textData().isEmpty()) {
+                qCWarning(logUnread) << "background poll:" << key
+                                     << "skipped — no stored sign-in to renew";
                 done();
                 return;
             }
-            auto *oauth = new OAuthHelper(this);
-            // authType is the provider id (see the foreground path).
-            const auto provider = OAuthHelper::Provider(
-                account.value(QStringLiteral("authType"), 0).toInt());
-            connect(oauth, &OAuthHelper::tokensReady, this,
-                    [oauth, connectWith](const QString &accessToken, const QString &,
-                                         const QDateTime &) {
-                oauth->deleteLater();
-                connectWith(accessToken);
+            const QString refreshToken = read->textData();
+            const int authType = account.value(QStringLiteral("authType"), 0).toInt();
+            // The same client pair the foreground sign-in would use — the
+            // token was issued to it, and no other can renew it.
+            resolveOAuthClient(
+                authType, account.value(QStringLiteral("clientId")).toString(),
+                account.value(QStringLiteral("clientSecret")).toString(),
+                [this, authType, refreshToken, key, connectWith,
+                 done](const QString &clientId, const QString &clientSecret) {
+                auto *oauth = new OAuthHelper(this);
+                connect(oauth, &OAuthHelper::tokensReady, this,
+                        [oauth, connectWith](const QString &accessToken, const QString &,
+                                             const QDateTime &) {
+                    oauth->deleteLater();
+                    connectWith(accessToken);
+                });
+                connect(oauth, &OAuthHelper::failed, this,
+                        [oauth, key, done](const QString &message) {
+                    qCWarning(logUnread) << "background poll:" << key
+                                         << "skipped — sign-in renewal failed:" << message;
+                    oauth->deleteLater();
+                    done();
+                });
+                // authType is the provider id (see the foreground path).
+                oauth->refresh(OAuthHelper::Provider(authType), clientId, clientSecret,
+                               refreshToken);
             });
-            connect(oauth, &OAuthHelper::failed, this, [oauth, done](const QString &) {
-                oauth->deleteLater();
-                done();
-            });
-            oauth->refresh(provider,
-                           account.value(QStringLiteral("clientId")).toString(),
-                           account.value(QStringLiteral("clientSecret")).toString(),
-                           read->textData());
         });
         read->start();
         return;
@@ -5807,8 +5836,11 @@ void MailClient::pollAccount(const QVariantMap &account, const std::function<voi
 
     auto *read = new QKeychain::ReadPasswordJob(kWalletService, this);
     read->setKey(AccountStore::walletKeyFor(user, host));
-    connect(read, &QKeychain::Job::finished, this, [read, connectWith, done] {
+    connect(read, &QKeychain::Job::finished, this, [read, key, connectWith, done] {
         if (read->error()) {
+            qCWarning(logUnread) << "background poll:" << key
+                                 << "skipped — the wallet gave no password:"
+                                 << read->errorString();
             done();
             return;
         }

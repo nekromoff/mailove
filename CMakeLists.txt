@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailove VERSION 3.6.1 LANGUAGES CXX)
+project(mailove VERSION 3.6.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -140,6 +140,18 @@ set_source_files_properties(src/qml/HoverToolTip.qml PROPERTIES QT_RESOURCE_ALIA
 set_source_files_properties(src/qml/SelectableValue.qml PROPERTIES QT_RESOURCE_ALIAS SelectableValue.qml)
 set_source_files_properties(src/qml/SandboxedWebView.qml PROPERTIES QT_RESOURCE_ALIAS SandboxedWebView.qml)
 set_source_files_properties(src/qml/ExpandableValue.qml PROPERTIES QT_RESOURCE_ALIAS ExpandableValue.qml)
+
+# Bytecode only, no QML-to-C++ compilation. The compiled functions call
+# QQmlPrivate::AOTCompiledContext, which Qt exports under the Qt_6_PRIVATE_API
+# symbol version — and Fedora and openSUSE rename that version per Qt release
+# (Qt_6.11.1_PRIVATE_API), so a binary built on Debian dies in the dynamic
+# linker there before main(): "version `Qt_6_PRIVATE_API' not found". Those
+# were the binary's only two private imports; packaging/rpm-find-requires.sh
+# hides the same thing from rpm's dependency check, which is why the package
+# installed and then would not start. The bytecode cache is kept, so startup
+# does not regress to parsing QML; only the C++ fast path for bindings goes.
+set_target_properties(mailove PROPERTIES
+    QT_QMLCACHEGEN_ARGUMENTS "--only-bytecode")
 
 qt_add_qml_module(mailove
     URI Mailove

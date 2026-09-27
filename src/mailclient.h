@@ -938,6 +938,11 @@ private:
     /// One account's check; \a done is called however it ends, so the queue
     /// keeps moving even when an account is unreachable.
     void pollAccount(const QVariantMap &account, const std::function<void()> &done);
+    /// Which OAuth client pair an account signs in with: its own, else the
+    /// advanced-settings one (secret from the wallet, hence asynchronous),
+    /// else the built-in. One answer for the foreground and the poll.
+    void resolveOAuthClient(int authType, const QString &ownId, const QString &ownSecret,
+                            const std::function<void(const QString &, const QString &)> &ready);
     /// Second half of one account's check: the mail behind the counts. Syncs
     /// whatever is newer than the cache into every folder of a background
     /// account, on the short-lived \a backend the poll already holds and under
@@ -1370,10 +1375,12 @@ private:
     QString m_trashFolder;
     QString m_junkFolder;
     /// New arrivals that scored under the threshold at the header stage,
-    /// per folder — the candidates the body re-score may yet auto-file (the
-    /// junk-content-match rule cannot fire before the body exists). Fed only
-    /// by autoFileSpamArrivals(), so backfilled history never qualifies;
-    /// an entry is spent by its first body re-score, whichever way it goes.
+    /// per account and folder — the candidates the body re-score may yet
+    /// auto-file (the junk-content-match rule cannot fire before the body
+    /// exists). Fed only by autoFileSpamArrivalsIn(), so backfilled history
+    /// never qualifies; an entry is spent by its first body re-score,
+    /// whichever way it goes. A background account's entries wait here until
+    /// it is opened, which is the first time its bodies are fetched at all.
     QHash<QString, QSet<qint64>> m_spamWatchArrivals;
     /// Whether m_selectedFolder is the junk one, decided when it is set rather
     /// than on every ask — see viewingJunkFolder().

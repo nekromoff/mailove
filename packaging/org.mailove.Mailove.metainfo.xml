@@ -33,6 +33,25 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.6.2" date="2026-09-27" type="stable">
+      <description>
+        <ul>
+          <li>The RPM now starts on Fedora and openSUSE: the binary no
+              longer imports Qt private symbols whose version those
+              distributions rename per Qt release.</li>
+          <li>A Gmail account set up over plain IMAP with the normal
+              Google password now gets a login error that says what to do
+              (use the Gmail account type or an app password), and the
+              account sheet says the same up front.</li>
+          <li>Gmail and Microsoft accounts using their own OAuth client
+              pair are now included in the background unread poll.</li>
+          <li>Spam candidates arriving in a background account are still
+              filed when that account is opened.</li>
+          <li>The AppImage no longer logs a portal registration failure
+              on every launch.</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.6.1" date="2026-09-16" type="stable">
       <description>
         <ul>

@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 #include <QGuiApplication>
 #include <QStyleHints>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QStandardPaths>
@@ -141,7 +142,36 @@ int main(int argc, char *argv[])
     // app_id, which Qt takes from the desktop file name — it must be the
     // desktop entry's basename, not the application name. X11 uses the window
     // icon instead, so set both.
-    QGuiApplication::setDesktopFileName(QStringLiteral("org.mailove.Mailove"));
+    //
+    // The AppImage has no entry on the host under that name: either none at
+    // all (run straight from Downloads) or the one AppImageLauncher/appimaged
+    // wrote, which is prefixed — appimagekit_<hash>-org.mailove.Mailove. Take
+    // whichever is there, so the icon matches; with none, leave the name
+    // unset rather than announce an id the host cannot resolve, which Qt
+    // reports on every launch as "Failed to register with host portal … App
+    // info not found".
+    QString desktopId = QStringLiteral("org.mailove.Mailove");
+    if (!qEnvironmentVariableIsEmpty("APPIMAGE")) {
+        const QString self = qEnvironmentVariable("APPDIR");
+        QString found;
+        const QStringList dirs =
+            QStandardPaths::standardLocations(QStandardPaths::ApplicationsLocation);
+        for (const QString &dir : dirs) {
+            // Not the copy inside the mounted image: XDG_DATA_DIRS leads
+            // with it (see the AppRun hook), and the portal never sees it.
+            if (!self.isEmpty() && dir.startsWith(self))
+                continue;
+            const QStringList hits = QDir(dir).entryList(
+                {QStringLiteral("*org.mailove.Mailove.desktop")}, QDir::Files);
+            if (!hits.isEmpty()) {
+                found = QFileInfo(hits.first()).completeBaseName();
+                break;
+            }
+        }
+        desktopId = found;
+    }
+    if (!desktopId.isEmpty())
+        QGuiApplication::setDesktopFileName(desktopId);
 
     // Where the spare copy of the settings is taken from at exit. Nothing is
     // read from the backup here or anywhere else — see settingsbackup.h.

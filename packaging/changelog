@@ -1,3 +1,30 @@
+mailove (3.6.2) unstable; urgency=medium
+
+  * The RPM installed on Fedora and openSUSE but would not start:
+    "version `Qt_6_PRIVATE_API' not found". The QML compiler pulled in
+    two Qt private symbols whose version those distributions rename per
+    Qt release. QML is now compiled to bytecode only; the binary has no
+    private Qt imports left (GitHub #5).
+  * Gmail set up as a plain IMAP account with the normal Google password
+    fails to log in once 2-Step Verification is on, and the server's
+    reply was elided to "Application specif..." in the status bar. The
+    login error now says what to do (use the Gmail / Google Workspace
+    account type, or an app password), and the account sheet says the
+    same when the IMAP server is a Gmail one (GitHub #5).
+  * A Gmail or Microsoft account signed in with its own or the advanced
+    settings' client pair was skipped by every background poll, so its
+    unread count never updated while another account was open. The poll
+    resolves the client pair the same way the foreground does; a skipped
+    account is now logged with the reason.
+  * New arrivals in a background account that were spam candidates
+    pending their body are remembered per account, so they are still
+    filed when that account is opened instead of being forgotten.
+  * The AppImage no longer logs "Failed to register with host portal …
+    App info not found" on every launch: it announces the desktop entry
+    AppImageLauncher wrote if there is one, and none otherwise.
+
+ -- dusoft <dusoft@bastadigital.com>  Sat, 27 Sep 2026 12:00:00 +0200
+
 mailove (3.6.1) unstable; urgency=medium
 
   * A reply-all that copies your own address is no longer marked as spam.

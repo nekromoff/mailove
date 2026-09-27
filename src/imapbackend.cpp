@@ -5,6 +5,7 @@
 
 #include "advancedconfig.h"
 
+#include <QCoreApplication>
 #include <QDebug>
 #include <QDateTime>
 #include <QLoggingCategory>
@@ -148,6 +149,28 @@ std::shared_ptr<KMime::Message> buildMessage(const RawMessage &raw)
     message->setFrozen(true);
     message->parse();
     return message;
+}
+
+/// Turns the one login refusal people actually hit into an instruction.
+/// Gmail answers a plain LOGIN with the account's normal Google password with
+/// "NO [ALERT] Application-specific password required: <url>" whenever
+/// 2-Step Verification is on — and the status bar elides the reply to
+/// "Application specif...", which nobody can act on (issue #5). The server's
+/// own words are kept for the error dialog; the remedy goes in front.
+QString explainLoginFailure(const QString &serverReply)
+{
+    if (serverReply.contains(QLatin1String("Application-specific password"),
+                             Qt::CaseInsensitive)) {
+        return QCoreApplication::translate(
+                   "ImapBackend",
+                   "Google rejected the password: this account uses 2-Step "
+                   "Verification, so IMAP needs either the \"Gmail / Google "
+                   "Workspace\" account type (signs in through your browser) or "
+                   "an app password from myaccount.google.com/apppasswords in "
+                   "place of your normal password.")
+               + QLatin1String("\n\n") + serverReply;
+    }
+    return serverReply;
 }
 
 /// Mirrors MailClient::Security, which is the enum the account settings and
@@ -312,7 +335,7 @@ void ImapBackend::connectAccount(const Credentials &credentials)
     configureLogin(login);
     connect(login, &KJob::result, this, [this](KJob *job) {
         if (job->error()) {
-            const QString message = job->errorString();
+            const QString message = explainLoginFailure(job->errorString());
             closeSessions();
             setConnected(false);
             Q_EMIT errorOccurred(Error::Auth, message);

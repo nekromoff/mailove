@@ -1077,6 +1077,24 @@ Item {
                         smtpHostField.text = sheet.derivedSmtpHost(text)
                 }
             }
+            // Gmail over plain IMAP is the one setup that looks right and
+            // never logs in: Google refuses the account password once 2-Step
+            // Verification is on (issue #5), and its reply arrives elided in
+            // the status bar. Said here, where the choice is made.
+            QQC2.Label {
+                visible: sheet.imapServerAccount
+                         && /(^|\.)(gmail|googlemail)\.com$/i.test(hostField.text.trim())
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                wrapMode: Text.Wrap
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                text: "This is a Gmail server. Google does not accept your normal "
+                      + "password over IMAP once 2-Step Verification is on: pick "
+                      + "the \"Gmail / Google Workspace\" account type above, or "
+                      + "enter an app password from "
+                      + "myaccount.google.com/apppasswords below."
+            }
             QQC2.SpinBox {
                 id: portField
                 visible: sheet.imapServerAccount
