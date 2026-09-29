@@ -82,8 +82,8 @@ wrong for your distro.
 
 - Full build toolchain and Mailove's build deps: Qt6 (Core, Gui, Network, Qml,
   Quick, QuickControls2, Sql, **WebEngineQuick**), KPim6 IMAP/Mime/SMTP, qtkeychain.
-- **Internet on first run** — the script downloads `linuxdeploy` and
-  `linuxdeploy-plugin-qt` into `./tools` (cached afterwards).
+- **Internet on first run** — the script downloads `linuxdeploy`,
+  `linuxdeploy-plugin-qt` and `appimagetool` into `./tools` (cached afterwards).
 - **FUSE** to *run* the produced AppImage (not needed to build it).
 
 ## Why the script does extra work
@@ -105,6 +105,26 @@ bundling for this app:
 3. **Breeze icon theme** — the UI uses named icons (`mail-attachment`, etc.);
    without a bundled theme they render blank. The hook prepends the bundled
    `share` to `XDG_DATA_DIRS`.
+
+It also bundles the **C library**, which linuxdeploy never does. Everything in
+the bundle is linked against the build system's glibc (2.38+ when built on
+Ubuntu 24.04), and an older host refused to load it — on Ubuntu 22.04 or
+Debian 12 the AppImage exited before showing a window. `usr/lib/compat` now
+carries glibc, `libstdc++`, `libgcc_s` and the other excludelisted libraries
+the bundle needs newer versions of (freetype, harfbuzz, fontconfig, …), and
+the dynamic loader sits in `usr/bin`.
+
+The AppRun hook picks at startup:
+
+- **Host glibc at least as new as the bundle needs** — the host's own is used,
+  exactly as before. Its GPU drivers are built against it and would not load
+  under an older one.
+- **Older host glibc (or none, e.g. musl)** — the app, and WebEngine's helper
+  via `usr/libexec/QtWebEngineProcess.compat`, run through the bundled loader
+  with `--library-path`. Not `LD_LIBRARY_PATH`, which would leak into host
+  programs the app starts.
+
+`MAILOVE_BUNDLED_GLIBC=1` or `=0` forces either path, for testing.
 
 ## Runtime notes
 

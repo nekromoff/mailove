@@ -22,6 +22,10 @@
 #                          plus Kirigami and the QQC2 desktop implementation.
 #   3. Breeze icons      — the UI references named icons (mail-attachment, …).
 #
+# It also carries its own C library (step 6), which linuxdeploy never bundles:
+# without it the AppImage ran only on hosts with the build system's glibc or
+# newer, and exited before showing a window on anything older.
+#
 set -euo pipefail
 
 # --- paths ---------------------------------------------------------------
@@ -83,6 +87,11 @@ base="https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous"
 qtbase="https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous"
 fetch "$base/linuxdeploy-x86_64.AppImage"                 "$tools_dir/linuxdeploy"
 fetch "$qtbase/linuxdeploy-plugin-qt-x86_64.AppImage"     "$tools_dir/linuxdeploy-plugin-qt"
+# Packs the AppDir. linuxdeploy's --output appimage cannot be used: the C
+# library goes in after linuxdeploy has deployed (step 6), and a second
+# linuxdeploy pass would rewrite the bundled loader and libc like any other ELF.
+fetch "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" \
+      "$tools_dir/appimagetool"
 export PATH="$tools_dir:$PATH"
 
 # --- 2. configure + build + install into AppDir --------------------------
@@ -264,7 +273,7 @@ esac
 HOOK
 chmod +x "$hooks/mailove-env.sh"
 
-# --- 5. deploy Qt + pack the AppImage ------------------------------------
+# --- 5. deploy Qt --------------------------------------------------------
 log "Running linuxdeploy + Qt plugin"
 # QML_SOURCES_PATHS points the Qt plugin at our QML so it can trace imports.
 # (EXTRA_QT_MODULES="waylandcompositor" used to be set here "for wayland" —
@@ -278,12 +287,164 @@ cd "$here"
   --appdir "$appdir" \
   --plugin qt \
   --desktop-file "$appdir/usr/share/applications/org.mailove.Mailove.desktop" \
-  --icon-file "$appdir/usr/share/icons/hicolor/scalable/apps/org.mailove.Mailove.svg" \
-  --output appimage
+  --icon-file "$appdir/usr/share/icons/hicolor/scalable/apps/org.mailove.Mailove.svg"
 
-# linuxdeploy names it from the desktop file, unversioned; normalise to $output.
-produced="$(ls -t "$here"/Mailove*.AppImage 2>/dev/null | head -1 || true)"
-if [[ -n "$produced" && "$produced" != "$output" ]]; then
-  mv -f "$produced" "$output"
+# --- 6. bundle the C library ---------------------------------------------
+# linuxdeploy leaves glibc (and libstdc++, freetype, … — its excludelist) to
+# the host. The bundle is linked against this build system's versions, so a
+# host with older ones cannot load it at all: on Ubuntu 22.04 / Debian 12 the
+# AppImage exited at once with "GLIBC_2.38 not found". It now carries them in
+# usr/lib/compat, and the AppRun hook (below) loads them through the bundled
+# dynamic loader — but only on a host too old for the bundle, since a newer
+# host's GPU drivers need its own, newer glibc.
+#
+# usr/lib/compat is deliberately not on any RUNPATH: under the host's loader
+# (the newer-host case) a libc.so.6 found through $ORIGIN/../lib would be
+# loaded into a process whose loader belongs to another glibc, and crash.
+log "Bundling the C library"
+# The glibc the bundle needs, read before compat/ exists to skew it.
+# objdump fails on the scripts and data among them; that is not an error here.
+glibc_needed="$({ find "$appdir/usr" -type f \( -name '*.so*' -o -perm -u+x \) \
+                    -exec objdump -T {} + 2>/dev/null || true; } \
+                | grep -o 'GLIBC_2\.[0-9]*' | sed 's/GLIBC_//' | sort -uV | tail -1)"
+[[ -n "$glibc_needed" ]] || { echo "could not work out the glibc the bundle needs" >&2; exit 1; }
+
+compat="$appdir/usr/lib/compat"
+rm -rf "$compat"; mkdir -p "$compat"
+# One read of the cache: piping ldconfig into an awk that exits early trips
+# pipefail on the SIGPIPE.
+ldcache="$(ldconfig -p)"
+syslib() { awk -v l="$1" '$1==l && /x86-64/{print $NF; exit}' <<<"$ldcache"; }
+libc_dir="$(dirname "$(syslib libc.so.6)")"
+
+# glibc itself. The stub libraries (libpthread, libdl, …) are empty since 2.34
+# but must still come from here: an older host library that links them would
+# otherwise pull the host's full, older copies in next to this libc.
+for l in libc.so.6 libm.so.6 libmvec.so.1 libresolv.so.2 libpthread.so.0 libdl.so.2 \
+         librt.so.1 libutil.so.1 libanl.so.1 libnss_files.so.2 libnss_dns.so.2; do
+  cp -L "$libc_dir/$l" "$compat/"
+done
+# The loader goes in usr/bin, not compat/: run through it, /proc/self/exe is
+# the loader, and Qt takes the application directory — where it looks for
+# qt.conf — from that. Next to the app it finds the same qt.conf as before.
+install -Dm755 "$(readlink -f "$libc_dir/ld-linux-x86-64.so.2")" \
+               "$appdir/usr/bin/ld-linux-x86-64.so.2"
+# iconv modules use glibc-private symbols, so the host's do not load under this
+# libc; the hook points GCONV_PATH here.
+cp -a "$libc_dir/gconv" "$compat/gconv"
+
+# The rest of what linuxdeploy leaves to the host and the bundle was linked
+# against newer versions of, plus whatever of their dependencies the AppDir does
+# not already have. Graphics drivers and the X11/Wayland/ALSA client libraries
+# stay the host's however old: they must match the running system, and their
+# ABI does not move.
+keep_host='^(libGL|libEGL|libGLX|libGLdispatch|libOpenGL|libgbm|libdrm|libX|libxcb|libwayland|libasound|libICE|libSM|libcom_err|libvulkan)'
+declare -A seen=()
+queue=()
+for l in libstdc++.so.6 libgcc_s.so.1 libfreetype.so.6 libharfbuzz.so.0 libfontconfig.so.1 \
+         libexpat.so.1 libz.so.1 libgmp.so.10 libgpg-error.so.0; do
+  p="$(syslib "$l")"
+  [[ -n "$p" ]] || { echo "$l not found on the build system" >&2; exit 1; }
+  queue+=("$p")
+done
+while ((${#queue[@]})); do
+  p="${queue[0]}"; queue=("${queue[@]:1}")
+  n="$(basename "$p")"
+  [[ -n "${seen[$n]:-}" ]] && continue
+  seen[$n]=1
+  cp -L "$p" "$compat/$n"
+  while read -r dep path; do
+    [[ -e "$compat/$dep" || -e "$appdir/usr/lib/$dep" ]] && continue
+    [[ "$dep" =~ $keep_host || "$dep" =~ ^(libc|libm|libpthread|libdl|librt|ld-linux)[.-] ]] && continue
+    queue+=("$path")
+  done < <(ldd "$p" | awk '$2=="=>" && $3 ~ /^\//{print $1, $3}')
+done
+
+# WebEngine starts its helper by path, as a new program, so it would get the
+# host's loader; this wrapper runs it the way the hook runs the app.
+cat > "$appdir/usr/libexec/QtWebEngineProcess.compat" <<'WRAP'
+#!/bin/sh
+# QtWebEngineProcess through the bundled loader. QTWEBENGINEPROCESS_PATH points
+# here only when the app itself runs that way (see apprun-hooks/mailove-env.sh).
+usr="$(dirname "$(readlink -f "$0")")/.."
+exec "$usr/bin/ld-linux-x86-64.so.2" \
+     --library-path "$usr/lib/compat:$usr/lib" \
+     --argv0 "$usr/libexec/QtWebEngineProcess" \
+     "$usr/libexec/QtWebEngineProcess" "$@"
+WRAP
+chmod +x "$appdir/usr/libexec/QtWebEngineProcess.compat"
+
+# Appended to the hook from step 4, which linuxdeploy's AppRun already sources:
+# a hook added now would not be in its list. It execs, so it must stay last.
+sed "s/@GLIBC_NEEDED@/$glibc_needed/g" >> "$hooks/mailove-env.sh" <<'HOOK'
+
+# Bundled C library (usr/lib/compat). The libraries here need glibc
+# @GLIBC_NEEDED@; an older host cannot load them, so on one the app runs on the
+# bundled glibc through the bundled loader. A host at least as new keeps its own:
+# its GPU drivers are built against it and would not load under an older one.
+# getconf reports the running glibc, and is absent on musl, which has none to
+# use. MAILOVE_BUNDLED_GLIBC=1 or 0 forces the choice.
+_glibc_have="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')"
+_glibc_need="@GLIBC_NEEDED@"
+case "${MAILOVE_BUNDLED_GLIBC:-}" in
+  1) _use_bundled=1 ;;
+  0) _use_bundled=0 ;;
+  *) if [[ -n "$_glibc_have" ]] \
+        && [[ "$(printf '%s\n%s\n' "$_glibc_need" "$_glibc_have" | sort -V | head -1)" == "$_glibc_need" ]]; then
+       _use_bundled=0
+     else
+       _use_bundled=1
+     fi ;;
+esac
+if [[ $_use_bundled == 1 ]]; then
+  # --library-path, not LD_LIBRARY_PATH: the variable would reach every host
+  # program the app starts (xdg-open, the browser) and load this glibc under
+  # the host's loader. --argv0 keeps the name the app sees its own.
+  export GCONV_PATH="$here/usr/lib/compat/gconv"
+  export QTWEBENGINEPROCESS_PATH="$here/usr/libexec/QtWebEngineProcess.compat"
+  exec "$here/usr/bin/ld-linux-x86-64.so.2" \
+       --library-path "$here/usr/lib/compat:$here/usr/lib" \
+       --argv0 "$here/usr/bin/mailove" \
+       "$here/usr/bin/mailove" "$@"
 fi
-log "Done: $output"
+unset _glibc_have _glibc_need _use_bundled
+HOOK
+
+# --- 7. metadata for AppImage checkers -----------------------------------
+# AppImageHub's checker and appimagetool look for AppStream data under the
+# older .appdata.xml name only, and reported it missing next to our
+# .metainfo.xml. Same file, both names.
+ln -sf org.mailove.Mailove.metainfo.xml \
+       "$appdir/usr/share/metainfo/org.mailove.Mailove.appdata.xml"
+
+# .DirIcon is what file managers use as the AppImage's thumbnail, and it has
+# to be a PNG — linuxdeploy points it at the SVG. Render one; the SVG stays for
+# the desktop entry. Whichever renderer the build system has.
+log "Rendering the PNG icon"
+svg="$appdir/usr/share/icons/hicolor/scalable/apps/org.mailove.Mailove.svg"
+png="$appdir/usr/share/icons/hicolor/256x256/apps/org.mailove.Mailove.png"
+mkdir -p "$(dirname "$png")"
+if command -v rsvg-convert >/dev/null; then
+  rsvg-convert -w 256 -h 256 "$svg" -o "$png"
+elif command -v inkscape >/dev/null; then
+  inkscape "$svg" -w 256 -h 256 -o "$png" >/dev/null 2>&1
+elif command -v convert >/dev/null; then
+  convert -background none -density 384 "$svg" -resize 256x256 "$png"
+fi
+if [[ -s "$png" ]]; then
+  cp "$png" "$appdir/org.mailove.Mailove.png"
+  ln -sf org.mailove.Mailove.png "$appdir/.DirIcon"
+else
+  echo "warning: no SVG renderer (rsvg-convert, inkscape or convert) —" \
+       ".DirIcon stays an SVG" >&2
+fi
+
+# --- 8. pack the AppImage ------------------------------------------------
+log "Packing $(basename "$output")"
+# Update information, so AppImageUpdate and friends can fetch the next release
+# by delta. It points at the .zsync of the latest GitHub release, which
+# appimagetool writes next to the AppImage — upload both to the release.
+# UPDATE_INFORMATION overrides it (as with linuxdeploy); empty leaves it out.
+update_info="${UPDATE_INFORMATION-gh-releases-zsync|nekromoff|mailove|latest|Mailove-*-x86_64.AppImage.zsync}"
+ARCH=x86_64 "$tools_dir/appimagetool" ${update_info:+-u "$update_info"} "$appdir" "$output"
+log "Done: $output (hosts below glibc $glibc_needed run on the bundled one)"
