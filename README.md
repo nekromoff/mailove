@@ -1,6 +1,6 @@
 # Mailove
 
-The fast KDE-first email client.
+The fast, friendly KDE-first email client.
 
 <img width="300" height="300" alt="org mailove Mailove" src="https://github.com/user-attachments/assets/67841075-7f20-4e41-a6ca-7814b1988757" />
 
@@ -13,8 +13,8 @@ Security-minded KDE-first IMAP and JMAP mail client, blazing fast.
 
 ### General
 - **IMAP, JMAP, Gmail/365 OAuth** - multiple accounts supported. IMAP against any server (SSL/TLS, STARTTLS, plain), password or OAuth 2 for Gmail and Microsoft 365; JMAP (RFC 8620/8621) discovers its own endpoints from the address and authenticates with an API token or a password.
-- **Push, or polling where there is none** - IMAP IDLE and JMAP EventSource both land as "something changed there"; what changed is then fetched the ordinary way. A timed refresh covers servers offering neither.
-- **Every account stays current, not just the open one** - the same refresh syncs the accounts you are not looking at: inbox first, then their other folders.
+- **Push or poll** - IMAP IDLE and JMAP EventSource both land as "something changed there"; what changed is then fetched the ordinary way. A timed refresh covers servers offering neither.
+- **Multiple accounts** - all accounts synced - inbox first, then their other folders.
 - **Local cache with full-text search** - headers, read bodies and folders in SQLite: folders open instantly, offline included. FTS5 (accent-folding) + a case-insensitive regex.
 - **Spam handling** - around 50 heuristic rules, not just the `X-Spam-*` headers: impersonation, homograph and zero-width tricks, phishing links, password forms in the body, dangerous attachments etc. A red **!** marks Spam - mouseover lists every rule that fired - everything explained. Older spam is cleared out automatically.
 
@@ -30,6 +30,7 @@ Security-minded KDE-first IMAP and JMAP mail client, blazing fast.
 - **Copy as Markdown** - copy full messages or selection as Markdown easily
 - **Sender images** - optional Gravatar avatars, **off by default**; Turn on with `avatars/enabled` in Advanced settings.
 - **Advanced settings** - for power users. All configs missing from the Settings can be edited (sync pacing, connection counts, protocol timeouts, spam weights, cache thresholds, sender pictures) in text area with a searchable reference beside the editor. Out-of-range values are corrected, unknown keys ignored with a warning. Clearing the file restores stock behaviour.
+- **Bulk send** - a hidden feature that helps users sending the same email individually to multiple recipients.
 
 ### Security & safety
 - **Secure credential storage** - passwords and OAuth tokens in KWallet via Qt6Keychain. OAuth client secrets in Advanced settings are moved to the wallet and scrubbed.

@@ -1,4 +1,4 @@
-The fast KDE-first email client
+The fast, friendly KDE-first email client
 
 (c) 2026 Daniel Duris, dusoft@staznosti.sk
 
