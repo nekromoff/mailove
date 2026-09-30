@@ -33,6 +33,25 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.7.0" date="2026-09-30" type="stable">
+      <description>
+        <ul>
+          <li>Bulk sending (off by default, enabled in the advanced
+              settings): a Bulk checkbox turns the To field into a list
+              and Send into hold-to-send; every address gets its own
+              message, sent one after another through the Outbox on a
+              connection of its own, with progress and Cancel in the top
+              bar. Switching accounts while it runs does not interrupt
+              it.</li>
+          <li>Cancelling the passphrase prompt during a bulk send cancels
+              the whole send with nothing queued.</li>
+          <li>Links in the composer: typed addresses become links, and
+              Ctrl+K edits a link's text and target separately.</li>
+          <li>A GUI freeze longer than two seconds now logs a backtrace
+              under its "stalled" line, so it can be located.</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.6.2" date="2026-09-27" type="stable">
       <description>
         <ul>

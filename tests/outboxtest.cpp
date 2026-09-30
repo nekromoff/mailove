@@ -188,6 +188,90 @@ int main(int argc, char **argv)
     check(store.outboxCount(account) == 1,
           QStringLiteral("…and nobody else's"));
 
+    // --- bulk batches ---------------------------------------------------------
+
+    out() << "outbox: bulk batches" << Qt::endl;
+    store.dropAccountOutbox(account);
+    check(store.activeOutboxBatch(account) == 0,
+          QStringLiteral("no batch on an empty queue"));
+    QList<MailStore::OutboxMessage> batchRows;
+    for (int n = 0; n < 4; ++n) {
+        batchRows.append(makeRow(QByteArray("bulk-") + QByteArray::number(n),
+                                 {QStringLiteral("r%1@example.com").arg(n)}));
+    }
+    const qint64 batch = store.enqueueOutboxBatch(batchRows);
+    check(batch != 0, QStringLiteral("a batch enqueues"));
+    check(store.outboxCount(account) == 4, QStringLiteral("…with every row of it"));
+    {
+        const auto rows = store.outboxMessages(account);
+        bool allTagged = rows.size() == 4;
+        for (const auto &r : rows)
+            allTagged = allTagged && r.batch == batch && r.batchTotal == 4;
+        check(allTagged, QStringLiteral("every row carries the batch id and its size"));
+        check(!rows.isEmpty() && rows.first().id == batch,
+              QStringLiteral("the batch id is the first row's id"));
+    }
+    check(store.activeOutboxBatch(account) == batch,
+          QStringLiteral("the batch is the active one"));
+    auto progress = store.outboxBatchProgress(account, batch);
+    check(progress.total == 4 && progress.remaining == 4 && progress.failed == 0,
+          QStringLiteral("progress starts at 0 of 4"));
+
+    // The ordinary drain never sees a batch row; the batch drain does.
+    check(store.nextOutboxMessage(account, now + 1).id == 0,
+          QStringLiteral("the ordinary drain skips batch rows"));
+    check(store.outboxNextTry(account) == 0,
+          QStringLiteral("…and does not arm its timer for them"));
+    check(store.nextOutboxBatchMessage(account, batch, now + 1).id == batch,
+          QStringLiteral("the batch drain gets them, oldest first"));
+
+    // Two go out, one is rejected: the counts follow the rows.
+    {
+        auto next = store.nextOutboxBatchMessage(account, batch, now + 1);
+        store.markOutboxSending(next.id);
+        store.dropOutboxMessage(next.id);
+        next = store.nextOutboxBatchMessage(account, batch, now + 1);
+        store.dropOutboxMessage(next.id);
+        next = store.nextOutboxBatchMessage(account, batch, now + 1);
+        store.recordOutboxFailure(next.id, QStringLiteral("550 no such user"), 0, true);
+    }
+    progress = store.outboxBatchProgress(account, batch);
+    check(progress.total == 4 && progress.remaining == 1 && progress.failed == 1,
+          QStringLiteral("2 sent, 1 failed, 1 to go: total stays 4 with rows gone"));
+    check(store.activeOutboxBatch(account) == batch,
+          QStringLiteral("a batch with a row still queued is still active"));
+
+    // A non-batch send queued behind it does not join it.
+    const qint64 loneId = store.enqueueOutbox(makeRow("lone", {QStringLiteral("x@example.com")}));
+    check(store.outboxMessage(loneId).batch == 0,
+          QStringLiteral("a plain send after a batch is not part of it"));
+    check(store.nextOutboxMessage(account, now + 1).id == loneId,
+          QStringLiteral("…and the ordinary drain picks it up past the batch"));
+    progress = store.outboxBatchProgress(account, batch);
+    check(progress.total == 4 && progress.remaining == 1,
+          QStringLiteral("…and does not count towards it"));
+
+    // Cancel drops what has not gone out — the failed row included — and
+    // leaves a row on the wire alone.
+    {
+        const auto last = store.nextOutboxBatchMessage(account, batch, now + 1);
+        store.markOutboxSending(last.id);
+        check(store.dropOutboxBatch(account, batch) == 1,
+              QStringLiteral("cancel drops the failed row, not the one on the wire"));
+        check(store.outboxMessage(last.id).id == last.id,
+              QStringLiteral("…which is still there"));
+        progress = store.outboxBatchProgress(account, batch);
+        check(progress.remaining == 1 && progress.failed == 0,
+              QStringLiteral("progress reflects the cancel"));
+        store.dropOutboxMessage(last.id);
+    }
+    check(store.activeOutboxBatch(account) == 0,
+          QStringLiteral("a batch with nothing left to send is over"));
+    check(store.outboxBatchProgress(account, batch).total == 0,
+          QStringLiteral("…and reports no total once its rows are gone"));
+    check(store.outboxCount(account) == 1,
+          QStringLiteral("the plain send is untouched by all of it"));
+
     out() << (failures == 0 ? QStringLiteral("all checks passed")
                             : QStringLiteral("%1 check(s) FAILED").arg(failures))
           << Qt::endl;

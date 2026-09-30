@@ -535,7 +535,10 @@ public:
 
     /// Remembers an address mail was sent to (compose autocompletion).
     /// Repeated adds bump a use counter that ranks the suggestions.
-    void addRecipient(const QString &address, const QString &name = {});
+    /// \a account overrides the open one — a bulk send's leg records its
+    /// recipients under the account it sends for, whichever is open.
+    void addRecipient(const QString &address, const QString &name = {},
+                      const QString &account = {});
     /// Known recipient addresses matching \a prefix (substring of the address
     /// or display name), best-ranked first.
     QStringList recipientCompletions(const QString &prefix, int limit = 8);
@@ -806,6 +809,20 @@ public:
         /// only addresses, subject and body, and silently dropping the rest
         /// would be data loss dressed as a feature.
         bool hasAttachments = false;
+        /// Non-zero on a row that is one message of a bulk send: the id of the
+        /// batch's first row, shared by every row enqueued with it. The drain
+        /// paces batch rows and the progress banner counts them.
+        qint64 batch = 0;
+        /// How many rows the batch started with, on every row of it, so the
+        /// "12 of 340" survives the rows that have already gone.
+        int batchTotal = 0;
+    };
+    /// Where a bulk send stands, for the progress banner. \a total is 0 when
+    /// the batch is gone (or never existed).
+    struct OutboxBatchProgress {
+        int total = 0;
+        int remaining = 0; ///< Queued or Sending
+        int failed = 0;
     };
     /// OutboxMessage::state. Failed rows are kept for the user, like retired
     /// journal ops: they stop being tried until "Retry now" revives them.
@@ -815,19 +832,38 @@ public:
     ///  msg.created are filled in from the open account and the clock when
     /// left empty.
     qint64 enqueueOutbox(OutboxMessage msg);
+    /// Appends every row of \a msgs as one batch, in one transaction: either
+    /// all of them are queued or none is, which is the promise a pressed
+    /// bulk Send needs. Returns the batch id (the first row's id), 0 on
+    /// failure or an empty list. Sets batch and batchTotal on the rows.
+    qint64 enqueueOutboxBatch(QList<OutboxMessage> msgs);
+    /// The oldest batch of \a account that still has a Queued or Sending
+    /// row, or 0 — what the drain adopts as "the bulk send in progress".
+    qint64 activeOutboxBatch(const QString &account) const;
+    OutboxBatchProgress outboxBatchProgress(const QString &account, qint64 batch) const;
+    /// Drops the rows of \a batch that have not gone out yet — Queued and
+    /// Failed; a Sending row is on the wire and stays. Returns how many went.
+    int dropOutboxBatch(const QString &account, qint64 batch);
     /// Every row of  account in send order — the Outbox list, wire included.
     QList<OutboxMessage> outboxMessages(const QString &account) const;
     /// One row by id, for acting on a list entry. id 0 on a row that is gone.
     OutboxMessage outboxMessage(qint64 id) const;
     /// The next row due to go out: the oldest Queued one whose nextTry has
-    /// passed. id 0 when nothing is due.
+    /// passed. id 0 when nothing is due. Rows of a bulk batch are not
+    /// offered here — they have a drain of their own (nextOutboxBatchMessage)
+    /// that runs on its own connection, and two drains on one row is how a
+    /// message is sent twice.
     OutboxMessage nextOutboxMessage(const QString &account, qint64 nowSecs) const;
+    /// The same for the rows of one batch.
+    OutboxMessage nextOutboxBatchMessage(const QString &account, qint64 batch,
+                                         qint64 nowSecs) const;
     /// How many rows the account has, without reading the blobs. Failed rows
     /// count too — the badge is "mail that has not gone out", not "mail that
     /// is about to".
     int outboxCount(const QString &account) const;
     /// When the earliest Queued row may go out, or 0 with none queued — what
-    /// the drain worker arms its backoff timer from.
+    /// the drain worker arms its backoff timer from. Batch rows excluded, as
+    /// in nextOutboxMessage(); a batch drain waits its own backoffs out.
     qint64 outboxNextTry(const QString &account) const;
     /// Marks a row Sending before its network attempt starts.
     void markOutboxSending(qint64 id);

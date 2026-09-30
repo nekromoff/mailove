@@ -181,6 +181,14 @@ class MailClient : public QObject
     Q_PROPERTY(int outboxCount READ outboxCount NOTIFY outboxChanged)
     Q_PROPERTY(bool undoSend READ undoSend WRITE setUndoSend NOTIFY undoSendChanged)
     Q_PROPERTY(qint64 undoSendDeadline READ undoSendDeadline NOTIFY undoSendDeadlineChanged)
+    // A bulk send in progress, for the progress banner. All read off the
+    // outbox rows of one batch, so a restart mid-send picks the numbers up
+    // where they were.
+    Q_PROPERTY(bool bulkActive READ bulkActive NOTIFY bulkProgressChanged)
+    Q_PROPERTY(int bulkTotal READ bulkTotal NOTIFY bulkProgressChanged)
+    Q_PROPERTY(int bulkDone READ bulkDone NOTIFY bulkProgressChanged)
+    Q_PROPERTY(int bulkFailed READ bulkFailed NOTIFY bulkProgressChanged)
+    Q_PROPERTY(QString bulkCurrent READ bulkCurrent NOTIFY bulkProgressChanged)
     /// The folder actually open right now. The sidebar follows this rather
     /// than deciding for itself which row is open.
     Q_PROPERTY(QString selectedFolder READ selectedFolder NOTIFY selectedFolderChanged)
@@ -337,6 +345,34 @@ public:
                               bool encrypt = false,
                               const QString &appendQuote = QString(),
                               bool appendStrip = false);
+    /// The bulk send (compose/bulkSend in the advanced settings): one
+    /// separate message per address in \a addresses — its own To header, its
+    /// own Message-ID, encrypted to that one recipient — all queued into the
+    /// Outbox as one batch, in one transaction. The composer closes on the
+    /// enqueue (mailSent), exactly like an undo-send; the drain then sends the
+    /// batch one row at a time, compose/bulkDelayMs apart, and the progress
+    /// lands in the bulk* properties. Nothing is queued when any address
+    /// fails to parse or any message fails to build (sendFailed).
+    /// \a addresses is the raw text of the Bulk To field: addresses separated
+    /// by commas, semicolons, newlines or whitespace; duplicates are sent once.
+    Q_INVOKABLE void sendBulk(const QString &addresses, const QString &subject,
+                              const QString &html, const QList<QUrl> &attachments,
+                              bool sign = false, bool encrypt = false,
+                              const QString &appendQuote = QString(),
+                              bool appendStrip = false);
+    /// The addresses sendBulk() would send to, in order, duplicates removed —
+    /// the composer's "N recipients" caption and its pre-send check read the
+    /// same split as the send, so they cannot disagree. Entries are returned
+    /// as typed; whether each is a valid address is the send's call.
+    Q_INVOKABLE static QStringList bulkAddresses(const QString &raw);
+    /// Drops what is left of the bulk send in progress. The row on the wire
+    /// finishes; every one still waiting is forgotten.
+    Q_INVOKABLE void cancelBulk();
+    bool bulkActive() const { return m_bulkBatch != 0; }
+    int bulkTotal() const { return m_bulkTotal; }
+    int bulkDone() const { return m_bulkDone; }
+    int bulkFailed() const { return m_bulkFailed; }
+    QString bulkCurrent() const { return m_bulkCurrent; }
     /// APPENDs the same message to the Drafts folder instead of sending it.
     /// Unlike sendMail this accepts an unfinished message — no recipient, or
     /// an address still being typed — because that is the state a draft is
@@ -787,6 +823,7 @@ Q_SIGNALS:
     void outboxChanged();
     void undoSendChanged();
     void undoSendDeadlineChanged();
+    void bulkProgressChanged();
 
 private:
     /// Records \a op, applies nothing (the caller has already changed the cache
@@ -838,6 +875,37 @@ private:
     /// Points the wake-up timer at the earliest nextTry still queued — the
     /// undo-send hold and the retry backoff both wake through this.
     void armOutboxTimer();
+    // --- the bulk leg -------------------------------------------------------
+    //
+    // A bulk batch is never sent over m_backend. That object is shared by
+    // every account of its protocol and re-credentialed on each switch, so a
+    // batch riding on it would be cut off — or worse, carried on with the
+    // next account's login — the moment the user clicked another account to
+    // read their mail while the batch went out. The batch gets a backend of
+    // its own, credentialed once from the account it was composed in, the
+    // way the background poll gives every other account one; it lives
+    // exactly as long as the batch has rows to send.
+
+    /// Re-reads the tracked batch's counts and tells QML. Announces the
+    /// batch's end, once, when nothing of it is left queued.
+    void refreshBulkProgress();
+    /// Picks up a batch of the open account that has rows left — after a
+    /// restart, or one paused by a lost connection — and starts its leg.
+    void resumeBulkBatch();
+    /// Opens the leg's own connection for the tracked batch. The credentials
+    /// are the open account's, so this is only ever called while the batch's
+    /// account is the open one; a batch of another account waits for it.
+    void startBulkLeg();
+    /// Sends the batch's next due row over the leg, or waits for the next
+    /// due time, or ends the leg when nothing is left.
+    void drainBulkLeg();
+    /// What the leg's backend said about one row, and what that does to the
+    /// row and to the leg.
+    void finishBulkSend(const MailStore::OutboxMessage &msg, MailBackend::Error error,
+                        const QString &message);
+    /// Closes the leg's connection. The batch stays in the store; a row on
+    /// the wire is marked interrupted like any other ambiguous send.
+    void endBulkLeg(const QString &reason);
     /// Sets (or clears) what the undo affordances act on, and tells QML. One
     /// place so the button and the shortcut can never disagree about whether
     /// there is something to undo.
@@ -1107,9 +1175,14 @@ private:
     /// flag is set. On failure \a done is never called and sendFailed() has
     /// been emitted — a message that could not be encrypted is not a message
     /// to send in the clear.
+    /// A dismissed passphrase prompt sends one message unsigned ("not this
+    /// time"); with \a cancelAborts it is a failure instead. That is the bulk
+    /// send's setting: one dismissal per recipient would put the same prompt
+    /// back on screen hundreds of times, and Cancel there means "not at all".
     void applyOutgoingCrypto(const std::shared_ptr<KMime::Message> &msg,
                              const QStringList &recipients, bool sign, bool encrypt,
-                             std::function<void(const QByteArray &)> done);
+                             std::function<void(const QByteArray &)> done,
+                             bool cancelAborts = false);
 
     /// Presents \a message in the reading pane's context.
     void presentMessage(const std::shared_ptr<KMime::Message> &message);
@@ -1450,6 +1523,22 @@ private:
     qint64 m_outboxInFlight = 0; ///< its row id, so a reply after an account
                                  ///< switch is recognised as stale
     QTimer m_outboxTimer;        ///< wakes the drain at the earliest nextTry
+    qint64 m_bulkBatch = 0;      ///< the bulk send being tracked; 0 = none
+    QString m_bulkAccount;       ///< its account's cache key
+    int m_bulkTotal = 0;
+    int m_bulkDone = 0;          ///< sent, i.e. total minus remaining and failed
+    int m_bulkFailed = 0;
+    QString m_bulkCurrent;       ///< the address on the wire right now
+    /// The connection a batch is sent over; see "the bulk leg" above.
+    struct BulkLeg {
+        MailBackend *backend = nullptr;
+        QString sentFolder;      ///< where the copies go; "" for none known
+        bool connected = false;
+        bool busy = false;       ///< one row in flight; the leg is serial
+        qint64 inFlight = 0;
+    };
+    std::unique_ptr<BulkLeg> m_bulkLeg;
+    int m_bulkLegRetries = 0;    ///< consecutive reopen attempts; backs off the wait
     bool m_undoSend = false;     ///< hold each send briefly before draining it
     qint64 m_lastHeldSend = 0;   ///< row id of the send just made, while its
                                  ///< hold lasts — the one thing Ctrl+Z may act

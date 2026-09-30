@@ -326,6 +326,9 @@ bool MailStore::open()
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN auth TEXT DEFAULT ''"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN attach INTEGER DEFAULT 0"));
     q.exec(QStringLiteral("ALTER TABLE messages ADD COLUMN color INTEGER DEFAULT 0"));
+    // Bulk sends: which batch an outbox row belongs to and how big it started.
+    q.exec(QStringLiteral("ALTER TABLE outbox ADD COLUMN batch INTEGER NOT NULL DEFAULT 0"));
+    q.exec(QStringLiteral("ALTER TABLE outbox ADD COLUMN batch_total INTEGER NOT NULL DEFAULT 0"));
     // Message-ID is the only stable identity a message has: IMAP UIDs are
     // per-folder and do not survive a move or a UIDVALIDITY reset. NULL means
     // "not known yet" and is what backfillMessageIds() looks for; '' means
@@ -549,7 +552,9 @@ bool MailStore::open()
                           " next_try INTEGER NOT NULL DEFAULT 0,"
                           " state INTEGER NOT NULL DEFAULT 0,"
                           " encrypted INTEGER NOT NULL DEFAULT 0,"
-                          " has_attachments INTEGER NOT NULL DEFAULT 0)"));
+                          " has_attachments INTEGER NOT NULL DEFAULT 0,"
+                          " batch INTEGER NOT NULL DEFAULT 0,"
+                          " batch_total INTEGER NOT NULL DEFAULT 0)"));
     // The drain reads "this account's queued rows in id order" and the badge
     // asks how many rows there are at all; both are this index.
     q.exec(QStringLiteral("CREATE INDEX IF NOT EXISTS idx_outbox_account"
@@ -3295,9 +3300,11 @@ void MailStore::setRemoteContentAllowedFor(const QString &sender, bool allowed)
     q.exec();
 }
 
-void MailStore::addRecipient(const QString &address, const QString &name)
+void MailStore::addRecipient(const QString &address, const QString &name,
+                             const QString &account)
 {
-    if (!m_db.isOpen() || m_accountKey.isEmpty() || !address.contains(QLatin1Char('@')))
+    const QString key = account.isEmpty() ? m_accountKey : account;
+    if (!m_db.isOpen() || key.isEmpty() || !address.contains(QLatin1Char('@')))
         return;
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral(
@@ -3307,7 +3314,7 @@ void MailStore::addRecipient(const QString &address, const QString &name)
         "  use_count = use_count + 1, last_used = excluded.last_used,"
         "  addr_norm = excluded.addr_norm,"
         "  name = CASE WHEN excluded.name != '' THEN excluded.name ELSE name END"));
-    q.addBindValue(m_accountKey);
+    q.addBindValue(key);
     q.addBindValue(address.trimmed().toLower());
     q.addBindValue(SpamHeuristics::normalizeAddress(address));
     q.addBindValue(name.trimmed());
@@ -4400,7 +4407,7 @@ namespace
 /// Column order shared by every outbox read and outboxRowOf().
 constexpr const char *kOutboxColumns =
     "id, account, wire, envelope, sender, subject, created, attempts,"
-    " last_error, next_try, state, encrypted, has_attachments";
+    " last_error, next_try, state, encrypted, has_attachments, batch, batch_total";
 } // namespace
 
 MailStore::OutboxMessage MailStore::outboxRowOf(const QSqlQuery &q)
@@ -4419,6 +4426,8 @@ MailStore::OutboxMessage MailStore::outboxRowOf(const QSqlQuery &q)
     msg.state = q.value(10).toInt();
     msg.encrypted = q.value(11).toInt() != 0;
     msg.hasAttachments = q.value(12).toInt() != 0;
+    msg.batch = q.value(13).toLongLong();
+    msg.batchTotal = q.value(14).toInt();
     return msg;
 }
 
@@ -4451,7 +4460,8 @@ qint64 MailStore::enqueueOutbox(OutboxMessage msg)
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral(
         "INSERT INTO outbox (account, wire, envelope, sender, subject, created,"
-        " next_try, encrypted, has_attachments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+        " next_try, encrypted, has_attachments, batch, batch_total)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
     q.addBindValue(msg.account);
     q.addBindValue(msg.wire);
     q.addBindValue(joinList(msg.envelope));
@@ -4461,11 +4471,98 @@ qint64 MailStore::enqueueOutbox(OutboxMessage msg)
     q.addBindValue(msg.nextTry);
     q.addBindValue(msg.encrypted ? 1 : 0);
     q.addBindValue(msg.hasAttachments ? 1 : 0);
+    q.addBindValue(msg.batch);
+    q.addBindValue(msg.batchTotal);
     if (!q.exec()) {
         qWarning() << "mailstore: outbox enqueue failed:" << q.lastError().text();
         return 0;
     }
     return q.lastInsertId().toLongLong();
+}
+
+qint64 MailStore::enqueueOutboxBatch(QList<OutboxMessage> msgs)
+{
+    if (!m_db.isOpen() || msgs.isEmpty())
+        return 0;
+    if (!m_db.transaction())
+        return 0;
+    // The batch id is the first row's id, which is not known until that row
+    // is in: the first row is inserted with batch 0 and patched afterwards,
+    // inside the same transaction.
+    qint64 batch = 0;
+    for (OutboxMessage &msg : msgs) {
+        msg.batch = batch;
+        msg.batchTotal = msgs.size();
+        const qint64 id = enqueueOutbox(msg);
+        if (id == 0) {
+            m_db.rollback();
+            return 0;
+        }
+        if (batch == 0) {
+            batch = id;
+            QSqlQuery q(m_db);
+            q.prepare(QStringLiteral("UPDATE outbox SET batch = ? WHERE id = ?"));
+            q.addBindValue(batch);
+            q.addBindValue(id);
+            if (!q.exec()) {
+                m_db.rollback();
+                return 0;
+            }
+            msg.batch = batch;
+        }
+    }
+    if (!m_db.commit()) {
+        m_db.rollback();
+        return 0;
+    }
+    return batch;
+}
+
+qint64 MailStore::activeOutboxBatch(const QString &account) const
+{
+    if (!m_db.isOpen())
+        return 0;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT MIN(batch) FROM outbox WHERE account = ?"
+                             " AND batch != 0 AND state IN (0, 1)"));
+    q.addBindValue(account);
+    if (!q.exec() || !q.next())
+        return 0;
+    return q.value(0).toLongLong();
+}
+
+MailStore::OutboxBatchProgress MailStore::outboxBatchProgress(const QString &account,
+                                                              qint64 batch) const
+{
+    OutboxBatchProgress p;
+    if (!m_db.isOpen() || batch == 0)
+        return p;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT MAX(batch_total), SUM(state IN (0, 1)), SUM(state = 2)"
+        " FROM outbox WHERE account = ? AND batch = ?"));
+    q.addBindValue(account);
+    q.addBindValue(batch);
+    if (!q.exec() || !q.next())
+        return p;
+    p.total = q.value(0).toInt();
+    p.remaining = q.value(1).toInt();
+    p.failed = q.value(2).toInt();
+    return p;
+}
+
+int MailStore::dropOutboxBatch(const QString &account, qint64 batch)
+{
+    if (!m_db.isOpen() || batch == 0)
+        return 0;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM outbox WHERE account = ? AND batch = ?"
+                             " AND state != 1"));
+    q.addBindValue(account);
+    q.addBindValue(batch);
+    if (!q.exec())
+        return 0;
+    return q.numRowsAffected();
 }
 
 QList<MailStore::OutboxMessage> MailStore::outboxMessages(const QString &account) const
@@ -4483,9 +4580,20 @@ MailStore::OutboxMessage MailStore::nextOutboxMessage(const QString &account,
                                                       qint64 nowSecs) const
 {
     const auto rows = outboxSelect(
-        QStringLiteral("WHERE account = ? AND state = 0 AND next_try <= ?"
+        QStringLiteral("WHERE account = ? AND state = 0 AND next_try <= ? AND batch = 0"
                        " ORDER BY id LIMIT 1"),
         {account, nowSecs});
+    return rows.isEmpty() ? OutboxMessage() : rows.first();
+}
+
+MailStore::OutboxMessage MailStore::nextOutboxBatchMessage(const QString &account,
+                                                           qint64 batch,
+                                                           qint64 nowSecs) const
+{
+    const auto rows = outboxSelect(
+        QStringLiteral("WHERE account = ? AND batch = ? AND state = 0 AND next_try <= ?"
+                       " ORDER BY id LIMIT 1"),
+        {account, batch, nowSecs});
     return rows.isEmpty() ? OutboxMessage() : rows.first();
 }
 
@@ -4507,7 +4615,7 @@ qint64 MailStore::outboxNextTry(const QString &account) const
         return 0;
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral(
-        "SELECT MIN(next_try) FROM outbox WHERE account = ? AND state = 0"));
+        "SELECT MIN(next_try) FROM outbox WHERE account = ? AND state = 0 AND batch = 0"));
     q.addBindValue(account);
     if (!q.exec() || !q.next() || q.value(0).isNull())
         return 0;

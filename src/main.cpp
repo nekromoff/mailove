@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 #include <QGuiApplication>
 #include <QStyleHints>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -32,7 +33,18 @@
 
 #include <QLoggingCategory>
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+#ifdef Q_OS_LINUX
+#include <csignal>
+#include <execinfo.h>
+#include <pthread.h>
+#include <unistd.h>
+#endif
+
 #include <cstdio>
+#include <cstdlib>
 
 Q_DECLARE_LOGGING_CATEGORY(logTrace)
 
@@ -81,6 +93,108 @@ static void filterMailHtmlNoise(QtMsgType type, const QMessageLogContext &contex
     else
         fprintf(stderr, "%s\n", qPrintable(qFormatLogMessage(type, context, message)));
 }
+
+namespace
+{
+qint64 steadyMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+/// Last heartbeat, in steadyMs(); 0 until the first one. Written by the GUI
+/// thread, read by the watchdog.
+std::atomic<qint64> g_lastBeatMs{0};
+/// How many backtraces the watchdog took during the stall now ending —
+/// consumed by the heartbeat that ends it, which logs them.
+std::atomic<int> g_stallSamples{0};
+#ifdef Q_OS_LINUX
+std::atomic<bool> g_stallStop{false};
+/// The samples themselves: raw return addresses, filled by the signal
+/// handler and read back by the heartbeat once the GUI thread is running
+/// again. Two slots, one per sample the watchdog takes.
+constexpr int kStallFrames = 96;
+void *g_stallFrames[2][kStallFrames];
+std::atomic<int> g_stallFrameCount[2]{0, 0};
+std::atomic<int> g_stallSlot{0};
+
+/// Runs on the GUI thread, in the middle of whatever is blocking it. Only
+/// async-signal-safe work: backtrace() into a static buffer. Resolving the
+/// symbols allocates, so that waits for the heartbeat.
+void stallSampleHandler(int)
+{
+    const int slot = g_stallSlot.load(std::memory_order_relaxed);
+    if (slot < 0 || slot > 1)
+        return;
+    const int n = backtrace(g_stallFrames[slot], kStallFrames);
+    g_stallFrameCount[slot].store(n, std::memory_order_release);
+}
+
+/// Appends the samples taken during the stall that just ended to the log,
+/// right under its "stalled" line. Addresses into this binary: resolve with
+/// addr2line -e mailove against the same build.
+void logStallSamples(int samples)
+{
+    for (int slot = 0; slot < samples && slot < 2; ++slot) {
+        const int n = g_stallFrameCount[slot].load(std::memory_order_acquire);
+        if (n <= 0)
+            continue;
+        char **symbols = backtrace_symbols(g_stallFrames[slot], n);
+        qCWarning(logTrace, "stall sample %d (%s):", slot + 1,
+                  slot == 0 ? "at ~2 s" : "at ~6 s");
+        // The top frames are the signal machinery and this handler; the
+        // caller's code starts a few frames down. Logged whole anyway —
+        // which frames are noise is easier to tell than to guess here.
+        for (int i = 0; i < n; ++i)
+            qCWarning(logTrace, "  #%02d %s", i, symbols ? symbols[i] : "?");
+        free(symbols);
+        g_stallFrameCount[slot].store(0, std::memory_order_relaxed);
+    }
+}
+#endif
+
+void startStallSampler(QCoreApplication *app)
+{
+#ifdef Q_OS_LINUX
+    struct sigaction action {};
+    action.sa_handler = stallSampleHandler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    if (sigaction(SIGUSR2, &action, nullptr) != 0)
+        return;
+    const pthread_t gui = pthread_self();
+    auto *watchdog = new std::thread([gui] {
+        int taken = 0;
+        while (!g_stallStop.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            const qint64 last = g_lastBeatMs.load(std::memory_order_relaxed);
+            if (last == 0)
+                continue;
+            const qint64 silent = steadyMs() - last;
+            // One sample at two seconds, one more at six: the first says
+            // where it sits, the second whether it is still there.
+            const int due = silent > 6000 ? 2 : silent > 2000 ? 1 : 0;
+            if (due > taken) {
+                g_stallSlot.store(taken, std::memory_order_relaxed);
+                pthread_kill(gui, SIGUSR2);
+                ++taken;
+                g_stallSamples.store(taken, std::memory_order_relaxed);
+            } else if (silent < 2000) {
+                taken = 0;
+            }
+        }
+    });
+    QObject::connect(app, &QCoreApplication::aboutToQuit, app, [watchdog] {
+        g_stallStop.store(true, std::memory_order_relaxed);
+        watchdog->join();
+        delete watchdog;
+    });
+#else
+    Q_UNUSED(app);
+#endif
+}
+} // namespace
 
 int main(int argc, char *argv[])
 {
@@ -202,18 +316,35 @@ int main(int argc, char *argv[])
     // this pins down when the event loop itself stops turning and for how
     // long — anything above half a second is loud, smaller gaps go to the
     // trace. Purely an observer: one timer, no per-event cost.
+    //
+    // Plus, on Linux, a sampler: a watchdog thread that sees the heartbeat
+    // go quiet for two seconds signals the GUI thread, whose handler writes
+    // its own backtrace to a file next to the log. A stall's duration says
+    // that something blocked; only a stack from inside the stall says what.
+    // Frames are addresses into this binary (resolve with addr2line against
+    // the same build), which is what backtrace_symbols_fd can give from a
+    // signal handler without allocating.
     {
         auto *beat = new QTimer(&app);
         auto *last = new QElapsedTimer;
         last->start();
         QObject::connect(beat, &QTimer::timeout, &app, [last] {
             const qint64 gap = last->restart();
-            if (gap > 500)
-                qWarning("mailove: GUI thread stalled ~%lld ms", gap - 100);
-            else if (gap > 220)
+            g_lastBeatMs.store(steadyMs(), std::memory_order_relaxed);
+            const int samples = g_stallSamples.exchange(0, std::memory_order_relaxed);
+            if (gap > 500) {
+                qCWarning(logTrace, "GUI thread stalled ~%lld ms", gap - 100);
+#ifdef Q_OS_LINUX
+                logStallSamples(samples);
+#else
+                Q_UNUSED(samples);
+#endif
+            } else if (gap > 220) {
                 qCDebug(logTrace, "GUI heartbeat late: %lld ms", gap - 100);
+            }
         });
         beat->start(100);
+        startStallSampler(&app);
     }
 
     if (qEnvironmentVariableIsEmpty("QT_QUICK_CONTROLS_STYLE"))

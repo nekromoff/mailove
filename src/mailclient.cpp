@@ -27,12 +27,16 @@
 #include <QStandardPaths>
 #include <QLocale>
 #include <QRandomGenerator>
+#include <QRegularExpression>
+#include <QSet>
 #include <QSettings>
 #include <QSqlQuery>
 #include <QLoggingCategory>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QTimer>
+
+#include <limits>
 
 #include <kmime/content.h>
 #include <kmime/headerparsing.h>
@@ -359,6 +363,7 @@ void MailClient::connectBackend(MailBackend *backend)
         // this handler rather than off a timer.
         drainJournal();
         drainOutbox();
+        resumeBulkBatch();
         // No "loading folders" crumb — the busy spinner shows the activity.
         listFolders();
     });
@@ -597,6 +602,9 @@ MailClient::MailClient(QObject *parent)
         Q_EMIT errorOccurred(
             tr("A message was interrupted while sending. Check the Outbox."));
     refreshOutboxCount();
+    // A bulk send cut short by a quit shows its numbers again from the rows;
+    // its leg opens once the account is connected.
+    resumeBulkBatch();
     // Before the first read of any folder: a row hidden by a change whose
     // journal entry never landed is mail the user can neither see nor get
     // back, and this is the only thing that looks for it.
@@ -1536,6 +1544,12 @@ void MailClient::removeAccount(int index)
     // account. Left behind they would be replayed against whichever account
     // reused the key, or sit in the failed list forever.
     if (!goingKey.isEmpty()) {
+        if (m_bulkAccount == goingKey) {
+            endBulkLeg(tr("the account was removed"));
+            m_bulkBatch = 0;
+            m_bulkAccount.clear();
+            refreshBulkProgress();
+        }
         m_store.dropAccountJournal(goingKey);
         m_store.dropAccountOutbox(goingKey);
         refreshJournalCounts();
@@ -1974,6 +1988,9 @@ void MailClient::switchAccountInternal(int index, const QString &sessionPassword
     m_outboxInFlight = 0;
     setUndoableSend(0, 0); // the row belongs to the account being left
     m_outboxTimer.stop();
+    // The bulk leg is deliberately not touched: it has its own connection and
+    // its own credentials, and the whole point is that the batch keeps going
+    // while the user reads mail in another account.
 
     loadAccountFields();
     m_folderModel.setAccountKey(accountKey());
@@ -2365,7 +2382,8 @@ bool MailClient::accountPgpAutoWkd() const
 
 void MailClient::applyOutgoingCrypto(const std::shared_ptr<KMime::Message> &msg,
                                      const QStringList &recipients, bool sign, bool encrypt,
-                                     std::function<void(const QByteArray &)> done)
+                                     std::function<void(const QByteArray &)> done,
+                                     bool cancelAborts)
 {
     const QByteArray plain = msg->encodedContent(KMime::NewlineType::CRLF);
     if (!sign && !encrypt) {
@@ -2460,9 +2478,10 @@ void MailClient::applyOutgoingCrypto(const std::shared_ptr<KMime::Message> &msg,
     }
     auto *conn = new QMetaObject::Connection;
     *conn = connect(m_pgp, &PgpEngine::signFinished, this,
-                    [this, conn, job, plain, parts, encrypt, encryptStep, done](
-                        quint64 id, const QByteArray &signature, const QString &micalg,
-                        const QString &error, bool cancelled) {
+                    [this, conn, job, plain, parts, encrypt, encryptStep, done,
+                     cancelAborts](quint64 id, const QByteArray &signature,
+                                   const QString &micalg, const QString &error,
+                                   bool cancelled) {
                         if (id != job)
                             return;
                         disconnect(*conn);
@@ -2472,6 +2491,10 @@ void MailClient::applyOutgoingCrypto(const std::shared_ptr<KMime::Message> &msg,
                         // than bouncing the user back into the same prompt.
                         // Encryption never needed the passphrase, so that half
                         // still happens when it was asked for.
+                        if (cancelled && cancelAborts) {
+                            Q_EMIT sendFailed(tr("Signing was cancelled — nothing was sent."));
+                            return;
+                        }
                         if (cancelled) {
                             setStatus(encrypt
                                           ? tr("Signing cancelled — sending encrypted "
@@ -2703,6 +2726,155 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &b
         setStatus(tr("Queued — will be sent when the connection is back"));
     }
         });
+}
+
+QStringList MailClient::bulkAddresses(const QString &raw)
+{
+    // Anything that separates addresses in a pasted list: commas and
+    // semicolons from spreadsheets, one per line from a text file, spaces
+    // from a hand-typed row. Display names are not supported here — a bulk
+    // list is bare addresses — which is what lets whitespace be a separator.
+    static const QRegularExpression sep(QStringLiteral("[,;\\s]+"));
+    QStringList out;
+    QSet<QString> seen;
+    const QStringList parts = raw.split(sep, Qt::SkipEmptyParts);
+    for (const QString &part : parts) {
+        const QString key = part.toLower();
+        if (seen.contains(key))
+            continue;
+        seen.insert(key);
+        out.append(part);
+    }
+    return out;
+}
+
+void MailClient::sendBulk(const QString &addresses, const QString &subject,
+                          const QString &html, const QList<QUrl> &attachments,
+                          bool sign, bool encrypt, const QString &appendQuote,
+                          bool appendStrip)
+{
+    if (!AdvancedConfig::b("compose/bulkSend")) {
+        Q_EMIT sendFailed(tr("Bulk sending is not enabled (compose/bulkSend in the "
+                             "advanced settings)."));
+        return;
+    }
+    const bool haveCredential = m_acct.authType != 0
+        ? !m_accounts.accessToken().isEmpty()
+        : !m_accounts.password().isEmpty();
+    if (m_acct.user.isEmpty() || !haveCredential) {
+        Q_EMIT sendFailed(tr("The account is not configured (check account settings)."));
+        return;
+    }
+    if (!m_backend || (m_backend->protocol() == MailBackend::Protocol::Imap
+                       && m_acct.smtpHost.isEmpty())) {
+        Q_EMIT sendFailed(tr("SMTP is not configured (check account settings)."));
+        return;
+    }
+    const QStringList list = bulkAddresses(addresses);
+    if (list.isEmpty()) {
+        Q_EMIT sendFailed(tr("No recipient given."));
+        return;
+    }
+    if (m_bulkBatch != 0) {
+        Q_EMIT sendFailed(tr("A bulk send is still in progress. Wait for it to finish "
+                             "or cancel it first."));
+        return;
+    }
+
+    // Every message is built up front, before a single one is queued: an
+    // address that fails to parse, or a key that turns out to be missing, on
+    // the 200th recipient must not leave 199 messages already on their way.
+    // The body is assembled once — the quote, the strip, the embedded
+    // images — and only the envelope differs per message.
+    const QString body = appendQuoteHtml(html, appendQuote, appendStrip);
+    const QString fromAddr = ownAddress();
+    const bool hasAttachments = !attachments.isEmpty()
+        || html.contains(QLatin1String("src=\"cid:"), Qt::CaseInsensitive)
+        || html.contains(QLatin1String("src='cid:"), Qt::CaseInsensitive)
+        || html.contains(QLatin1String("src=\"file:"), Qt::CaseInsensitive)
+        || html.contains(QLatin1String("src='file:"), Qt::CaseInsensitive);
+
+    // The crypto step is asynchronous (gpg-agent may prompt), so the messages
+    // are built one after another through a continuation rather than a loop;
+    // rows collects the finished wires until the last one lands.
+    auto rows = std::make_shared<QList<MailStore::OutboxMessage>>();
+    rows->reserve(list.size());
+    // The step holds only a weak reference to itself: the strong one lives in
+    // whatever is waiting to call it next (the crypto continuation, the
+    // zero-length timer), so the chain owns itself exactly as long as it runs
+    // and a failed step lets the whole thing go.
+    auto step = std::make_shared<std::function<void(int)>>();
+    std::weak_ptr<std::function<void(int)>> weakStep = step;
+    *step = [this, list, subject, body, attachments, sign, encrypt, fromAddr,
+             hasAttachments, rows, weakStep](int index) {
+        if (index >= list.size()) {
+            const qint64 batch = m_store.enqueueOutboxBatch(*rows);
+            if (batch == 0) {
+                Q_EMIT sendFailed(tr("The messages could not be queued for sending."));
+                return;
+            }
+            qCInfo(logJournal) << "outbox: bulk batch" << batch << "queued with"
+                               << rows->size() << "message(s)";
+            Q_EMIT mailSent(); // compose window closes on this
+            refreshOutboxCount();
+            // A bulk send is never undoable as a whole; the hold on the
+            // button was the moment to change one's mind, and the banner's
+            // Cancel covers what has not gone out yet.
+            setUndoableSend(0, 0);
+            if (m_bulkBatch == 0) {
+                m_bulkBatch = batch;
+                m_bulkAccount = accountKey();
+            }
+            refreshBulkProgress();
+            startBulkLeg();
+            return;
+        }
+        const QString addr = list.at(index);
+        QStringList toList, ccList, bccList;
+        auto msg = composeMessage(addr, QString(), QString(), subject, body, attachments,
+                                  true, &toList, &ccList, &bccList);
+        if (!msg)
+            return; // composeMessage emitted sendFailed; nothing was queued
+        if (toList.isEmpty()) {
+            Q_EMIT sendFailed(tr("Invalid recipient address: %1").arg(addr));
+            return;
+        }
+        auto step = weakStep.lock();
+        if (!step)
+            return;
+        applyOutgoingCrypto(msg, toList, sign, encrypt,
+                            [this, toList, fromAddr, subject, encrypt, hasAttachments, rows,
+                             step, index](const QByteArray &wire) {
+            MailStore::OutboxMessage row;
+            row.wire = wire;
+            row.envelope = toList;
+            row.sender = fromAddr;
+            row.subject = subject;
+            row.encrypted = encrypt;
+            row.hasAttachments = hasAttachments;
+            rows->append(row);
+            // Off the stack, not recursively: without crypto the continuation
+            // runs synchronously, and a thousand recipients would be a
+            // thousand nested frames of MIME assembly.
+            QTimer::singleShot(0, this, [step, index] { (*step)(index + 1); });
+        }, /*cancelAborts=*/true);
+    };
+    (*step)(0);
+}
+
+void MailClient::cancelBulk()
+{
+    if (m_bulkBatch == 0)
+        return;
+    const int dropped = m_store.dropOutboxBatch(m_bulkAccount, m_bulkBatch);
+    qCInfo(logJournal) << "outbox: bulk batch" << m_bulkBatch << "cancelled," << dropped
+                       << "message(s) dropped";
+    setStatus(tr("Bulk send cancelled — %n message(s) not sent", nullptr, dropped));
+    refreshOutboxCount();
+    refreshBulkProgress();
+    // The leg finds nothing left and closes itself — unless a row is on the
+    // wire, in which case it does so once that one is answered.
+    drainBulkLeg();
 }
 
 void MailClient::saveDraft(const QString &to, const QString &cc, const QString &bcc,
@@ -4539,6 +4711,7 @@ MailClient::~MailClient()
     // ever hangs, these say which join it is sitting in rather than leaving a
     // silent process behind.
     abandonLocalSearch(); // a search worker must not outlive the model it fills
+    endBulkLeg(QString()); // marks a row on the wire interrupted, as recovery would
     qCDebug(logTrace, "shutdown: stopping DKIM verifier");
     delete m_verifier;
     m_verifier = nullptr;
@@ -7607,6 +7780,278 @@ void MailClient::finishOutboxSend(const MailStore::OutboxMessage &msg,
     drainOutbox();
 }
 
+// --- the bulk leg -------------------------------------------------------------
+
+void MailClient::refreshBulkProgress()
+{
+    if (m_bulkBatch == 0) {
+        if (m_bulkTotal != 0 || !m_bulkCurrent.isEmpty()) {
+            m_bulkTotal = m_bulkDone = m_bulkFailed = 0;
+            m_bulkCurrent.clear();
+            Q_EMIT bulkProgressChanged();
+        }
+        return;
+    }
+    const auto p = m_store.outboxBatchProgress(m_bulkAccount, m_bulkBatch);
+    m_bulkTotal = p.total;
+    m_bulkFailed = p.failed;
+    m_bulkDone = qMax(0, p.total - p.remaining - p.failed);
+    if (p.remaining == 0) {
+        // Nothing of it left to send: the batch is over. Said once, in the
+        // status line, with the failures pointed at the Outbox where they
+        // wait for the user.
+        qCInfo(logJournal) << "outbox: bulk batch" << m_bulkBatch << "finished:" << m_bulkDone
+                           << "sent," << m_bulkFailed << "failed";
+        if (p.total > 0) {
+            setStatus(m_bulkFailed == 0
+                          ? tr("Bulk send finished — %n message(s) sent", nullptr, m_bulkDone)
+                          : tr("Bulk send finished — %1 sent, %2 failed (see the Outbox)")
+                                .arg(m_bulkDone)
+                                .arg(m_bulkFailed));
+        }
+        m_bulkBatch = 0;
+        m_bulkAccount.clear();
+        m_bulkTotal = m_bulkDone = m_bulkFailed = 0;
+        m_bulkCurrent.clear();
+        Q_EMIT bulkProgressChanged();
+        return;
+    }
+    Q_EMIT bulkProgressChanged();
+}
+
+void MailClient::resumeBulkBatch()
+{
+    if (m_bulkLeg)
+        return; // one leg at a time; the next batch follows when it ends
+    if (m_bulkBatch == 0) {
+        const qint64 batch = m_store.activeOutboxBatch(accountKey());
+        if (batch == 0)
+            return;
+        m_bulkBatch = batch;
+        m_bulkAccount = accountKey();
+        qCInfo(logJournal) << "outbox: resuming bulk batch" << batch;
+    }
+    refreshBulkProgress();
+    startBulkLeg();
+}
+
+void MailClient::startBulkLeg()
+{
+    if (m_bulkLeg || m_bulkBatch == 0 || !m_backend)
+        return;
+    if (m_bulkAccount != accountKey() || !connected()) {
+        // The leg is credentialed from the open account, so a batch of
+        // another one — or of this one while it is offline — waits. The
+        // banner keeps showing it as waiting; resumeBulkBatch() runs on the
+        // next connection.
+        return;
+    }
+    // The token first, for the same reason the foreground send renews before
+    // dialling: SMTP authenticates per message out of the copy it is given.
+    ensureAccessToken([this, batch = m_bulkBatch](bool, const QString &) {
+        if (m_bulkLeg || m_bulkBatch != batch || m_bulkAccount != accountKey() || !m_backend)
+            return;
+        auto leg = std::make_unique<BulkLeg>();
+        leg->backend = makeBackend(protocolFromSetting(m_acct.protocol), this);
+        leg->sentFolder = m_sentFolder;
+        MailBackend *backend = leg->backend;
+        m_bulkLeg = std::move(leg);
+        qCInfo(logJournal) << "outbox: bulk leg opening for batch" << batch;
+        connect(backend, &MailBackend::connectedChanged, this, [this, backend](bool up) {
+            if (!m_bulkLeg || m_bulkLeg->backend != backend)
+                return;
+            if (up) {
+                m_bulkLeg->connected = true;
+                drainBulkLeg();
+            } else if (m_bulkLeg->connected) {
+                endBulkLeg(tr("the connection was lost"));
+            }
+        });
+        connect(backend, &MailBackend::connectionLost, this, [this, backend] {
+            if (m_bulkLeg && m_bulkLeg->backend == backend)
+                endBulkLeg(tr("the connection was lost"));
+        });
+        connect(backend, &MailBackend::errorOccurred, this,
+                [this, backend](MailBackend::Error, const QString &message) {
+            if (m_bulkLeg && m_bulkLeg->backend == backend)
+                endBulkLeg(message);
+        });
+        backend->connectAccount(backendCredentials());
+    });
+}
+
+void MailClient::drainBulkLeg()
+{
+    if (!m_bulkLeg || m_bulkLeg->busy || !m_bulkLeg->connected)
+        return;
+    if (m_bulkBatch == 0) {
+        endBulkLeg(QString()); // cancelled away, or finished
+        return;
+    }
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    const auto msg = m_store.nextOutboxBatchMessage(m_bulkAccount, m_bulkBatch, now);
+    if (msg.id == 0) {
+        // Nothing due now. Either a throttled row is waiting out its backoff
+        // — wait with it — or the batch is over.
+        const auto later = m_store.nextOutboxBatchMessage(
+            m_bulkAccount, m_bulkBatch, std::numeric_limits<qint64>::max());
+        if (later.id == 0) {
+            refreshBulkProgress(); // announces the end, when it is one
+            endBulkLeg(QString());
+            return;
+        }
+        const qint64 wait = qBound<qint64>(qint64(1), later.nextTry - now + 1, qint64(3600));
+        QTimer::singleShot(int(wait) * 1000, this, [this] { drainBulkLeg(); });
+        return;
+    }
+    m_bulkLeg->busy = true;
+    m_bulkLeg->inFlight = msg.id;
+    m_store.markOutboxSending(msg.id);
+    Q_EMIT outboxChanged();
+    // The banner names the address on the wire; the counts follow from the
+    // rows, but "which one right now" only the drain knows.
+    m_bulkCurrent = msg.envelope.value(0);
+    refreshBulkProgress();
+    qCInfo(logJournal) << "outbox: bulk row" << msg.id << "sending";
+    MailBackend *backend = m_bulkLeg->backend;
+    backend->sendMessage(msg.wire, msg.sender, msg.envelope,
+                         [this, backend, msg](MailBackend::Error error, const QString &message) {
+        if (!m_bulkLeg || m_bulkLeg->backend != backend || m_bulkLeg->inFlight != msg.id)
+            return; // the leg was ended under it; the row was dealt with then
+        m_bulkLeg->busy = false;
+        m_bulkLeg->inFlight = 0;
+        finishBulkSend(msg, error, message);
+    });
+}
+
+void MailClient::finishBulkSend(const MailStore::OutboxMessage &msg, MailBackend::Error error,
+                                const QString &message)
+{
+    // The step to the next row: compose/bulkDelayMs later, so a mass mailing
+    // does not hit the server as fast as it will take it.
+    const auto next = [this] {
+        refreshOutboxCount();
+        refreshBulkProgress();
+        const int delay = AdvancedConfig::i("compose/bulkDelayMs");
+        if (delay <= 0)
+            drainBulkLeg();
+        else
+            QTimer::singleShot(delay, this, [this] { drainBulkLeg(); });
+    };
+    switch (error) {
+    case MailBackend::Error::None: {
+        for (const QString &addr : msg.envelope)
+            m_store.addRecipient(addr, QString(), m_bulkAccount);
+        qCInfo(logJournal) << "outbox: bulk row" << msg.id << "sent";
+        m_bulkLegRetries = 0; // the connection is evidently good
+        // A bulk send may keep its hundreds of copies out of Sent
+        // (compose/bulkSentCopy). Same rule as the foreground: the row
+        // outlives the send by exactly as long as the copy takes.
+        MailBackend *backend = m_bulkLeg ? m_bulkLeg->backend : nullptr;
+        const bool fileCopy = backend && !backend->sentCopyIsAutomatic()
+            && AdvancedConfig::b("compose/bulkSentCopy") && !m_bulkLeg->sentFolder.isEmpty();
+        if (fileCopy) {
+            const QString folder = m_bulkLeg->sentFolder;
+            backend->storeMessage(folder, msg.wire, {QStringLiteral("seen")},
+                                  [this, backend, id = msg.id, folder, next](
+                                      MailBackend::Error err, const QString &, const QString &why) {
+                m_store.dropOutboxMessage(id);
+                if (err != MailBackend::Error::None)
+                    qCWarning(logJournal) << "outbox: bulk row" << id
+                                          << "sent, but the Sent copy failed:" << why;
+                else if (m_bulkLeg && m_bulkLeg->backend == backend
+                         && m_bulkAccount == accountKey() && m_selectedFolder == folder)
+                    refreshCurrentFolder(); // the user is looking at Sent
+                next();
+            });
+            return;
+        }
+        m_store.dropOutboxMessage(msg.id);
+        break;
+    }
+    case MailBackend::Error::Auth:
+        // Most often an OAuth token that expired during a long batch. Renew
+        // it if this is still the open account, and go on; otherwise the
+        // batch waits for the account to be opened again.
+        m_store.deferOutboxMessage(msg.id);
+        if (m_bulkAccount == accountKey() && m_acct.authType != 0) {
+            qCInfo(logJournal) << "outbox: bulk row" << msg.id << "refused login; renewing";
+            acquireToken([this, message](bool ok, const QString &error) {
+                if (!m_bulkLeg)
+                    return;
+                if (!ok) {
+                    endBulkLeg(error.isEmpty() ? message : error);
+                    return;
+                }
+                m_bulkLeg->backend->updateAccessToken(m_accounts.accessToken());
+                drainBulkLeg();
+            });
+            return;
+        }
+        endBulkLeg(message);
+        return;
+    case MailBackend::Error::Connection:
+        m_store.deferOutboxMessage(msg.id);
+        endBulkLeg(message);
+        return;
+    case MailBackend::Error::Throttled: {
+        const qint64 wait = outboxBackoffSecs(msg.attempts);
+        qCInfo(logJournal) << "outbox: bulk row" << msg.id << "throttled, retrying in" << wait
+                           << "s";
+        m_store.recordOutboxFailure(msg.id, message,
+                                    QDateTime::currentSecsSinceEpoch() + wait, false);
+        break;
+    }
+    case MailBackend::Error::NotFound:
+    case MailBackend::Error::Protocol:
+        // One rejection in a batch of hundreds is a count in the banner and
+        // a failed row in the Outbox, not a dialog per address.
+        qCWarning(logJournal) << "outbox: bulk row" << msg.id << "rejected:" << message;
+        m_store.recordOutboxFailure(msg.id, message, 0, true);
+        break;
+    }
+    next();
+}
+
+void MailClient::endBulkLeg(const QString &reason)
+{
+    if (!m_bulkLeg)
+        return;
+    if (m_bulkLeg->inFlight) {
+        // Whether the message left is unknowable — the same ambiguity as a
+        // crash mid-send, and the same answer: a failed row saying so, never
+        // a silent resend.
+        m_store.recordOutboxFailure(
+            m_bulkLeg->inFlight,
+            tr("Interrupted while sending — it may already have been sent"), 0, true);
+    }
+    MailBackend *backend = m_bulkLeg->backend;
+    m_bulkLeg.reset();
+    backend->disconnect(this);
+    backend->disconnectAccount();
+    backend->deleteLater();
+    m_bulkCurrent.clear();
+    refreshOutboxCount();
+    refreshBulkProgress();
+    if (m_bulkBatch == 0 || reason.isEmpty()) {
+        qCInfo(logJournal) << "outbox: bulk leg closed";
+        m_bulkLegRetries = 0;
+        return;
+    }
+    // The batch is not done and the leg died on it. Nothing else will wake
+    // it — the foreground connection is typically still up, so its
+    // connectedChanged() never fires — so the leg reopens itself, after a
+    // wait that grows with each failure in a row: a server that dropped the
+    // connection once is asked again in seconds, one that keeps doing it in
+    // minutes. Reset by the next successful send.
+    const int wait = qMin(300, 5 << qMin(m_bulkLegRetries, 6));
+    ++m_bulkLegRetries;
+    qCInfo(logJournal) << "outbox: bulk leg closed:" << reason << "— batch" << m_bulkBatch
+                       << "reopens in" << wait << "s";
+    setStatus(tr("Bulk send: %1 — reconnecting in %2 s").arg(reason).arg(wait));
+    QTimer::singleShot(wait * 1000, this, [this] { resumeBulkBatch(); });
+}
+
 void MailClient::refreshOutboxCount()
 {
     const int count = m_store.outboxCount(accountKey());
@@ -7647,6 +8092,7 @@ QVariantList MailClient::outboxList() const
             {QStringLiteral("editable"), !row.encrypted && !row.hasAttachments},
             {QStringLiteral("holdUntil"),
              row.state == MailStore::Queued && row.nextTry > 0 ? row.nextTry : 0},
+            {QStringLiteral("bulk"), row.batch != 0},
         });
     }
     return out;
@@ -7654,10 +8100,11 @@ QVariantList MailClient::outboxList() const
 
 bool MailClient::cancelOutboxMessage(qint64 id)
 {
-    if (id == m_outboxInFlight)
+    if (id == m_outboxInFlight || (m_bulkLeg && m_bulkLeg->inFlight == id))
         return false; // already on the wire; too late to un-send
     m_store.dropOutboxMessage(id);
     refreshOutboxCount();
+    refreshBulkProgress(); // a batch row: the banner's counts move
     return true;
 }
 
@@ -7665,6 +8112,10 @@ void MailClient::retryOutboxMessage(qint64 id)
 {
     m_store.reviveOutboxMessage(id);
     refreshOutboxCount();
+    // A revived batch row re-opens its batch, which has its own drain.
+    refreshBulkProgress();
+    resumeBulkBatch();
+    drainBulkLeg();
     drainOutbox();
 }
 

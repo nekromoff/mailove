@@ -82,6 +82,28 @@ public:
     /// list itself from the outermost one.
     Q_INVOKABLE bool outdentAtBlockStart();
 
+    // --- links ---------------------------------------------------------------
+
+    /// Space or Return typed right after a URL or an address: turns that word
+    /// into a link with the same text and target, then inserts \a typed
+    /// itself (" " or "\n") in plain formatting, so the space does not join
+    /// the link and typing carries on unlinked. Returns true when it did all
+    /// of that, so the caller eats the key; false leaves the key alone. A
+    /// word that is already a link, or is not a URL, is left as it is.
+    Q_INVOKABLE bool autoLinkBeforeCursor(const QString &typed);
+    /// The link the caret or selection sits in, for the link dialog:
+    /// {text, href, start, end}. Inside a link, the whole of it (every
+    /// fragment carrying that href back to back), whatever is selected.
+    /// Outside one, the selection with an empty href, or an empty range at
+    /// the caret when nothing is selected.
+    Q_INVOKABLE QVariantMap linkAtCursor() const;
+    /// Replaces [\a start, \a end) with \a text pointing at \a href, which
+    /// may differ from the text. An empty \a href removes the link and keeps
+    /// the text; an empty \a text shows the target itself. A link that ends
+    /// the block gets a plain space after it, so what is typed next is not
+    /// part of it.
+    Q_INVOKABLE void setLink(int start, int end, const QString &text, const QString &href);
+
     /// Ctrl+Shift+V: inserts the clipboard as unformatted text, taking the
     /// formatting of the text it lands in rather than dragging the source
     /// document's fonts and colors into the message. False when the clipboard
@@ -160,6 +182,11 @@ Q_SIGNALS:
     /// A pasted image was not inserted, with a line saying why. Nothing else
     /// reports it: the paste simply appears not to have happened otherwise.
     void imagePasteFailed(const QString &message);
+
+    /// The editor should put its caret here — after a link this handler just
+    /// inserted, since the editor's own caret does not follow an edit made
+    /// through another cursor at the same position.
+    void caretMoveRequested(int position);
 
     void documentChanged();
     void cursorPositionChanged();

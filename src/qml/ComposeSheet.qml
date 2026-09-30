@@ -72,6 +72,49 @@ Item {
     // closes outright on success.
     property bool sending: false
 
+    // --- Bulk sending --------------------------------------------------------
+    //
+    // A "secret" mode: nothing of it is on screen until compose/bulkSend is
+    // switched on in the advanced settings. Checked, the To field becomes a
+    // list — one address per line, or comma-separated — and Send becomes
+    // hold-to-send: every address gets its own separate message, queued
+    // through the Outbox and sent one after another.
+
+    /// compose/bulkSend, re-read whenever the advanced settings are saved.
+    property bool bulkAvailable: Advanced.get("compose/bulkSend") === true
+    property int bulkHoldMs: 1000 * (Advanced.get("compose/bulkHoldSecs") || 3)
+    Connections {
+        target: Advanced
+        function onReloaded() {
+            sheet.bulkAvailable = Advanced.get("compose/bulkSend") === true
+            sheet.bulkHoldMs = 1000 * (Advanced.get("compose/bulkHoldSecs") || 3)
+            if (!sheet.bulkAvailable)
+                sheet.bulkMode = false
+        }
+    }
+    /// The checkbox. Only ever true while bulkAvailable is.
+    property bool bulkMode: false
+    /// The addresses in the bulk field, split the way the send splits them.
+    readonly property var bulkList: bulkMode ? Mail.bulkAddresses(bulkField.text) : []
+    /// Entries in the bulk field that are not addresses at all. Checked here
+    /// so the send is refused with the list in front of the user, not with
+    /// the first bad one from C++.
+    readonly property var bulkInvalid: {
+        const out = []
+        for (let i = 0; i < bulkList.length; ++i) {
+            const a = bulkList[i]
+            const at = a.indexOf("@")
+            if (at < 1 || at === a.length - 1 || a.indexOf("@", at + 1) >= 0
+                    || a.indexOf(".", at) < 0)
+                out.push(a)
+        }
+        return out
+    }
+    /// What the To field has to say for Send to be enabled at all.
+    readonly property bool haveRecipient: bulkMode
+        ? bulkList.length > 0
+        : toField.text.trim().length > 0
+
     // --- OpenPGP -----------------------------------------------------------
 
     /// Sign / encrypt this message. Initialised from the account defaults when
@@ -96,6 +139,8 @@ Item {
     /// the whole string. Anything without an "@" is an address still being
     /// typed and is left out — there is no key to look up for it yet.
     function recipientList() {
+        if (bulkMode)
+            return bulkList.slice()
         const all = (toField.text + "," + ccField.text + "," + bccField.text).split(",")
         const out = []
         for (let i = 0; i < all.length; ++i) {
@@ -186,8 +231,15 @@ Item {
 
     // Single send entry point for the button and the Ctrl+Enter shortcut.
     function doSend() {
-        if (toField.text.trim().length === 0 || sending)
+        if (!haveRecipient || sending)
             return
+        if (bulkMode && bulkInvalid.length > 0) {
+            sendErrorDialog.heading = "Bulk list not sent"
+            sendErrorDialog.errorText = "These entries are not e-mail addresses:\n\n"
+                + bulkInvalid.join("\n")
+            sendErrorDialog.open()
+            return
+        }
         // Never a silent downgrade: if encryption is on and a key is missing,
         // the user decides what happens (doc/openpgp.md §9).
         if (pgpEncrypt) {
@@ -202,9 +254,13 @@ Item {
         // a send must never carry half a body.
         docHandler.flushQuoteStream()
         sending = true
-        Mail.sendMail(toField.text, ccField.text, bccField.text,
-                      subjectField.text, bodyEdit.text, attachments,
-                      pgpSign, pgpEncrypt, resolvedAppendQuote(), appendStrip)
+        if (bulkMode)
+            Mail.sendBulk(bulkField.text, subjectField.text, bodyEdit.text, attachments,
+                          pgpSign, pgpEncrypt, resolvedAppendQuote(), appendStrip)
+        else
+            Mail.sendMail(toField.text, ccField.text, bccField.text,
+                          subjectField.text, bodyEdit.text, attachments,
+                          pgpSign, pgpEncrypt, resolvedAppendQuote(), appendStrip)
         markForwardedSource()
     }
 
@@ -286,7 +342,8 @@ Item {
     property bool closingConfirmed: false
 
     function hasContent() {
-        return toField.text.trim() !== "" || ccField.text.trim() !== ""
+        return toField.text.trim() !== "" || bulkField.text.trim() !== ""
+            || ccField.text.trim() !== ""
             || bccField.text.trim() !== "" || subjectField.text.trim() !== ""
             || bodyEdit.text.trim() !== "" || attachments.length > 0
     }
@@ -299,6 +356,7 @@ Item {
     function captureOpenedState() {
         openedState = {
             to: toField.text,
+            bulk: bulkField.text,
             cc: ccField.text,
             bcc: bccField.text,
             subject: subjectField.text,
@@ -313,6 +371,7 @@ Item {
         if (!openedState)
             return hasContent()
         return toField.text !== openedState.to
+            || bulkField.text !== openedState.bulk
             || ccField.text !== openedState.cc
             || bccField.text !== openedState.bcc
             || subjectField.text !== openedState.subject
@@ -380,6 +439,8 @@ Item {
         forwardedUids = []
         titleBase = "Compose"
         toField.text = ""
+        bulkField.text = ""
+        bulkMode = false
         ccField.text = ""
         bccField.text = ""
         subjectField.text = ""
@@ -417,6 +478,8 @@ Item {
         appendStrip = false
         releasePreview()
         titleBase = "Draft"
+        bulkField.text = ""
+        bulkMode = false
         toField.text = d.to
         ccField.text = d.cc
         bccField.text = d.bcc
@@ -443,6 +506,8 @@ Item {
         forwardedFolder = ""
         forwardedUids = []
         titleBase = "Reply"
+        bulkField.text = ""
+        bulkMode = false
         toField.text = r.to
         ccField.text = r.cc
         bccField.text = ""
@@ -685,9 +750,13 @@ Item {
                     missingKeyDialog.close()
                     sheet.pgpEncrypt = false
                     sheet.sending = true
-                    Mail.sendMail(toField.text, ccField.text, bccField.text,
-                                  subjectField.text, bodyEdit.text, sheet.attachments,
-                                  sheet.pgpSign, false)
+                    if (sheet.bulkMode)
+                        Mail.sendBulk(bulkField.text, subjectField.text, bodyEdit.text,
+                                      sheet.attachments, sheet.pgpSign, false)
+                    else
+                        Mail.sendMail(toField.text, ccField.text, bccField.text,
+                                      subjectField.text, bodyEdit.text, sheet.attachments,
+                                      sheet.pgpSign, false)
                     sheet.markForwardedSource()
                 }
             }
@@ -812,6 +881,9 @@ Item {
     DocumentHandler {
         id: docHandler
         document: bodyEdit.textDocument
+        // An edit made through the handler's own cursor leaves the editor's
+        // caret where it was; a link just inserted wants it after itself.
+        onCaretMoveRequested: position => bodyEdit.cursorPosition = position
         cursorPosition: bodyEdit.cursorPosition
         selectionStart: bodyEdit.selectionStart
         selectionEnd: bodyEdit.selectionEnd
@@ -873,6 +945,98 @@ Item {
         enabled: sheet.pageActive && bodyEdit.activeFocus
         onActivated: docHandler.toggleOrderedList()
     }
+    Shortcut {
+        sequence: "Ctrl+K"
+        enabled: sheet.pageActive && bodyEdit.activeFocus
+        onActivated: linkDialog.openForCursor()
+    }
+
+    /// Text and target, editable separately: "our site" pointing at the URL.
+    /// Opened on an existing link it edits that one, whole; on a selection it
+    /// links the selection; on a bare caret it inserts a new link.
+    QQC2.Dialog {
+        id: linkDialog
+        parent: QQC2.Overlay.overlay
+        anchors.centerIn: parent
+        modal: true
+        title: editing ? "Edit link" : "Insert link"
+        width: Math.min(sheet.width - Kirigami.Units.gridUnit * 4,
+                        Kirigami.Units.gridUnit * 28)
+
+        property int rangeStart: 0
+        property int rangeEnd: 0
+        property bool editing: false
+
+        function openForCursor() {
+            const l = docHandler.linkAtCursor()
+            rangeStart = l.start
+            rangeEnd = l.end
+            editing = l.href.length > 0
+            linkText.text = l.text
+            linkTarget.text = l.href
+            open()
+            // The target is the one thing always worth typing; the text is
+            // usually already there from the selection.
+            if (linkTarget.text.length === 0)
+                linkTarget.forceActiveFocus()
+            else
+                linkText.forceActiveFocus()
+        }
+        function apply() {
+            let target = linkTarget.text.trim()
+            // A bare "example.com" is meant as a web address, not a relative
+            // path — the same completion the autolink does.
+            if (target.length > 0 && target.indexOf(":") < 0) {
+                target = (target.indexOf("@") > 0 ? "mailto:" : "https://") + target
+            }
+            docHandler.setLink(rangeStart, rangeEnd, linkText.text, target)
+            close()
+            bodyEdit.forceActiveFocus()
+        }
+
+        contentItem: ColumnLayout {
+            spacing: Kirigami.Units.smallSpacing
+            QQC2.Label { text: "Text" }
+            QQC2.TextField {
+                id: linkText
+                Layout.fillWidth: true
+                placeholderText: "Shown in the message (empty: the address itself)"
+                onAccepted: linkDialog.apply()
+            }
+            QQC2.Label { text: "Link to" }
+            QQC2.TextField {
+                id: linkTarget
+                Layout.fillWidth: true
+                placeholderText: "https://… or name@example.com"
+                onAccepted: linkDialog.apply()
+            }
+        }
+
+        footer: QQC2.DialogButtonBox {
+            QQC2.Button {
+                text: "Remove link"
+                visible: linkDialog.editing
+                QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.DestructiveRole
+                onClicked: {
+                    docHandler.setLink(linkDialog.rangeStart, linkDialog.rangeEnd,
+                                       linkText.text, "")
+                    linkDialog.close()
+                    bodyEdit.forceActiveFocus()
+                }
+            }
+            QQC2.Button {
+                text: linkDialog.editing ? "Save" : "Insert"
+                enabled: linkTarget.text.trim().length > 0
+                QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.AcceptRole
+                onClicked: linkDialog.apply()
+            }
+            QQC2.Button {
+                text: "Cancel"
+                QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.RejectRole
+                onClicked: linkDialog.close()
+            }
+        }
+    }
 
     // Send shortcut (configurable; default Ctrl+Return). Also accepts the
     // numeric-keypad Enter alongside the configured sequence, and honours the
@@ -880,8 +1044,10 @@ Item {
     Shortcut {
         sequences: sheet.ui ? [sheet.ui.shortcutSend, "Ctrl+Enter"]
                             : ["Ctrl+Return", "Ctrl+Enter"]
-        enabled: sheet.pageActive
-                 && toField.text.trim().length > 0 && !sheet.sending
+        // Not in bulk mode: there the hold on the button is the safeguard,
+        // and a shortcut would be a way around it.
+        enabled: sheet.pageActive && !sheet.bulkMode
+                 && sheet.haveRecipient && !sheet.sending
         onActivated: sheet.doSend()
     }
 
@@ -895,16 +1061,88 @@ Item {
         Kirigami.Theme.colorSet: Kirigami.Theme.Window
         Kirigami.Theme.inherit: false
 
-        AddressField {
-            id: toField
+        RowLayout {
             Layout.fillWidth: true
-            // Which recipients we hold keys for decides whether encryption is
-            // even possible, so it follows the field as it is typed.
-            onTextChanged: sheet.refreshRecipientKeys()
-            placeholderText: "To (comma-separated)"
-            // White field on the gray panel.
-            Kirigami.Theme.colorSet: Kirigami.Theme.View
-            Kirigami.Theme.inherit: false
+            spacing: Kirigami.Units.smallSpacing
+
+            AddressField {
+                id: toField
+                visible: !sheet.bulkMode
+                Layout.fillWidth: true
+                // Which recipients we hold keys for decides whether encryption is
+                // even possible, so it follows the field as it is typed.
+                onTextChanged: sheet.refreshRecipientKeys()
+                placeholderText: "To (comma-separated)"
+                // White field on the gray panel.
+                Kirigami.Theme.colorSet: Kirigami.Theme.View
+                Kirigami.Theme.inherit: false
+            }
+            // The bulk list. A TextArea in a ScrollView so a pasted thousand
+            // lines scroll inside a field of fixed height rather than pushing
+            // the body off the bottom of the window.
+            QQC2.ScrollView {
+                id: bulkScroll
+                visible: sheet.bulkMode
+                Layout.fillWidth: true
+                Layout.preferredHeight: Kirigami.Units.gridUnit * 5
+                Layout.maximumHeight: Kirigami.Units.gridUnit * 5
+                clip: true
+                QQC2.TextArea {
+                    id: bulkField
+                    placeholderText: "Bulk To — one address per line, or comma-separated"
+                    wrapMode: TextEdit.NoWrap
+                    textFormat: TextEdit.PlainText
+                    onTextChanged: sheet.refreshRecipientKeys()
+                    Kirigami.Theme.colorSet: Kirigami.Theme.View
+                    Kirigami.Theme.inherit: false
+                }
+            }
+            QQC2.CheckBox {
+                id: bulkCheck
+                visible: sheet.bulkAvailable
+                Layout.alignment: Qt.AlignTop
+                text: "Bulk"
+                checked: sheet.bulkMode
+                enabled: !sheet.sending
+                onToggled: {
+                    sheet.bulkMode = checked
+                    if (checked) {
+                        // Whatever was in To is the start of the list; Cc and
+                        // Bcc have no place in one-message-per-address.
+                        if (bulkField.text.trim().length === 0 && toField.text.trim().length > 0)
+                            bulkField.text = toField.text
+                        content.ccExpanded = false
+                        bulkField.forceActiveFocus()
+                    } else {
+                        toField.forceActiveFocus()
+                    }
+                    sheet.refreshRecipientKeys()
+                }
+                QQC2.ToolTip.text: "Send one separate message to each address in the "
+                                   + "list, one after another. Hold the Send button to start."
+                QQC2.ToolTip.visible: hovered
+            }
+        }
+        // The count is the check on a pasted list: it is what says whether
+        // the split read the file the way the user did.
+        QQC2.Label {
+            visible: sheet.bulkMode
+            Layout.fillWidth: true
+            opacity: 0.8
+            font.pointSize: Kirigami.Theme.smallFont.pointSize
+            color: sheet.bulkInvalid.length > 0 ? Kirigami.Theme.negativeTextColor
+                                                : Kirigami.Theme.textColor
+            text: {
+                const n = sheet.bulkList.length
+                let t = n === 1 ? "1 recipient" : n + " recipients"
+                t += " — each gets a separate message"
+                if (sheet.bulkInvalid.length > 0)
+                    t += " · " + sheet.bulkInvalid.length + " not an address: "
+                       + sheet.bulkInvalid.slice(0, 3).join(", ")
+                       + (sheet.bulkInvalid.length > 3 ? ", …" : "")
+                return t
+            }
+            elide: Text.ElideRight
         }
 
         // Cc/Bcc are collapsed by default behind a single clickable row.
@@ -918,7 +1156,10 @@ Item {
 
         // Row 1: collapsed → "[>] Cc + Bcc" toggle; expanded → "[⌄] <Cc field>".
         // The arrow stays put on the left in both states and toggles on click.
+        // Neither row in bulk mode: every message there has exactly one
+        // recipient, so a shared Cc is meaningless and a Bcc has nothing to hide.
         RowLayout {
+            visible: !sheet.bulkMode
             Layout.fillWidth: true
             spacing: Kirigami.Units.smallSpacing
 
@@ -958,7 +1199,7 @@ Item {
         }
         AddressField {
             id: bccField
-            visible: content.ccExpanded
+            visible: content.ccExpanded && !sheet.bulkMode
             Layout.fillWidth: true
             // Align under the Cc field (past the arrow inset).
             Layout.leftMargin: content.ccArrowInset
@@ -1131,6 +1372,15 @@ Item {
                                    + "\"1. \" at the start of a line also starts one."
                 QQC2.ToolTip.visible: hovered
             }
+            QQC2.ToolButton {
+                activeFocusOnTab: false
+                icon.name: "insert-link"
+                onClicked: linkDialog.openForCursor()
+                QQC2.ToolTip.text: "Link (Ctrl+K): make the selection a link, or edit the "
+                                   + "link under the cursor. A typed web address becomes "
+                                   + "a link by itself."
+                QQC2.ToolTip.visible: hovered
+            }
             Item { Layout.fillWidth: true }
             QQC2.ToolButton {
                 activeFocusOnTab: true
@@ -1250,6 +1500,9 @@ Item {
                             // through to that paste untouched.
                             if (docHandler.pasteImage())
                                 event.accepted = true
+                        } else if (event.key === Qt.Key_K) {
+                            linkDialog.openForCursor()
+                            event.accepted = true
                         }
                         // The list pair is a Shortcut below rather than a key
                         // code here: Shift+8 is not Key_8 on every layout, and
@@ -1263,7 +1516,10 @@ Item {
                     // committed by its own "." or ")", which is already a
                     // marker and nothing else.
                     if (event.key === Qt.Key_Space) {
-                        if (docHandler.startBulletList())
+                        // A web address just typed becomes a link when the
+                        // space after it says the word is complete.
+                        if (docHandler.startBulletList()
+                                || docHandler.autoLinkBeforeCursor(" "))
                             event.accepted = true
                     } else if (event.text === "." || event.text === ")") {
                         // event.text, not a key code: ")" is Shift+0 on some
@@ -1273,8 +1529,11 @@ Item {
                     } else if (event.key === Qt.Key_Return
                                || event.key === Qt.Key_Enter) {
                         // Enter on an empty item ends the list: the first Enter
-                        // made the empty item, this one leaves it behind.
-                        if (docHandler.leaveEmptyListItem())
+                        // made the empty item, this one leaves it behind. Enter
+                        // after an address links it, like the space does.
+                        if (docHandler.leaveEmptyListItem()
+                                || ((event.modifiers & Qt.ShiftModifier) === 0
+                                    && docHandler.autoLinkBeforeCursor("\n")))
                             event.accepted = true
                     } else if (event.key === Qt.Key_Tab) {
                         // In a list, Tab is a level rather than a character or
@@ -1453,12 +1712,57 @@ Item {
                         id: sendButton
                         anchors.fill: parent
                         visible: !sheet.sending
-                        text: "Send"
+                        text: sheet.bulkMode
+                            ? "Hold to send " + sheet.bulkList.length
+                            : "Send"
                         icon.name: "document-send"
-                        enabled: toField.text.trim().length > 0
-                        onClicked: sheet.doSend()
-                        QQC2.ToolTip.text: "Send (" +
-                            (sheet.ui ? sheet.ui.shortcutSend : "Ctrl+Return") + ")"
+                        enabled: sheet.haveRecipient
+                        // A click sends a normal message; in bulk mode a click
+                        // does nothing, and only holding to the end of the
+                        // line below sends — the same gesture as forward-as-
+                        // attachment, stretched to compose/bulkHoldSecs so a
+                        // mass mailing takes a deliberate few seconds.
+                        onClicked: if (!sheet.bulkMode) sheet.doSend()
+                        onPressedChanged: {
+                            if (!sheet.bulkMode)
+                                return
+                            if (pressed)
+                                bulkHoldTimer.restart()
+                            else
+                                bulkHoldTimer.stop()
+                        }
+                        Timer {
+                            id: bulkHoldTimer
+                            interval: sheet.bulkHoldMs
+                            onTriggered: {
+                                if (sendButton.pressed && sheet.bulkMode)
+                                    sheet.doSend()
+                            }
+                        }
+                        // The hold made visible: a line filling left to right
+                        // over the configured seconds, so reaching the far edge
+                        // and the send starting are the same moment. Releasing
+                        // early snaps it away (only the grow is animated).
+                        Rectangle {
+                            visible: sheet.bulkMode
+                            anchors.left: parent.left
+                            anchors.bottom: parent.bottom
+                            anchors.leftMargin: 3
+                            anchors.bottomMargin: 2
+                            height: 3
+                            radius: 1
+                            color: Kirigami.Theme.highlightColor
+                            width: sendButton.pressed && sheet.bulkMode
+                                   ? sendButton.width - 6 : 0
+                            Behavior on width {
+                                enabled: sendButton.pressed
+                                NumberAnimation { duration: sheet.bulkHoldMs }
+                            }
+                        }
+                        QQC2.ToolTip.text: sheet.bulkMode
+                            ? "Hold for " + (sheet.bulkHoldMs / 1000) + " s to send one "
+                              + "message to each address in the list"
+                            : "Send (" + (sheet.ui ? sheet.ui.shortcutSend : "Ctrl+Return") + ")"
                         QQC2.ToolTip.visible: hovered
                     }
 

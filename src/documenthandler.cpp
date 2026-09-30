@@ -26,6 +26,9 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QTextFragment>
+#include <QTextCharFormat>
+#include <QRegularExpression>
+#include <QPalette>
 #include <QTextFrame>
 #include <QTextTable>
 #include <QTimer>
@@ -629,6 +632,209 @@ void unlistBlock(QTextCursor &cursor)
 bool DocumentHandler::atBlockStart(const QTextCursor &cursor) const
 {
     return !cursor.hasSelection() && cursor.position() == cursor.block().position();
+}
+
+// --- links --------------------------------------------------------------------
+
+namespace
+{
+/// What a typed word has to look like to become a link by itself: a scheme,
+/// a "www." or a mail address. Anything looser links words that are not
+/// addresses at all — "and/or", "a.b" — which is worse than missing a link.
+const QRegularExpression &autoLinkPattern()
+{
+    static const QRegularExpression re(
+        QStringLiteral("^(?:(?:https?|ftp)://[^\\s<>\"]+"
+                       "|www\\.[^\\s<>\"]+"
+                       "|[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)+)$"),
+        QRegularExpression::CaseInsensitiveOption);
+    return re;
+}
+
+/// The href a typed word stands for: a scheme added where the word had none.
+QString hrefForTyped(const QString &word)
+{
+    if (word.contains(QLatin1Char('@')) && !word.contains(QLatin1String("://")))
+        return QStringLiteral("mailto:") + word;
+    if (word.startsWith(QLatin1String("www."), Qt::CaseInsensitive))
+        return QStringLiteral("http://") + word;
+    return word;
+}
+
+/// The format a link shows in the editor. The document does not style an
+/// anchor set through a format the way it styles one parsed from HTML, so
+/// the colour and the underline are set here — and cleared by unlinking.
+QTextCharFormat linkFormat(QTextCharFormat format, const QString &href)
+{
+    format.setAnchor(true);
+    format.setAnchorHref(href);
+    format.setFontUnderline(true);
+    format.setForeground(QGuiApplication::palette().color(QPalette::Link));
+    return format;
+}
+
+QTextCharFormat unlinkedFormat(QTextCharFormat format)
+{
+    format.setAnchor(false);
+    format.setAnchorHref(QString());
+    format.setAnchorNames({});
+    format.setFontUnderline(false);
+    format.clearForeground();
+    return format;
+}
+} // namespace
+
+bool DocumentHandler::autoLinkBeforeCursor(const QString &typed)
+{
+    QTextCursor cursor = textCursor();
+    if (cursor.isNull() || cursor.hasSelection())
+        return false;
+    if (cursor.charFormat().isAnchor())
+        return false; // already a link: the space just ends it
+    // The word is what sits between the previous whitespace and the caret.
+    const QTextBlock block = cursor.block();
+    const QString text = block.text();
+    const int caret = cursor.position() - block.position();
+    int start = caret;
+    while (start > 0 && !text.at(start - 1).isSpace())
+        --start;
+    QString word = text.mid(start, caret - start);
+    // A URL at the end of a sentence carries the sentence's punctuation,
+    // which is not part of it.
+    int trimmed = 0;
+    while (!word.isEmpty()
+           && QStringLiteral(".,;:!?)]}'\"").contains(word.at(word.size() - 1))) {
+        word.chop(1);
+        ++trimmed;
+    }
+    if (word.size() < 4 || !autoLinkPattern().match(word).hasMatch())
+        return false;
+
+    cursor.beginEditBlock();
+    QTextCursor range(cursor);
+    range.setPosition(block.position() + start);
+    range.setPosition(block.position() + start + word.size(), QTextCursor::KeepAnchor);
+    range.mergeCharFormat(linkFormat(QTextCharFormat(), hrefForTyped(word)));
+    // What was typed goes in unlinked, in the format the caret had before —
+    // the same bold or size, just not the anchor.
+    const QTextCharFormat plain = unlinkedFormat(cursor.charFormat());
+    if (typed == QLatin1String("\n"))
+        cursor.insertBlock(cursor.blockFormat(), plain);
+    else
+        cursor.insertText(typed, plain);
+    cursor.endEditBlock();
+    Q_EMIT caretMoveRequested(cursor.position());
+    Q_EMIT formatChanged();
+    return true;
+}
+
+QVariantMap DocumentHandler::linkAtCursor() const
+{
+    QVariantMap out{{QStringLiteral("text"), QString()},
+                    {QStringLiteral("href"), QString()},
+                    {QStringLiteral("start"), 0},
+                    {QStringLiteral("end"), 0}};
+    QTextCursor cursor = textCursor();
+    if (cursor.isNull())
+        return out;
+    const int selStart = cursor.selectionStart();
+    const int selEnd = cursor.selectionEnd();
+    // The href under the caret: of the character after it, or — at the end
+    // of a link — the one before, which is where the caret lands after
+    // typing a link out.
+    auto hrefAt = [this](int pos) -> QString {
+        QTextCursor probe(m_document->textDocument());
+        probe.setPosition(pos);
+        if (!probe.atBlockEnd())
+            probe.movePosition(QTextCursor::NextCharacter);
+        const QTextCharFormat f = probe.charFormat();
+        return f.isAnchor() ? f.anchorHref() : QString();
+    };
+    QString href = hrefAt(selStart);
+    if (href.isEmpty() && selStart == selEnd) {
+        QTextCursor probe(m_document->textDocument());
+        probe.setPosition(selStart);
+        if (!probe.atBlockStart()) {
+            const QTextCharFormat f = probe.charFormat();
+            if (f.isAnchor())
+                href = f.anchorHref();
+        }
+    }
+    if (href.isEmpty()) {
+        out[QStringLiteral("text")] = cursor.selectedText();
+        out[QStringLiteral("start")] = selStart;
+        out[QStringLiteral("end")] = selEnd;
+        return out;
+    }
+    // Widen to the whole link: every fragment of the block carrying this
+    // href that touches the caret.
+    const QTextBlock block = cursor.block();
+    int start = -1;
+    int end = -1;
+    for (auto it = block.begin(); !it.atEnd(); ++it) {
+        const QTextFragment frag = it.fragment();
+        if (!frag.isValid())
+            continue;
+        const bool same = frag.charFormat().isAnchor() && frag.charFormat().anchorHref() == href;
+        if (!same) {
+            if (start >= 0 && end >= selStart)
+                break;
+            start = end = -1;
+            continue;
+        }
+        if (start < 0)
+            start = frag.position();
+        end = frag.position() + frag.length();
+    }
+    if (start < 0 || selStart > end || selEnd < start) {
+        out[QStringLiteral("text")] = cursor.selectedText();
+        out[QStringLiteral("start")] = selStart;
+        out[QStringLiteral("end")] = selEnd;
+        return out;
+    }
+    QTextCursor whole(m_document->textDocument());
+    whole.setPosition(start);
+    whole.setPosition(end, QTextCursor::KeepAnchor);
+    out[QStringLiteral("text")] = whole.selectedText();
+    out[QStringLiteral("href")] = href;
+    out[QStringLiteral("start")] = start;
+    out[QStringLiteral("end")] = end;
+    return out;
+}
+
+void DocumentHandler::setLink(int start, int end, const QString &text, const QString &href)
+{
+    if (!m_document)
+        return;
+    QTextDocument *doc = m_document->textDocument();
+    start = qBound(0, start, doc->characterCount() - 1);
+    end = qBound(start, end, doc->characterCount() - 1);
+    QTextCursor cursor(doc);
+    cursor.setPosition(start);
+    cursor.setPosition(end, QTextCursor::KeepAnchor);
+    const QString target = href.trimmed();
+    QString shown = text;
+    if (shown.isEmpty())
+        shown = target.isEmpty() ? cursor.selectedText() : target;
+    if (shown.isEmpty())
+        return;
+    // The formatting the link takes over: whatever the range had, minus any
+    // previous link — so a bold word stays bold when it becomes a link.
+    QTextCharFormat base = unlinkedFormat(cursor.charFormat());
+    if (start == end) {
+        QTextCursor probe(doc);
+        probe.setPosition(start);
+        base = unlinkedFormat(probe.charFormat());
+    }
+    cursor.beginEditBlock();
+    cursor.insertText(shown, target.isEmpty() ? base : linkFormat(base, target));
+    // A link that ends its block would swallow whatever is typed next; a
+    // plain space after it is where typing continues.
+    if (!target.isEmpty() && cursor.atBlockEnd())
+        cursor.insertText(QStringLiteral(" "), base);
+    cursor.endEditBlock();
+    Q_EMIT caretMoveRequested(cursor.position());
+    Q_EMIT formatChanged();
 }
 
 bool DocumentHandler::startBulletList()

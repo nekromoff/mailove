@@ -1298,6 +1298,52 @@ Kirigami.ApplicationWindow {
                        ? " (" + uiSettings.shortcutUndoSend + ")" : "")
                 QQC2.ToolTip.visible: hovered
             }
+            // A bulk send in progress: count, the address on the wire and a
+            // bar, with Cancel for what has not gone out yet. In the status
+            // row rather than a dialog because it runs for minutes and the
+            // mail stays usable throughout; it appears and disappears with
+            // the batch, like the Undo button with its hold.
+            ColumnLayout {
+                id: bulkBanner
+                visible: Mail.bulkActive
+                Layout.preferredWidth: Kirigami.Units.gridUnit * 20
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 20
+                spacing: 1
+                QQC2.Label {
+                    Layout.fillWidth: true
+                    elide: Text.ElideMiddle
+                    font.pointSize: Kirigami.Theme.smallFont.pointSize
+                    text: "Bulk send " + (Mail.bulkDone + Mail.bulkFailed) + " of "
+                          + Mail.bulkTotal
+                          + (Mail.bulkFailed > 0 ? " (" + Mail.bulkFailed + " failed)" : "")
+                          + (Mail.bulkCurrent !== "" ? " · " + Mail.bulkCurrent : "")
+                    HoverHandler { id: bulkHover }
+                    HoverToolTip {
+                        hover: bulkHover
+                        text: "Sending one message per address, "
+                              + (Mail.bulkCurrent !== "" ? "now to " + Mail.bulkCurrent + ". "
+                                                         : "waiting for the connection. ")
+                              + Mail.bulkDone + " sent, " + Mail.bulkFailed
+                              + " failed, " + (Mail.bulkTotal - Mail.bulkDone - Mail.bulkFailed)
+                              + " to go. Failed ones wait in the Outbox."
+                    }
+                }
+                QQC2.ProgressBar {
+                    Layout.fillWidth: true
+                    from: 0
+                    to: Math.max(1, Mail.bulkTotal)
+                    value: Mail.bulkDone + Mail.bulkFailed
+                }
+            }
+            QQC2.Button {
+                visible: Mail.bulkActive
+                text: "Cancel"
+                icon.name: "dialog-cancel"
+                onClicked: Mail.cancelBulk()
+                QQC2.ToolTip.text: "Stop the bulk send: the message on the wire finishes, "
+                                   + "every one still waiting is dropped"
+                QQC2.ToolTip.visible: hovered
+            }
             QQC2.ToolButton {
                 icon.name: "mail-message-new"
                 enabled: Mail.hasAccount
@@ -2922,7 +2968,8 @@ Kirigami.ApplicationWindow {
                                             }
                                             QQC2.Label {
                                                 Layout.fillWidth: true
-                                                text: "To: " + outboxDelegate.modelData.to
+                                                text: (outboxDelegate.modelData.bulk ? "Bulk · " : "")
+                                                      + "To: " + outboxDelegate.modelData.to
                                                 elide: Text.ElideRight
                                                 opacity: 0.8
                                                 font.pointSize: Kirigami.Theme.smallFont.pointSize

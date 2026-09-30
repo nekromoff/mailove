@@ -1,3 +1,34 @@
+mailove (3.7.0) unstable; urgency=medium
+
+  * Bulk sending, off by default: with compose/bulkSend set in the
+    advanced settings a Bulk checkbox appears in the composer. Checked,
+    the To field becomes a list (one address per line, or separated by
+    commas), Cc/Bcc go away, and Send becomes hold-to-send
+    (compose/bulkHoldSecs). Every address gets its own message with its
+    own To header and Message-ID, encrypted to that one recipient when
+    encryption is on; attachments are carried by each.
+  * The batch goes through the Outbox on a connection of its own, so it
+    keeps sending while you read mail in another account, at
+    compose/bulkDelayMs between messages. A lost connection or an expired
+    sign-in pauses it and it reconnects by itself; a rejected address
+    fails only that row. Progress (n of total, the address on the wire,
+    failures) sits in the top bar with a Cancel that drops what has not
+    gone out. Each message's Sent copy is optional (compose/bulkSentCopy).
+  * A dismissed passphrase prompt during a bulk send cancels the whole
+    send with nothing queued, instead of asking once per recipient and
+    sending unsigned.
+  * Links in the composer: a typed web or mail address becomes a link
+    when the space or line break after it is typed. Ctrl+K (or the link
+    button) opens a dialog with the link text and its target as separate
+    fields, edits the link under the cursor whole, and can remove it.
+  * The advanced settings are readable from QML (Advanced.get), for
+    features whose switches live only there.
+  * When the GUI thread stalls for more than two seconds a backtrace of
+    it is sampled and logged under the "stalled" line (mailove.trace),
+    so a freeze can be located rather than only measured.
+
+ -- dusoft <dusoft@bastadigital.com>  Wed, 30 Sep 2026 12:00:00 +0200
+
 mailove (3.6.2) unstable; urgency=medium
 
   * The RPM installed on Fedora and openSUSE but would not start:

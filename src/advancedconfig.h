@@ -92,6 +92,10 @@ public:
     /// schema entries are generated from the same list. Everything else should
     /// use i(), which is checked at the call site.
     static int intOr(const QString &key, int fallback);
+    /// The same values for QML, which cannot spell a schema key as a C
+    /// literal. An unknown key returns an invalid QVariant rather than
+    /// asserting: QML has no compile-time check to lean on.
+    Q_INVOKABLE QVariant get(const QString &key) const;
 
     static QString filePath();
     QString text() const;

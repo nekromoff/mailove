@@ -149,6 +149,19 @@ const AdvancedConfig::Knob kSchema[] = {
     {"compose/undoSendDelaySecs", Type::Int, 10, 2, 120, Reload::Live,
      "How long a sent message is held in the Outbox before it goes out, once "
      "undo send is enabled in Settings."},
+    // Bulk sending: one message per address, sent through the Outbox one
+    // after another. Off by default and shown nowhere until switched on here —
+    // a mass mailing pressed by accident is the failure this guards against.
+    {"compose/bulkSend", Type::Bool, false, {}, {}, Reload::Live,
+     "Show the Bulk checkbox in the composer: one separate message per address "
+     "in a To list, sent through the Outbox."},
+    {"compose/bulkHoldSecs", Type::Int, 3, 1, 30, Reload::Live,
+     "How long the Send button has to be held down for a bulk send to start."},
+    {"compose/bulkDelayMs", Type::Int, 100, 0, 60000, Reload::Live,
+     "Pause between two consecutive messages of a bulk send, in milliseconds."},
+    {"compose/bulkSentCopy", Type::Bool, true, {}, {}, Reload::Live,
+     "File each message of a bulk send into the Sent folder (IMAP accounts). "
+     "Off keeps hundreds of copies out of Sent."},
 
     // --- db ------------------------------------------------------------------
     {"db/busyTimeoutMs", Type::Int, 15000, 1000, 300000, Reload::Restart,
@@ -945,6 +958,24 @@ QVariant AdvancedConfig::value(const char *key) const
     const int index = indexOf(key);
     Q_ASSERT_X(index >= 0, "AdvancedConfig", key); // not in kSchema: a typo in the caller
     if (index < 0)
+        return {};
+    const QReadLocker locked(&m_lock);
+    return m_effective.at(index);
+}
+
+QVariant AdvancedConfig::get(const QString &key) const
+{
+    // Not indexOf(): that caches by the literal's address, and a temporary
+    // buffer's address gets reused. A linear walk per call is fine for the
+    // handful of QML reads this serves.
+    int index = -1;
+    for (int n = 0; n < kSchemaCount; ++n) {
+        if (key == QLatin1String(kSchema[n].key)) {
+            index = n;
+            break;
+        }
+    }
+    if (index < 0 || kSchema[index].type == Type::Secret)
         return {};
     const QReadLocker locked(&m_lock);
     return m_effective.at(index);
