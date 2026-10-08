@@ -59,9 +59,9 @@ WebEngineView {
 
     // Our own context menu in place of Chromium's default, whose entries
     // (Back, Reload, View page source…) do nothing useful inside a mail
-    // sandbox. Only what acts on mail content: copying — plain, as Markdown
-    // (the interchange format issue trackers and notes speak), a link's
-    // address — and Select all.
+    // sandbox. Only what acts on mail content: copying — a link's address
+    // (first, when the click is on one), plain, as Markdown (the interchange
+    // format issue trackers and notes speak) — and Select all.
     onContextMenuRequested: function (request) {
         request.accepted = true
         contextMenu.hasSelection = request.selectedText.length > 0
@@ -72,8 +72,30 @@ WebEngineView {
         id: contextMenu
         property bool hasSelection: false
         property url linkUrl: ""
+        readonly property bool onLink: linkUrl.toString().length > 0
+        readonly property bool onMailto: linkUrl.toString().toLowerCase().indexOf("mailto:") === 0
 
-        // First, and the only entry that works without a selection: the
+        // On a link, the link comes first: that is what the right click was
+        // aimed at. A mail address copies as the address alone — the
+        // "mailto:" and any subject the link carries are the link's
+        // business, not what anyone pastes into an address field.
+        QQC2.MenuItem {
+            visible: contextMenu.onLink
+            height: visible ? implicitHeight : 0
+            text: contextMenu.onMailto ? "Copy email address" : "Copy link address"
+            icon.name: "edit-copy"
+            onTriggered: {
+                if (contextMenu.onMailto)
+                    Mail.copyToClipboard(Mail.mailtoData(contextMenu.linkUrl).to)
+                else
+                    view.triggerWebAction(WebEngineView.CopyLinkToClipboard)
+            }
+        }
+        QQC2.MenuSeparator {
+            visible: contextMenu.onLink
+            height: visible ? implicitHeight : 0
+        }
+        // Then the entry that works without a selection: the
         // common case is wanting the message, not part of it, and reaching
         // that through Select all → Copy made the reader do the renderer's
         // work. Converted from the sanitized HTML part directly, so it needs
@@ -102,13 +124,6 @@ WebEngineView {
                 view.triggerWebAction(WebEngineView.Copy)
                 Mail.clipboardSelectionToMarkdown()
             }
-        }
-        QQC2.MenuItem {
-            visible: contextMenu.linkUrl.toString().length > 0
-            height: visible ? implicitHeight : 0
-            text: "Copy link address"
-            icon.name: "edit-copy"
-            onTriggered: view.triggerWebAction(WebEngineView.CopyLinkToClipboard)
         }
         QQC2.MenuSeparator {}
         QQC2.MenuItem {

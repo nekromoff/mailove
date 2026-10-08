@@ -1,3 +1,41 @@
+mailove (3.7.1) unstable; urgency=medium
+
+  * Meeting invitations show their content. An Outlook/Exchange request
+    arrives as empty text and HTML alternatives beside a text/calendar
+    part with no name, which read as a blank message with no attachment.
+    The invitation is now a card at the top of the body — title, when
+    (in local time, Windows zone names understood), where, organizer,
+    attendees, description — and is listed as invitation.ics so it can
+    be opened in a calendar or saved. The preview line carries the same.
+  * A mailto: link clicked in a message opens this client's composer,
+    prefilled from the link (to, cc, bcc, subject, body), instead of
+    whatever the desktop has registered for mail.
+  * Right-clicking a link in a message offers the link's address first.
+    A mail address copies as the address alone ("Copy email address"),
+    not as the mailto: link with its subject and body.
+  * Replying to your own message (from Sent, or your own message in a
+    thread) addresses the original recipients rather than yourself, and
+    Reply all no longer puts your own address among the recipients.
+  * Find in the composer: Ctrl+F opens a find bar over the body —
+    as-you-type, F3/Shift+F3 for next/previous, match count, match
+    case. The match stays selected when the bar closes.
+  * Ending a link in the composer: the link dialog (Ctrl+K or the link
+    button) has an "End link" button that puts the caret after the link
+    and makes the next thing typed plain — typing at the end of a link
+    used to extend it with no way out. The link button lights up while
+    the caret is in a link.
+  * A reply quoting a signature with a file: image (Outlook for Mac
+    writes those) no longer fails to send with "Could not read the
+    pasted image": such references point into the sender's disk and are
+    dropped from the quote. A pasted image whose scratch file is gone
+    is dropped the same way, with a log line, instead of blocking the
+    send.
+  * A dismissed passphrase prompt during a bulk send now switches
+    signing off for the rest of the batch and carries on, instead of
+    cancelling the whole send.
+
+ -- dusoft <dusoft@staznosti.sk>  Thu, 08 Oct 2026 14:30:00 +0200
+
 mailove (3.7.0) unstable; urgency=medium
 
   * Bulk sending, off by default: with compose/bulkSend set in the
@@ -27,7 +65,7 @@ mailove (3.7.0) unstable; urgency=medium
     it is sampled and logged under the "stalled" line (mailove.trace),
     so a freeze can be located rather than only measured.
 
- -- dusoft <dusoft@bastadigital.com>  Wed, 30 Sep 2026 12:00:00 +0200
+ -- dusoft <dusoft@staznosti.sk>  Wed, 30 Sep 2026 12:00:00 +0200
 
 mailove (3.6.2) unstable; urgency=medium
 
@@ -54,7 +92,7 @@ mailove (3.6.2) unstable; urgency=medium
     App info not found" on every launch: it announces the desktop entry
     AppImageLauncher wrote if there is one, and none otherwise.
 
- -- dusoft <dusoft@bastadigital.com>  Sat, 27 Sep 2026 12:00:00 +0200
+ -- dusoft <dusoft@staznosti.sk>  Sat, 27 Sep 2026 12:00:00 +0200
 
 mailove (3.6.1) unstable; urgency=medium
 
@@ -83,5 +121,5 @@ mailove (3.6.1) unstable; urgency=medium
   * Copying from the activity log yields a fenced code block, so it
     pastes as a log into a bug tracker or chat rather than as prose.
 
- -- dusoft <dusoft@bastadigital.com>  Wed, 16 Sep 2026 16:00:00 +0200
+ -- dusoft <dusoft@staznosti.sk>  Wed, 16 Sep 2026 16:00:00 +0200
 

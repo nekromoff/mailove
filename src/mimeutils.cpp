@@ -6,7 +6,9 @@
 #include "attachmentstore.h"
 
 #include <QHash>
+#include <QLocale>
 #include <QRegularExpression>
+#include <QTimeZone>
 #include <QStringDecoder>
 #include <QTextBlock>
 #include <QTextCursor>
@@ -354,8 +356,400 @@ void collectAttachments(KMime::Content *node, QStringList *names)
         name = cd->filename();
     else if (auto *ct = node->contentType(); ct && !ct->name().isEmpty())
         name = ct->name();
+    // A nameless calendar part is still the invitation the reader is being
+    // asked to accept — listed under the name the reading pane gives it.
+    if (name.isEmpty() && isCalendarPart(node))
+        name = QStringLiteral("invitation.ics");
     if (!name.isEmpty())
         names->append(name);
+}
+
+bool isCalendarPart(KMime::Content *part)
+{
+    if (!part || !part->contents().isEmpty())
+        return false;
+    if (const auto *ct = std::as_const(*part).contentType()) {
+        const QByteArray mime = ct->mimeType().toLower();
+        if (mime == "text/calendar" || mime == "application/ics")
+            return true;
+    }
+    QString name;
+    if (const auto *cd = std::as_const(*part).contentDisposition())
+        name = cd->filename();
+    if (name.isEmpty()) {
+        if (const auto *ct = std::as_const(*part).contentType())
+            name = ct->name();
+    }
+    return name.endsWith(QLatin1String(".ics"), Qt::CaseInsensitive);
+}
+
+KMime::Content *findCalendarPart(KMime::Content *root)
+{
+    if (!root)
+        return nullptr;
+    if (isCalendarPart(root))
+        return root;
+    const auto children = root->contents();
+    for (KMime::Content *child : children) {
+        if (KMime::Content *found = findCalendarPart(child))
+            return found;
+    }
+    return nullptr;
+}
+
+QList<KMime::Content *> attachmentParts(KMime::Content *root)
+{
+    QList<KMime::Content *> out;
+    if (!root)
+        return out;
+    const auto listed = root->attachments();
+    // Walk the tree rather than appending to KMime's list, so a calendar
+    // part keeps its place among the files around it.
+    std::function<void(KMime::Content *)> walk = [&](KMime::Content *node) {
+        const auto children = node->contents();
+        if (!children.isEmpty()) {
+            for (KMime::Content *child : children)
+                walk(child);
+            return;
+        }
+        if (listed.contains(node) || isCalendarPart(node))
+            out.append(node);
+    };
+    walk(root);
+    return out;
+}
+
+namespace
+{
+/// One iCalendar content line, unfolded: NAME;PARAM=V;PARAM="q:v":VALUE.
+struct IcsLine {
+    QString name;
+    QHash<QString, QString> params; // upper-case names
+    QString value;
+};
+
+/// Splits a content line at the first ':' outside double quotes; parameter
+/// values may be quoted and carry ':' ("CN="Room: 2nd floor"").
+IcsLine parseIcsLine(const QString &line)
+{
+    IcsLine out;
+    bool quoted = false;
+    int colon = -1;
+    for (int i = 0; i < line.size(); ++i) {
+        const QChar c = line.at(i);
+        if (c == QLatin1Char('"'))
+            quoted = !quoted;
+        else if (c == QLatin1Char(':') && !quoted) {
+            colon = i;
+            break;
+        }
+    }
+    const QString head = colon < 0 ? line : line.left(colon);
+    out.value = colon < 0 ? QString() : line.mid(colon + 1);
+    // NAME;P=V;P=V — the same quote rule for the ';' between parameters.
+    QStringList pieces;
+    QString cur;
+    quoted = false;
+    for (const QChar c : head) {
+        if (c == QLatin1Char('"'))
+            quoted = !quoted;
+        if (c == QLatin1Char(';') && !quoted) {
+            pieces.append(cur);
+            cur.clear();
+        } else {
+            cur.append(c);
+        }
+    }
+    pieces.append(cur);
+    out.name = pieces.takeFirst().trimmed().toUpper();
+    for (const QString &p : std::as_const(pieces)) {
+        const int eq = p.indexOf(QLatin1Char('='));
+        if (eq <= 0)
+            continue;
+        QString v = p.mid(eq + 1);
+        if (v.size() >= 2 && v.startsWith(QLatin1Char('"')) && v.endsWith(QLatin1Char('"')))
+            v = v.mid(1, v.size() - 2);
+        out.params.insert(p.left(eq).trimmed().toUpper(), v);
+    }
+    return out;
+}
+
+/// RFC 5545 §3.3.11 text unescaping.
+QString unescapeIcsText(const QString &text)
+{
+    QString out;
+    out.reserve(text.size());
+    for (int i = 0; i < text.size(); ++i) {
+        const QChar c = text.at(i);
+        if (c != QLatin1Char('\\') || i + 1 >= text.size()) {
+            out.append(c);
+            continue;
+        }
+        const QChar n = text.at(++i);
+        if (n == QLatin1Char('n') || n == QLatin1Char('N'))
+            out.append(QLatin1Char('\n'));
+        else
+            out.append(n); // \, \; \\ — the character itself
+    }
+    return out;
+}
+
+/// "CN=Name:mailto:addr" → "Name <addr>"; a bare address stays itself.
+QString icsPerson(const IcsLine &line)
+{
+    QString addr = line.value.trimmed();
+    if (addr.startsWith(QLatin1String("mailto:"), Qt::CaseInsensitive))
+        addr = addr.mid(7);
+    const QString name = line.params.value(QStringLiteral("CN")).trimmed();
+    if (name.isEmpty() || name.compare(addr, Qt::CaseInsensitive) == 0)
+        return addr;
+    if (addr.isEmpty())
+        return name;
+    return name + QLatin1String(" <") + addr + QLatin1Char('>');
+}
+
+/// The zone a TZID names: IANA first, then Exchange's Windows names.
+QTimeZone zoneFor(const QString &tzid)
+{
+    if (tzid.isEmpty())
+        return {};
+    QTimeZone zone(tzid.toUtf8());
+    if (zone.isValid())
+        return zone;
+    const QByteArray iana = QTimeZone::windowsIdToDefaultIanaId(tzid.toUtf8());
+    if (!iana.isEmpty()) {
+        zone = QTimeZone(iana);
+        if (zone.isValid())
+            return zone;
+    }
+    return {};
+}
+
+/// DTSTART/DTEND in any of their shapes: 20261014T100000Z (UTC),
+/// 20261014T100000 with a TZID or floating, 20261014 (date only).
+QDateTime icsDateTime(const IcsLine &line, bool *allDay, QString *tzid)
+{
+    const QString v = line.value.trimmed();
+    if (line.params.value(QStringLiteral("VALUE")).compare(QLatin1String("DATE"),
+                                                           Qt::CaseInsensitive) == 0
+        || (v.size() == 8 && !v.contains(QLatin1Char('T')))) {
+        const QDate d = QDate::fromString(v.left(8), QStringLiteral("yyyyMMdd"));
+        if (allDay)
+            *allDay = true;
+        return d.isValid() ? QDateTime(d, QTime(0, 0)) : QDateTime();
+    }
+    const bool utc = v.endsWith(QLatin1Char('Z'));
+    const QDateTime naive = QDateTime::fromString(utc ? v.chopped(1) : v,
+                                                  QStringLiteral("yyyyMMddTHHmmss"));
+    if (!naive.isValid())
+        return {};
+    if (utc)
+        return QDateTime(naive.date(), naive.time(), QTimeZone::UTC).toLocalTime();
+    const QString id = line.params.value(QStringLiteral("TZID"));
+    if (tzid && !id.isEmpty())
+        *tzid = id;
+    const QTimeZone zone = zoneFor(id);
+    if (zone.isValid())
+        return QDateTime(naive.date(), naive.time(), zone).toLocalTime();
+    return QDateTime(naive.date(), naive.time()); // floating, or a zone nobody knows
+}
+
+QString whenText(const CalendarInvite &invite)
+{
+    const QLocale locale;
+    if (!invite.start.isValid())
+        return {};
+    if (invite.allDay) {
+        // DTEND of an all-day event is the day after the last one.
+        const QDate last = invite.end.isValid() ? invite.end.date().addDays(-1)
+                                                : invite.start.date();
+        if (last <= invite.start.date())
+            return locale.toString(invite.start.date(), QLocale::LongFormat);
+        return locale.toString(invite.start.date(), QLocale::LongFormat)
+            + QStringLiteral(" \u2013 ") + locale.toString(last, QLocale::LongFormat);
+    }
+    const QString day = locale.toString(invite.start.date(), QLocale::LongFormat);
+    const QString from = locale.toString(invite.start.time(), QLocale::ShortFormat);
+    if (!invite.end.isValid())
+        return day + QStringLiteral(", ") + from;
+    const QString to = locale.toString(invite.end.time(), QLocale::ShortFormat);
+    if (invite.end.date() == invite.start.date())
+        return day + QStringLiteral(", ") + from + QStringLiteral(" \u2013 ") + to;
+    return day + QStringLiteral(", ") + from + QStringLiteral(" \u2013 ")
+        + locale.toString(invite.end.date(), QLocale::LongFormat) + QStringLiteral(", ") + to;
+}
+
+QString inviteHeading(const CalendarInvite &invite)
+{
+    if (invite.method == QLatin1String("CANCEL"))
+        return QStringLiteral("Cancelled: ");
+    if (invite.method == QLatin1String("REPLY"))
+        return QStringLiteral("Reply to invitation: ");
+    if (invite.method == QLatin1String("REQUEST"))
+        return QStringLiteral("Invitation: ");
+    return QStringLiteral("Event: ");
+}
+
+/// A person as "Name <addr>" → "Name" linked to mailto:addr, escaped.
+QString personHtml(const QString &person)
+{
+    const int lt = person.lastIndexOf(QLatin1Char('<'));
+    QString name = person;
+    QString addr;
+    if (lt >= 0 && person.endsWith(QLatin1Char('>'))) {
+        name = person.left(lt).trimmed();
+        addr = person.mid(lt + 1, person.size() - lt - 2).trimmed();
+    } else if (person.contains(QLatin1Char('@')) && !person.contains(QLatin1Char(' '))) {
+        addr = person;
+    }
+    QString suffix;
+    if (name.endsWith(QLatin1String(" (optional)"))) {
+        name.chop(11);
+        suffix = QStringLiteral(" <span style=\"opacity:0.7\">(optional)</span>");
+    }
+    if (addr.isEmpty() || !addr.contains(QLatin1Char('@')))
+        return name.toHtmlEscaped() + suffix;
+    return QStringLiteral("<a href=\"mailto:%1\">%2</a>%3")
+        .arg(QString::fromLatin1(QUrl::toPercentEncoding(addr, "@.+-_")), name.toHtmlEscaped(),
+             suffix);
+}
+} // namespace
+
+CalendarInvite parseCalendarInvite(const QByteArray &ics)
+{
+    CalendarInvite out;
+    // Unfold: a line starting with a space or tab continues the previous one.
+    QString text = QString::fromUtf8(ics);
+    text.replace(QLatin1String("\r\n"), QLatin1String("\n"));
+    text.replace(QLatin1String("\n "), QString());
+    text.replace(QLatin1String("\n\t"), QString());
+    bool inEvent = false;
+    bool done = false;
+    for (const QString &raw : text.split(QLatin1Char('\n'))) {
+        if (raw.isEmpty() || done)
+            continue;
+        const IcsLine line = parseIcsLine(raw);
+        if (!inEvent) {
+            if (line.name == QLatin1String("METHOD"))
+                out.method = line.value.trimmed().toUpper();
+            else if (line.name == QLatin1String("BEGIN")
+                     && line.value.trimmed().compare(QLatin1String("VEVENT"),
+                                                     Qt::CaseInsensitive) == 0) {
+                inEvent = true;
+                out.valid = true;
+            }
+            continue;
+        }
+        if (line.name == QLatin1String("END")
+            && line.value.trimmed().compare(QLatin1String("VEVENT"), Qt::CaseInsensitive) == 0) {
+            done = true; // the first event only; METHOD may still follow, rarely
+            inEvent = false;
+            continue;
+        }
+        if (line.name == QLatin1String("SUMMARY"))
+            out.summary = unescapeIcsText(line.value).trimmed();
+        else if (line.name == QLatin1String("LOCATION"))
+            out.location = unescapeIcsText(line.value).trimmed();
+        else if (line.name == QLatin1String("DESCRIPTION"))
+            out.description = unescapeIcsText(line.value).trimmed();
+        else if (line.name == QLatin1String("ORGANIZER"))
+            out.organizer = icsPerson(line);
+        else if (line.name == QLatin1String("ATTENDEE")) {
+            QString who = icsPerson(line);
+            if (line.params.value(QStringLiteral("ROLE")).compare(QLatin1String("OPT-PARTICIPANT"),
+                                                                  Qt::CaseInsensitive) == 0)
+                who += QStringLiteral(" (optional)");
+            if (!who.isEmpty())
+                out.attendees.append(who);
+        } else if (line.name == QLatin1String("DTSTART"))
+            out.start = icsDateTime(line, &out.allDay, &out.timeZone);
+        else if (line.name == QLatin1String("DTEND"))
+            out.end = icsDateTime(line, nullptr, nullptr);
+    }
+    return out;
+}
+
+QString calendarInviteHtml(const CalendarInvite &invite)
+{
+    if (!invite.valid)
+        return {};
+    const QString title = inviteHeading(invite)
+        + (invite.summary.isEmpty() ? QStringLiteral("(no title)") : invite.summary);
+    QString rows;
+    auto row = [&rows](const QString &label, const QString &valueHtml) {
+        if (valueHtml.isEmpty())
+            return;
+        rows += QStringLiteral("<tr><td style=\"color:#666;padding:2px 1em 2px 0;"
+                               "vertical-align:top;white-space:nowrap\">%1</td>"
+                               "<td style=\"padding:2px 0\">%2</td></tr>")
+                    .arg(label, valueHtml);
+    };
+    row(QStringLiteral("When"), whenText(invite).toHtmlEscaped());
+    row(QStringLiteral("Where"), invite.location.toHtmlEscaped());
+    row(QStringLiteral("Organizer"), invite.organizer.isEmpty() ? QString()
+                                                                 : personHtml(invite.organizer));
+    QStringList people;
+    for (const QString &a : invite.attendees)
+        people.append(personHtml(a));
+    row(QStringLiteral("Attendees"), people.join(QStringLiteral("<br>")));
+    QString html = QStringLiteral(
+        "<div style=\"font-family:sans-serif;border:1px solid #c8c8c8;border-radius:6px;"
+        "padding:12px 14px;margin:0 0 14px 0;max-width:44em\">"
+        "<div style=\"font-size:1.1em;font-weight:bold;margin-bottom:8px\">%1</div>"
+        "<table style=\"border-collapse:collapse\">%2</table>")
+        .arg(title.toHtmlEscaped(), rows);
+    if (!invite.description.isEmpty()) {
+        html += QStringLiteral("<div style=\"margin-top:10px;white-space:pre-wrap\">%1</div>")
+            .arg(invite.description.toHtmlEscaped());
+    }
+    html += QStringLiteral("</div>");
+    return html;
+}
+
+QString calendarInviteText(const CalendarInvite &invite)
+{
+    if (!invite.valid)
+        return {};
+    QStringList lines;
+    lines << inviteHeading(invite)
+            + (invite.summary.isEmpty() ? QStringLiteral("(no title)") : invite.summary);
+    if (const QString when = whenText(invite); !when.isEmpty())
+        lines << QStringLiteral("When: ") + when;
+    if (!invite.location.isEmpty())
+        lines << QStringLiteral("Where: ") + invite.location;
+    if (!invite.organizer.isEmpty())
+        lines << QStringLiteral("Organizer: ") + invite.organizer;
+    if (!invite.attendees.isEmpty())
+        lines << QStringLiteral("Attendees: ") + invite.attendees.join(QStringLiteral(", "));
+    if (!invite.description.isEmpty())
+        lines << QString() << invite.description;
+    return lines.join(QLatin1Char('\n'));
+}
+
+bool htmlIsBlank(const QString &html)
+{
+    if (html.trimmed().isEmpty())
+        return true;
+    // Parse only, never laid out — see plainTextWithLinks().
+    QTextDocument doc;
+    doc.setHtml(html);
+    const QString text = doc.toPlainText();
+    for (const QChar c : text) {
+        if (!c.isSpace() && c != QChar(0xFFFC)) // object replacement = an image
+            return false;
+    }
+    // Images are content: a blank-text page with a picture is not blank.
+    return !text.contains(QChar(0xFFFC));
+}
+
+QString prependToHtmlBody(const QString &html, const QString &card)
+{
+    static const QRegularExpression bodyTag(QStringLiteral("<body\\b[^>]*>"),
+                                            QRegularExpression::CaseInsensitiveOption);
+    const QRegularExpressionMatch m = bodyTag.match(html);
+    if (!m.hasMatch())
+        return card + html;
+    return html.left(m.capturedEnd()) + card + html.mid(m.capturedEnd());
 }
 
 namespace
@@ -497,6 +891,40 @@ QList<InlineImage> takeInlineImages(QString &html, const QString &idDomain)
     out += QStringView(html).sliced(copied);
     html = out;
     return images;
+}
+
+int dropFileImages(QString &html, const std::function<bool(const QString &path)> &drop)
+{
+    static const QRegularExpression imgRe(
+        QStringLiteral("<img\\b[^>]*>"), QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression srcRe(
+        QStringLiteral("\\bsrc\\s*=\\s*([\"'])(file:[^\"']*)\\1"),
+        QRegularExpression::CaseInsensitiveOption);
+    if (!html.contains(QLatin1String("file:"), Qt::CaseInsensitive))
+        return 0;
+
+    QString out;
+    qsizetype copied = 0;
+    int dropped = 0;
+    auto tags = imgRe.globalMatch(html);
+    while (tags.hasNext()) {
+        const auto tag = tags.next();
+        const auto src = srcRe.match(tag.captured());
+        if (!src.hasMatch())
+            continue;
+        if (!drop(QUrl(src.captured(2)).toLocalFile()))
+            continue;
+        if (dropped == 0)
+            out.reserve(html.size());
+        out += QStringView(html).sliced(copied, tag.capturedStart() - copied);
+        copied = tag.capturedEnd();
+        ++dropped;
+    }
+    if (dropped == 0)
+        return 0;
+    out += QStringView(html).sliced(copied);
+    html = out;
+    return dropped;
 }
 
 QString plainTextWithLinks(const QString &html)

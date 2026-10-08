@@ -614,6 +614,13 @@ public:
     Q_INVOKABLE void saveAttachmentToDownloads(int index);
     /// Opens a link from a message in the system browser / mail handler.
     Q_INVOKABLE void openExternalUrl(const QUrl &url);
+    /// The compose fields a mailto: link asks for (RFC 6068): {to, cc, bcc,
+    /// subject, body}, every header percent-decoded, addresses joined with
+    /// ", ". Empty map for anything that is not a mailto: link. A clicked
+    /// mailto opens this client's composer, not whatever the desktop has
+    /// registered for mail — which may well be this client again, in a
+    /// second instance.
+    Q_INVOKABLE static QVariantMap mailtoData(const QUrl &url);
 
     // --- Cache maintenance (Settings → Storage) ---
     /// Human-readable cache size, e.g. "13.4 GB (6.2 GB reclaimable)".
@@ -1175,14 +1182,14 @@ private:
     /// flag is set. On failure \a done is never called and sendFailed() has
     /// been emitted — a message that could not be encrypted is not a message
     /// to send in the clear.
-    /// A dismissed passphrase prompt sends one message unsigned ("not this
-    /// time"); with \a cancelAborts it is a failure instead. That is the bulk
-    /// send's setting: one dismissal per recipient would put the same prompt
-    /// back on screen hundreds of times, and Cancel there means "not at all".
+    /// A dismissed passphrase prompt sends the message unsigned ("not this
+    /// time"); \a signCancelled, when given, is told so the caller can stop
+    /// asking — the bulk send switches signing off for the rest of its
+    /// batch rather than putting the same prompt up once per recipient.
     void applyOutgoingCrypto(const std::shared_ptr<KMime::Message> &msg,
                              const QStringList &recipients, bool sign, bool encrypt,
                              std::function<void(const QByteArray &)> done,
-                             bool cancelAborts = false);
+                             std::function<void()> signCancelled = {});
 
     /// Presents \a message in the reading pane's context.
     void presentMessage(const std::shared_ptr<KMime::Message> &message);

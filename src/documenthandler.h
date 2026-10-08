@@ -26,6 +26,8 @@ class DocumentHandler : public QObject
     Q_PROPERTY(bool bold READ bold WRITE setBold NOTIFY formatChanged)
     Q_PROPERTY(bool italic READ italic WRITE setItalic NOTIFY formatChanged)
     Q_PROPERTY(int fontSize READ fontSize WRITE setFontSize NOTIFY formatChanged)
+    Q_PROPERTY(bool inLink READ inLink NOTIFY formatChanged)
+    Q_PROPERTY(bool linkEnded READ linkEnded NOTIFY linkEndedChanged)
     /// True while a reply/forward quote is still streaming into the document.
     Q_PROPERTY(bool quoteStreaming READ quoteStreaming NOTIFY quoteStreamingChanged)
 
@@ -103,6 +105,34 @@ public:
     /// the block gets a plain space after it, so what is typed next is not
     /// part of it.
     Q_INVOKABLE void setLink(int start, int end, const QString &text, const QString &href);
+    /// "End link": the caret goes to the end of the link it sits in, and the
+    /// next thing typed there goes in unlinked. The editor's own typing takes
+    /// the format of the character before the caret — at the end of a link,
+    /// the link — and nothing public changes that, so the editor hands the
+    /// next key press to insertAfterEndedLink() instead. Returns false when
+    /// the caret is not in a link, leaving the editor as it was.
+    Q_INVOKABLE bool endLink();
+    /// True between endLink() and the next edit or caret move: the composer
+    /// routes the next key through insertAfterEndedLink() while this holds.
+    bool linkEnded() const { return m_linkEndPosition >= 0; }
+    /// Whether the caret or selection sits in a link — the toolbar's link
+    /// button lights up, so "still in the link" is visible before typing.
+    bool inLink() const;
+    /// Inserts \a text ("\n" for a new paragraph) at the caret in the
+    /// caret's formatting minus the link, as autoLinkBeforeCursor() does
+    /// for the space after a typed address. Only while linkEnded; false
+    /// otherwise so the editor's own insert runs.
+    Q_INVOKABLE bool insertAfterEndedLink(const QString &text);
+
+    // --- find ----------------------------------------------------------------
+
+    /// Find in the body. Searches for \a term from \a from — forward, or
+    /// backward from there with \a backward — wrapping round the document,
+    /// and answers {found, start, end, index, total}: the match's range, its
+    /// ordinal among all matches, and how many there are. A term that is
+    /// nowhere answers found=false and total=0.
+    Q_INVOKABLE QVariantMap findText(const QString &term, int from, bool backward,
+                                     bool caseSensitive) const;
 
     /// Ctrl+Shift+V: inserts the clipboard as unformatted text, taking the
     /// formatting of the text it lands in rather than dragging the source
@@ -187,6 +217,7 @@ Q_SIGNALS:
     /// inserted, since the editor's own caret does not follow an edit made
     /// through another cursor at the same position.
     void caretMoveRequested(int position);
+    void linkEndedChanged();
 
     void documentChanged();
     void cursorPositionChanged();
@@ -238,6 +269,8 @@ private:
     std::unique_ptr<QTemporaryDir> m_imageDir;
     int m_imageCount = 0;
     int m_cursorPosition = -1;
+    /// Where endLink() left the caret; -1 when no link has just been ended.
+    int m_linkEndPosition = -1;
     int m_selectionStart = 0;
     int m_selectionEnd = 0;
 };

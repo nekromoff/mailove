@@ -35,6 +35,7 @@
 #include <QTemporaryDir>
 #include <QThread>
 #include <QTimer>
+#include <QUrlQuery>
 
 #include <limits>
 
@@ -2172,6 +2173,13 @@ std::shared_ptr<KMime::Message> MailClient::composeMessage(
     // body parts are built: the HTML that goes into the message is the
     // rewritten one.
     QString bodyHtml = html;
+    // An image whose file is gone (a scratch file cleaned up under an open
+    // composer, or a stray reference that slipped in) is dropped with a log
+    // line rather than holding the whole message hostage.
+    if (const int n = MimeUtils::dropFileImages(
+            bodyHtml, [](const QString &path) { return !QFileInfo(path).isReadable(); })) {
+        qCWarning(logTrace, "compose: dropped %d image(s) whose local file is unreadable", n);
+    }
     const QList<MimeUtils::InlineImage> inlineImages =
         MimeUtils::takeInlineImages(bodyHtml, fromAddr.section(QLatin1Char('@'), 1));
     struct ImagePart {
@@ -2383,7 +2391,7 @@ bool MailClient::accountPgpAutoWkd() const
 void MailClient::applyOutgoingCrypto(const std::shared_ptr<KMime::Message> &msg,
                                      const QStringList &recipients, bool sign, bool encrypt,
                                      std::function<void(const QByteArray &)> done,
-                                     bool cancelAborts)
+                                     std::function<void()> signCancelled)
 {
     const QByteArray plain = msg->encodedContent(KMime::NewlineType::CRLF);
     if (!sign && !encrypt) {
@@ -2479,9 +2487,9 @@ void MailClient::applyOutgoingCrypto(const std::shared_ptr<KMime::Message> &msg,
     auto *conn = new QMetaObject::Connection;
     *conn = connect(m_pgp, &PgpEngine::signFinished, this,
                     [this, conn, job, plain, parts, encrypt, encryptStep, done,
-                     cancelAborts](quint64 id, const QByteArray &signature,
-                                   const QString &micalg, const QString &error,
-                                   bool cancelled) {
+                     signCancelled](quint64 id, const QByteArray &signature,
+                                    const QString &micalg, const QString &error,
+                                    bool cancelled) {
                         if (id != job)
                             return;
                         disconnect(*conn);
@@ -2491,11 +2499,9 @@ void MailClient::applyOutgoingCrypto(const std::shared_ptr<KMime::Message> &msg,
                         // than bouncing the user back into the same prompt.
                         // Encryption never needed the passphrase, so that half
                         // still happens when it was asked for.
-                        if (cancelled && cancelAborts) {
-                            Q_EMIT sendFailed(tr("Signing was cancelled — nothing was sent."));
-                            return;
-                        }
                         if (cancelled) {
+                            if (signCancelled)
+                                signCancelled();
                             setStatus(encrypt
                                           ? tr("Signing cancelled — sending encrypted "
                                                "but unsigned")
@@ -2799,6 +2805,10 @@ void MailClient::sendBulk(const QString &addresses, const QString &subject,
     // rows collects the finished wires until the last one lands.
     auto rows = std::make_shared<QList<MailStore::OutboxMessage>>();
     rows->reserve(list.size());
+    // One dismissed passphrase prompt switches signing off for the whole
+    // batch: the prompt was answered, and asking again per recipient would
+    // be asking the same question a few hundred times.
+    auto signOff = std::make_shared<bool>(false);
     // The step holds only a weak reference to itself: the strong one lives in
     // whatever is waiting to call it next (the crypto continuation, the
     // zero-length timer), so the chain owns itself exactly as long as it runs
@@ -2806,7 +2816,7 @@ void MailClient::sendBulk(const QString &addresses, const QString &subject,
     auto step = std::make_shared<std::function<void(int)>>();
     std::weak_ptr<std::function<void(int)>> weakStep = step;
     *step = [this, list, subject, body, attachments, sign, encrypt, fromAddr,
-             hasAttachments, rows, weakStep](int index) {
+             hasAttachments, rows, signOff, weakStep](int index) {
         if (index >= list.size()) {
             const qint64 batch = m_store.enqueueOutboxBatch(*rows);
             if (batch == 0) {
@@ -2842,7 +2852,7 @@ void MailClient::sendBulk(const QString &addresses, const QString &subject,
         auto step = weakStep.lock();
         if (!step)
             return;
-        applyOutgoingCrypto(msg, toList, sign, encrypt,
+        applyOutgoingCrypto(msg, toList, sign && !*signOff, encrypt,
                             [this, toList, fromAddr, subject, encrypt, hasAttachments, rows,
                              step, index](const QByteArray &wire) {
             MailStore::OutboxMessage row;
@@ -2857,7 +2867,10 @@ void MailClient::sendBulk(const QString &addresses, const QString &subject,
             // runs synchronously, and a thousand recipients would be a
             // thousand nested frames of MIME assembly.
             QTimer::singleShot(0, this, [step, index] { (*step)(index + 1); });
-        }, /*cancelAborts=*/true);
+        }, [this, signOff] {
+            *signOff = true;
+            setStatus(tr("Signing cancelled — the bulk send goes out unsigned"));
+        });
     };
     (*step)(0);
 }
@@ -3131,6 +3144,12 @@ QString restoreDraftImages(QString html, KMime::Content *root)
     static const QRegularExpression cidRe(
         QStringLiteral("(\\bsrc\\s*=\\s*)([\"'])cid:([^\"']+)\\2"),
         QRegularExpression::CaseInsensitiveOption);
+    // file: images in a stored message are never ours — our own drafts are
+    // saved with cid: parts — so they point into the sender's disk. Left in,
+    // composeMessage() would try to embed that path from *this* machine:
+    // a send failure when it is missing, a leaked local file when it exists.
+    if (const int n = MimeUtils::dropFileImages(html, [](const QString &) { return true; }))
+        qCInfo(logTrace, "quote: dropped %d foreign file: image reference(s)", n);
     if (!root || !html.contains(QLatin1String("cid:"), Qt::CaseInsensitive))
         return html;
 
@@ -3410,10 +3429,28 @@ QVariantMap MailClient::replyDataFor(MessageContext *ctx, bool replyAll)
         return out;
     };
 
-    // Reply target: Reply-To when the sender set one, else From.
-    QStringList to = addressesOf(msg->replyTo());
-    if (to.isEmpty())
-        to = addressesOf(msg->from());
+    // A message the user sent themselves (Sent folder, or their own message
+    // in a thread): replying means following up with the original
+    // recipients, not writing to oneself.
+    const QStringList own = ownAddresses();
+    auto isOwn = [&own](const QString &addr) {
+        return own.contains(SpamHeuristics::normalizeAddress(addr));
+    };
+    const QStringList fromAddrs = addressesOf(msg->from());
+    const bool fromSelf = !fromAddrs.isEmpty() && isOwn(fromAddrs.first());
+
+    // Reply target: Reply-To when the sender set one, else From. For our own
+    // message: its To (self-addressed mail keeps going to self).
+    QStringList to;
+    if (fromSelf) {
+        to = addressesOf(msg->to());
+        if (to.isEmpty())
+            to = fromAddrs;
+    } else {
+        to = addressesOf(msg->replyTo());
+        if (to.isEmpty())
+            to = fromAddrs;
+    }
     to.removeDuplicates();
 
     // Reply-all: everyone in the original To/Cc except us and the target.
@@ -3424,7 +3461,7 @@ QVariantMap MailClient::replyDataFor(MessageContext *ctx, bool replyAll)
             seen.insert(addr.toLower());
         const QStringList others = addressesOf(msg->to()) + addressesOf(msg->cc());
         for (const QString &addr : others) {
-            if (!seen.contains(addr.toLower())) {
+            if (!seen.contains(addr.toLower()) && !isOwn(addr)) {
                 seen.insert(addr.toLower());
                 cc.append(addr);
             }
@@ -7114,34 +7151,18 @@ void MailClient::fetchHeadersByUids(const QList<qint64> &uids, const QString &lo
     });
 }
 
-/// True for MIME parts that carry an iCalendar invite (.ics).
-static bool partIsCalendar(KMime::Content *part)
-{
-    if (const auto *ct = std::as_const(*part).contentType()) {
-        const QByteArray mime = ct->mimeType().toLower();
-        if (mime == "text/calendar" || mime == "application/ics")
-            return true;
-    }
-    QString name;
-    if (const auto *cd = std::as_const(*part).contentDisposition())
-        name = cd->filename();
-    if (name.isEmpty()) {
-        if (const auto *ct = std::as_const(*part).contentType())
-            name = ct->name();
-    }
-    return name.toLower().endsWith(QLatin1String(".ics"));
-}
-
 /// Splits a parsed message's attachments into ordinary files and .ics
 /// invitations, and names the AttachKind that pair means. One place, because
 /// the body pass and the tooltip's hover-heal must never disagree about the
 /// same message.
 static int classifyAttachments(KMime::Message *msg, int *files, int *calendars)
 {
-    const auto parts = msg->attachments();
+    // The same list the reading pane shows, nameless invitation parts
+    // included (MimeUtils::attachmentParts).
+    const auto parts = MimeUtils::attachmentParts(msg);
     int ics = 0;
     for (KMime::Content *part : parts) {
-        if (partIsCalendar(part))
+        if (MimeUtils::isCalendarPart(part))
             ++ics;
     }
     const int other = int(parts.size()) - ics;
@@ -8974,6 +8995,46 @@ bool MailClient::refetchBodyForVerification(const QString &folder, qint64 uid,
         },
         /*interactive=*/true);
     return true;
+}
+
+QVariantMap MailClient::mailtoData(const QUrl &url)
+{
+    if (url.scheme().compare(QLatin1String("mailto"), Qt::CaseInsensitive) != 0)
+        return {};
+    // The part before "?" is the To list; the query carries the rest. Both
+    // are percent-encoded, and "," between addresses may itself be encoded.
+    QStringList to;
+    const QString pathPart = url.path(QUrl::FullyDecoded);
+    for (const QString &a : pathPart.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+        if (!a.trimmed().isEmpty())
+            to.append(a.trimmed());
+    }
+    QString cc, bcc, subject, body;
+    const QUrlQuery query(url.query(QUrl::FullyEncoded));
+    const auto items = query.queryItems(QUrl::FullyDecoded);
+    for (const auto &item : items) {
+        const QString key = item.first.toLower();
+        // "+" is a literal in a mailto query (RFC 6068 §2), not a space.
+        const QString value = item.second;
+        if (key == QLatin1String("to"))
+            to.append(value.split(QLatin1Char(','), Qt::SkipEmptyParts));
+        else if (key == QLatin1String("cc"))
+            cc = value;
+        else if (key == QLatin1String("bcc"))
+            bcc = value;
+        else if (key == QLatin1String("subject"))
+            subject = value;
+        else if (key == QLatin1String("body"))
+            body = value;
+    }
+    for (QString &a : to)
+        a = a.trimmed();
+    to.removeAll(QString());
+    return {{QStringLiteral("to"), to.join(QStringLiteral(", "))},
+            {QStringLiteral("cc"), cc},
+            {QStringLiteral("bcc"), bcc},
+            {QStringLiteral("subject"), subject},
+            {QStringLiteral("body"), body}};
 }
 
 void MailClient::openExternalUrl(const QUrl &url)

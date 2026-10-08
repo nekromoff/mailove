@@ -56,6 +56,15 @@ ColumnLayout {
     /// The full-fidelity forward: original bytes as a message/rfc822
     /// attachment (the Forward button's press-and-hold option).
     signal forwardAsAttachmentRequested()
+    /// A mailto: link in the message was clicked: the composer, prefilled
+    /// from the link, rather than the desktop's mail handler.
+    signal mailtoRequested(url link)
+    function openLink(link) {
+        if (String(link).toLowerCase().indexOf("mailto:") === 0)
+            viewer.mailtoRequested(link)
+        else
+            Mail.openExternalUrl(link)
+    }
 
     // Reset to the "Select a message" placeholder (e.g. the shown message was
     // deleted and the list is now empty).
@@ -1094,16 +1103,17 @@ ColumnLayout {
         }
 
         onNavigationRequested: function (request) {
-            // Never navigate inside the viewer; open link clicks externally.
+            // Never navigate inside the viewer; open link clicks externally —
+            // except a mail address, which this client answers itself.
             if (request.navigationType === WebEngineNavigationRequest.LinkClickedNavigation) {
                 request.reject()
-                Mail.openExternalUrl(request.url)
+                viewer.openLink(request.url)
             }
         }
 
         // target="_blank" links (most email links) arrive here, not as navigation.
         onNewWindowRequested: function (request) {
-            Mail.openExternalUrl(request.requestedUrl)
+            viewer.openLink(request.requestedUrl)
         }
     }
 

@@ -414,6 +414,7 @@ Kirigami.ApplicationWindow {
             composeSheet().openForward(context.forwardData()))
         w.forwardAsAttachmentRequested.connect(() =>
             composeSheet().openForward(context.forwardAsAttachmentData()))
+        w.mailtoRequested.connect(link => composeSheet().openMailto(link))
         addTab(w)
     }
 
@@ -4290,6 +4291,7 @@ Kirigami.ApplicationWindow {
                             onForwardRequested: composeSheet().openForward(Mail.forwardData())
                             onForwardAsAttachmentRequested:
                                 composeSheet().openForward(Mail.forwardAsAttachmentData())
+                            onMailtoRequested: link => composeSheet().openMailto(link)
                         }
                         }
                     }

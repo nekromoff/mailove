@@ -29,6 +29,7 @@ Item {
     signal replyRequested(bool replyAll)
     signal forwardRequested()
     signal forwardAsAttachmentRequested()
+    signal mailtoRequested(url link)
 
     /// Tab page contract (see Main.qml).
     property string title: context && context.subject.length > 0
@@ -75,5 +76,6 @@ Item {
         onReplyRequested: replyAll => win.replyRequested(replyAll)
         onForwardRequested: win.forwardRequested()
         onForwardAsAttachmentRequested: win.forwardAsAttachmentRequested()
+        onMailtoRequested: link => win.mailtoRequested(link)
     }
 }

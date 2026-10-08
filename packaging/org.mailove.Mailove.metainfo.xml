@@ -33,6 +33,29 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.7.1" date="2026-10-08" type="stable">
+      <description>
+        <ul>
+          <li>Meeting invitations (Outlook, Exchange, Google) show as a card
+              with the time, place, organizer and attendees, and the .ics is
+              listed as an attachment; such messages used to look blank.</li>
+          <li>A mailto: link in a message opens this client's composer,
+              prefilled from the link.</li>
+          <li>Right-clicking a link offers its address first; a mail address
+              copies as the plain address.</li>
+          <li>Replying to your own message addresses its original recipients,
+              and Reply all leaves your own address out.</li>
+          <li>Find in the composer (Ctrl+F), with next/previous and a match
+              count.</li>
+          <li>The link dialog can end a link, so typing continues after it
+              unlinked; the link button lights up inside a link.</li>
+          <li>A quoted signature with a file: image no longer blocks sending
+              a reply.</li>
+          <li>Cancelling the passphrase prompt during a bulk send sends the
+              rest of the batch unsigned instead of cancelling it.</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.7.0" date="2026-09-30" type="stable">
       <description>
         <ul>

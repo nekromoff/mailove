@@ -56,7 +56,9 @@ void MessagePresenter::collectAttachments(MessageContext *ctx, KMime::Content *r
 {
     ctx->m_attachmentParts.clear();
     ctx->m_attachments.clear();
-    const auto parts = root->attachments();
+    // KMime's list plus the nameless calendar part of an invitation — see
+    // MimeUtils::attachmentParts().
+    const auto parts = MimeUtils::attachmentParts(root);
     for (KMime::Content *part : parts) {
         QString name;
         if (const auto *cd = std::as_const(*part).contentDisposition())
@@ -68,6 +70,8 @@ void MessagePresenter::collectAttachments(MessageContext *ctx, KMime::Content *r
         // Sanitize once, here, so the list label, the confirmation dialog, the
         // risky-extension check and the on-disk name all agree on one string.
         name = sanitizeFileName(QFileInfo(name).fileName());
+        if (name.isEmpty() && MimeUtils::isCalendarPart(part))
+            name = QStringLiteral("invitation.ics");
         if (name.isEmpty())
             name = tr("attachment %1").arg(ctx->m_attachmentParts.size() + 1);
 
@@ -506,6 +510,25 @@ void MessagePresenter::applyBodyParts(MessageContext *ctx, KMime::Message *root,
     ctx->m_htmlBody = htmlPart ? htmlPart->decodedText() : QString();
     ctx->m_textBody = textPart ? textPart->decodedText() : QString();
 
+    // A meeting invitation: the text and HTML alternatives Outlook sends are
+    // empty (a Word page around one &nbsp;), and what the message is about
+    // — when, where, who — lives only in the text/calendar sibling. A card
+    // of that goes on top of the body, which is then usually nothing.
+    if (!opaque) {
+        if (KMime::Content *cal = MimeUtils::findCalendarPart(root)) {
+            const MimeUtils::CalendarInvite invite =
+                MimeUtils::parseCalendarInvite(cal->decodedBody());
+            if (invite.valid) {
+                const QString card = MimeUtils::calendarInviteHtml(invite);
+                ctx->m_htmlBody = MimeUtils::htmlIsBlank(ctx->m_htmlBody)
+                    ? card : MimeUtils::prependToHtmlBody(ctx->m_htmlBody, card);
+                const QString lines = MimeUtils::calendarInviteText(invite);
+                ctx->m_textBody = ctx->m_textBody.trimmed().isEmpty()
+                    ? lines : lines + QStringLiteral("\n\n") + ctx->m_textBody;
+            }
+        }
+    }
+
     if (opaque) {
         // The viewer needs something to show while gpg works, or in place of a
         // message it could not open. This is the only body it gets — the
@@ -555,6 +578,7 @@ void MessagePresenter::applyBodyParts(MessageContext *ctx, KMime::Message *root,
         findAttachedKey(ctx, root);
     }
 
-    ctx->m_bodyUrl = (htmlPart && !junk) ? htmlViewUrl(ctx) : textViewUrl(ctx);
+    // The body, not the part: an invitation's card is HTML of its own.
+    ctx->m_bodyUrl = (!ctx->m_htmlBody.isEmpty() && !junk) ? htmlViewUrl(ctx) : textViewUrl(ctx);
 }
 

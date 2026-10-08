@@ -29,6 +29,7 @@
 #include <QDir>
 #include <QStandardPaths>
 #include <QTextStream>
+#include <QTimeZone>
 
 #include <kmime/content.h>
 #include <kmime/message.h>
@@ -307,6 +308,27 @@ int main(int argc, char **argv)
                   && html == before,
               "a body with no pasted image is left as it is");
     }
+    // file: images that cannot or must not be embedded: the reference goes,
+    // everything else stays. An Outlook-for-Mac signature quoted in a reply
+    // used to block the send with "Could not read the pasted image".
+    {
+        QString html = QStringLiteral(
+            "<p>hi</p><img src=\"file:////Users/someone/Library/sig.png\" width=\"80\">"
+            "<img src='file:///tmp/x/keep.png'><img src=\"cid:part@x\"><p>bye</p>");
+        const int n = MimeUtils::dropFileImages(html, [](const QString &path) {
+            return path.startsWith(QLatin1String("//Users/"));
+        });
+        check(n == 1, "only the image the predicate picks is dropped");
+        check(!html.contains(QLatin1String("Users")), "the dropped tag is gone whole");
+        check(html.contains(QLatin1String("file:///tmp/x/keep.png"))
+                  && html.contains(QLatin1String("cid:part@x"))
+                  && html.startsWith(QLatin1String("<p>hi</p>"))
+                  && html.endsWith(QLatin1String("<p>bye</p>")),
+              "other images and the text around them are untouched");
+        check(MimeUtils::dropFileImages(html, [](const QString &) { return true; }) == 1
+                  && !html.contains(QLatin1String("file:")),
+              "drop-all leaves no local reference behind");
+    }
 
     // Blank-line condensing: at most two empty lines survive between text,
     // and invisible-ink lines (nbsp spacers, object-replacement characters
@@ -553,6 +575,136 @@ int main(int argc, char **argv)
                                             ascii->subject()->asUnicodeString())
                   == QStringLiteral("Refund notice"),
               "an ASCII payload is nobody's evidence of a wrong label");
+    }
+
+    {
+        // An Outlook meeting request, the shape Exchange sends: a
+        // multipart/alternative whose text part is empty, whose HTML part is
+        // a Word page around one &nbsp;, and whose third alternative is the
+        // text/calendar carrying everything — with no disposition and no
+        // name, so KMime lists no attachment at all.
+        const QByteArray ics = QByteArrayLiteral(
+            "BEGIN:VCALENDAR\r\n"
+            "METHOD:REQUEST\r\n"
+            "PRODID:Microsoft Exchange Server 2010\r\n"
+            "VERSION:2.0\r\n"
+            "BEGIN:VEVENT\r\n"
+            "ORGANIZER;CN=Milan Organizer:mailto:milan@partners.example\r\n"
+            "ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=Daniel Rea\r\n"
+            " der:mailto:daniel@hotels.example\r\n"
+            "ATTENDEE;ROLE=OPT-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=\"Room: 2nd\r\n"
+            " \":mailto:room@partners.example\r\n"
+            "DESCRIPTION;LANGUAGE=sk-SK:\\n\r\n"
+            "UID:0400000082\r\n"
+            "SUMMARY;LANGUAGE=sk-SK:stretnutie <b>Hotels</b>\r\n"
+            "DTSTART;TZID=Central Europe Standard Time:20261014T100000\r\n"
+            "DTEND;TZID=Central Europe Standard Time:20261014T110000\r\n"
+            "LOCATION;LANGUAGE=sk-SK:PARTNERS\\, Main square 7\\, Bratislava\\, 2nd Floor meeti\r\n"
+            " ng room\r\n"
+            "END:VEVENT\r\n"
+            "END:VCALENDAR\r\n");
+        QByteArray raw;
+        raw += "From: Milan Organizer <milan@partners.example>\r\n";
+        raw += "To: daniel@hotels.example\r\n";
+        raw += "Subject: stretnutie\r\n";
+        raw += "MIME-Version: 1.0\r\n";
+        raw += "Content-Type: multipart/alternative; boundary=\"ALT\"\r\n";
+        raw += "\r\n";
+        raw += "--ALT\r\n";
+        raw += "Content-Type: text/plain; charset=\"iso-8859-2\"\r\n";
+        raw += "Content-Transfer-Encoding: quoted-printable\r\n";
+        raw += "\r\n";
+        raw += "\r\n";
+        raw += "--ALT\r\n";
+        raw += "Content-Type: text/html; charset=\"iso-8859-2\"\r\n";
+        raw += "Content-Transfer-Encoding: quoted-printable\r\n";
+        raw += "\r\n";
+        raw += "<html><head><style>p.MsoNormal{margin:0cm}</style></head>\r\n";
+        raw += "<body lang=3D\"SK\"><div class=3D\"WordSection1\">\r\n";
+        raw += "<p class=3D\"MsoNormal\"><o:p>&nbsp;</o:p></p></div></body></html>\r\n";
+        raw += "--ALT\r\n";
+        raw += "Content-Type: text/calendar; charset=\"utf-8\"; method=REQUEST\r\n";
+        raw += "Content-Transfer-Encoding: base64\r\n";
+        raw += "\r\n";
+        raw += ics.toBase64() + "\r\n";
+        raw += "--ALT--\r\n";
+        auto msg = std::make_shared<KMime::Message>();
+        msg->setContent(KMime::CRLFtoLF(raw));
+        msg->parse();
+
+        check(msg->attachments().isEmpty(), "KMime itself lists no attachment for the invite");
+        KMime::Content *cal = MimeUtils::findCalendarPart(msg.get());
+        check(cal != nullptr, "the text/calendar alternative is found");
+        const auto parts = MimeUtils::attachmentParts(msg.get());
+        check(parts.size() == 1 && parts.first() == cal,
+              "and it is the one attachment the reading pane lists");
+        QStringList names;
+        MimeUtils::collectAttachments(msg.get(), &names);
+        check(names == QStringList{QStringLiteral("invitation.ics")},
+              "collectAttachments names it invitation.ics");
+
+        const QString html = msg->mainBodyPart("text/html")->decodedText();
+        check(MimeUtils::htmlIsBlank(html), "the Word &nbsp; page counts as blank");
+        check(!MimeUtils::htmlIsBlank(QStringLiteral("<p>Hi</p>")), "a page with text does not");
+        check(!MimeUtils::htmlIsBlank(QStringLiteral("<img src=\"cid:x\">")),
+              "nor a page that is only a picture");
+
+        const MimeUtils::CalendarInvite inv = MimeUtils::parseCalendarInvite(cal ? cal->decodedBody() : ics);
+        check(inv.valid && inv.method == QLatin1String("REQUEST"), "VEVENT + METHOD read");
+        check(inv.summary == QStringLiteral("stretnutie <b>Hotels</b>"), "summary read verbatim");
+        check(inv.location == QStringLiteral("PARTNERS, Main square 7, Bratislava, 2nd Floor meeting room"),
+              "location unfolded and unescaped");
+        check(inv.description.isEmpty(), "an escaped newline alone is no description");
+        check(inv.organizer == QStringLiteral("Milan Organizer <milan@partners.example>"),
+              "organizer as name <address>");
+        check(inv.attendees.size() == 2
+                  && inv.attendees.at(0) == QStringLiteral("Daniel Reader <daniel@hotels.example>")
+                  && inv.attendees.at(1) == QStringLiteral("Room: 2nd <room@partners.example> (optional)"),
+              "attendees: folded name, quoted CN with a colon, optional marked");
+        // 10:00 in Exchange's "Central Europe Standard Time" is 08:00 UTC on
+        // that (summer-time) date, whatever zone this machine is in.
+        check(inv.start.isValid()
+                  && inv.start.toUTC() == QDateTime(QDate(2026, 10, 14), QTime(8, 0), QTimeZone::UTC),
+              "a Windows zone name resolves; start is 08:00 UTC");
+        check(inv.end.toUTC() == QDateTime(QDate(2026, 10, 14), QTime(9, 0), QTimeZone::UTC),
+              "end is 09:00 UTC");
+        check(!inv.allDay && inv.timeZone == QStringLiteral("Central Europe Standard Time"),
+              "timed event, TZID remembered");
+
+        const QString card = MimeUtils::calendarInviteHtml(inv);
+        check(card.contains(QStringLiteral("Invitation: stretnutie &lt;b&gt;Hotels&lt;/b&gt;")),
+              "card heading, summary escaped");
+        check(card.contains(QStringLiteral("href=\"mailto:milan@partners.example\"")),
+              "organizer linked as mailto");
+        check(card.contains(QStringLiteral("Main square 7")) && !card.contains(QStringLiteral("\\,")),
+              "location on the card, unescaped");
+        const QString text = MimeUtils::calendarInviteText(inv);
+        check(text.startsWith(QStringLiteral("Invitation: stretnutie <b>Hotels</b>\nWhen: "))
+                  && text.contains(QStringLiteral("Where: PARTNERS, Main square 7")),
+              "text rendering for the preview");
+
+        check(MimeUtils::prependToHtmlBody(QStringLiteral("<html><head><style>x</style></head><body class=\"a\"><p>t</p></body></html>"),
+                                           QStringLiteral("[card]"))
+                  == QStringLiteral("<html><head><style>x</style></head><body class=\"a\">[card]<p>t</p></body></html>"),
+              "card goes right after the body tag");
+        check(MimeUtils::prependToHtmlBody(QStringLiteral("<p>t</p>"), QStringLiteral("[card]"))
+                  == QStringLiteral("[card]<p>t</p>"),
+              "or in front of a bare fragment");
+
+        // Date-only and UTC shapes.
+        const auto allDay = MimeUtils::parseCalendarInvite(QByteArrayLiteral(
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Day\nDTSTART;VALUE=DATE:20261220\n"
+            "DTEND;VALUE=DATE:20261221\nEND:VEVENT\nEND:VCALENDAR\n"));
+        check(allDay.valid && allDay.allDay && allDay.start.date() == QDate(2026, 12, 20),
+              "all-day event");
+        const auto utc = MimeUtils::parseCalendarInvite(QByteArrayLiteral(
+            "BEGIN:VCALENDAR\nMETHOD:CANCEL\nBEGIN:VEVENT\nDTSTART:20261220T150000Z\nEND:VEVENT\nEND:VCALENDAR\n"));
+        check(utc.start.toUTC() == QDateTime(QDate(2026, 12, 20), QTime(15, 0), QTimeZone::UTC),
+              "UTC stamp");
+        check(MimeUtils::calendarInviteText(utc).startsWith(QStringLiteral("Cancelled: (no title)")),
+              "cancellation without a summary");
+        check(!MimeUtils::parseCalendarInvite(QByteArrayLiteral("BEGIN:VCALENDAR\nEND:VCALENDAR\n")).valid,
+              "no VEVENT, no invite");
     }
 
     out << (failures == 0 ? "all mime utils tests passed\n"

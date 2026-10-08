@@ -500,6 +500,12 @@ void DocumentHandler::setCursorPosition(int position)
     if (m_cursorPosition == position)
         return;
     m_cursorPosition = position;
+    // A caret that moved away from an ended link may be back inside one;
+    // the next key is the editor's again.
+    if (m_linkEndPosition >= 0 && m_linkEndPosition != position) {
+        m_linkEndPosition = -1;
+        Q_EMIT linkEndedChanged();
+    }
     Q_EMIT cursorPositionChanged();
     Q_EMIT formatChanged();
 }
@@ -835,6 +841,105 @@ void DocumentHandler::setLink(int start, int end, const QString &text, const QSt
     cursor.endEditBlock();
     Q_EMIT caretMoveRequested(cursor.position());
     Q_EMIT formatChanged();
+}
+
+bool DocumentHandler::inLink() const
+{
+    return !linkAtCursor().value(QStringLiteral("href")).toString().isEmpty();
+}
+
+bool DocumentHandler::endLink()
+{
+    const QVariantMap link = linkAtCursor();
+    if (link.value(QStringLiteral("href")).toString().isEmpty())
+        return false;
+    const int end = link.value(QStringLiteral("end")).toInt();
+    const bool moved = end != m_cursorPosition || m_selectionStart != m_selectionEnd;
+    m_linkEndPosition = end;
+    if (moved) {
+        // The editor's caret follows, and reports back the position that
+        // matches the arm — the disarm in setCursorPosition is for a
+        // caret that goes somewhere else.
+        m_cursorPosition = end;
+        Q_EMIT caretMoveRequested(end);
+    }
+    Q_EMIT linkEndedChanged();
+    Q_EMIT formatChanged();
+    return true;
+}
+
+bool DocumentHandler::insertAfterEndedLink(const QString &text)
+{
+    if (m_linkEndPosition < 0 || text.isEmpty())
+        return false;
+    QTextCursor cursor = textCursor();
+    if (cursor.isNull() || cursor.hasSelection() || cursor.position() != m_linkEndPosition)
+        return false;
+    const QTextCharFormat plain = unlinkedFormat(cursor.charFormat());
+    cursor.beginEditBlock();
+    if (text == QLatin1String("\n"))
+        cursor.insertBlock(cursor.blockFormat(), plain);
+    else
+        cursor.insertText(text, plain);
+    cursor.endEditBlock();
+    // What is typed next sits after a plain character — the editor's own
+    // typing does the right thing from here.
+    m_linkEndPosition = -1;
+    Q_EMIT linkEndedChanged();
+    Q_EMIT caretMoveRequested(cursor.position());
+    Q_EMIT formatChanged();
+    return true;
+}
+
+QVariantMap DocumentHandler::findText(const QString &term, int from, bool backward,
+                                      bool caseSensitive) const
+{
+    QVariantMap out{{QStringLiteral("found"), false},
+                    {QStringLiteral("start"), -1},
+                    {QStringLiteral("end"), -1},
+                    {QStringLiteral("index"), 0},
+                    {QStringLiteral("total"), 0}};
+    if (!m_document || !m_document->textDocument() || term.isEmpty())
+        return out;
+    const QTextDocument *doc = m_document->textDocument();
+    const QTextDocument::FindFlags flags =
+        caseSensitive ? QTextDocument::FindCaseSensitively : QTextDocument::FindFlags();
+    // Every match, in document order: the count is what the bar shows, and
+    // the ordinal of the one found comes from the same list. A body is a
+    // message, not a book — walking it once per keystroke is nothing.
+    QList<QPair<int, int>> matches;
+    for (QTextCursor c = doc->find(term, 0, flags); !c.isNull(); c = doc->find(term, c, flags))
+        matches.append({c.selectionStart(), c.selectionEnd()});
+    out[QStringLiteral("total")] = matches.size();
+    if (matches.isEmpty())
+        return out;
+    int pick = -1;
+    if (backward) {
+        // The last match that ends at or before the caret — wrapping to the
+        // very last one when nothing precedes it.
+        for (int i = matches.size() - 1; i >= 0; --i) {
+            if (matches.at(i).second <= from) {
+                pick = i;
+                break;
+            }
+        }
+        if (pick < 0)
+            pick = matches.size() - 1;
+    } else {
+        // The first match starting at or after the caret, else the first one.
+        pick = 0;
+        for (int i = 0; i < matches.size(); ++i) {
+            if (matches.at(i).first >= from) {
+                pick = i;
+                break;
+            }
+        }
+    }
+    out[QStringLiteral("found")] = true;
+    out[QStringLiteral("start")] = matches.at(pick).first;
+    out[QStringLiteral("end")] = matches.at(pick).second;
+    out[QStringLiteral("index")] = pick + 1;
+    return out;
 }
 
 bool DocumentHandler::startBulletList()

@@ -388,9 +388,69 @@ Item {
     // untouched one just closes.
     Shortcut {
         sequence: "Esc"
-        // Only the visible tab may act on a window-wide shortcut.
-        enabled: sheet.pageActive
+        // Only the visible tab may act on a window-wide shortcut. While the
+        // find bar is open Esc belongs to it: closing the tab from under a
+        // search is not what the key meant.
+        enabled: sheet.pageActive && !sheet.findActive
         onActivated: sheet.close()
+    }
+
+    // Find in the body: the same bar the message viewer has, over the
+    // editor's own document. The match is selected, so closing the bar
+    // leaves the caret on it ready to edit.
+    readonly property bool findActive: findBar.visible
+    property int findMatches: 0
+    property int findCurrent: 0
+
+    function openFind() {
+        findBar.visible = true
+        findField.forceActiveFocus()
+        findField.selectAll() // repeat presses replace the old term
+        if (findField.text.length > 0)
+            findRun(false)
+    }
+    function closeFind() {
+        findBar.visible = false
+        findMatches = 0
+        findCurrent = 0
+        bodyEdit.forceActiveFocus()
+    }
+    /// Next (or previous) match from the current selection: the as-you-type
+    /// search starts at the selection's start so a longer term stays on the
+    /// match it already had, Enter moves on from its end.
+    function findRun(backward, fromSelectionEnd) {
+        if (findField.text.length === 0) {
+            findMatches = 0
+            findCurrent = 0
+            return
+        }
+        const from = backward ? bodyEdit.selectionStart
+                   : (fromSelectionEnd ? bodyEdit.selectionEnd : bodyEdit.selectionStart)
+        const r = docHandler.findText(findField.text, from, backward, findCase.checked)
+        findMatches = r.total
+        findCurrent = r.found ? r.index : 0
+        if (r.found)
+            bodyEdit.select(r.start, r.end)
+    }
+    Shortcut {
+        sequences: [sheet.ui ? sheet.ui.shortcutFind : "Ctrl+F"]
+        enabled: sheet.pageActive
+        onActivated: sheet.openFind()
+    }
+    Shortcut {
+        sequence: "Esc"
+        enabled: sheet.pageActive && sheet.findActive
+        onActivated: sheet.closeFind()
+    }
+    Shortcut {
+        sequence: "F3"
+        enabled: sheet.pageActive && sheet.findActive
+        onActivated: sheet.findRun(false, true)
+    }
+    Shortcut {
+        sequence: "Shift+F3"
+        enabled: sheet.pageActive && sheet.findActive
+        onActivated: sheet.findRun(true, false)
     }
 
     /// Closing only asks when there is something to lose: a composer the user
@@ -467,6 +527,39 @@ Item {
     /// the $Forwarded arrow on the original. Empty for every other composer.
     property string forwardedFolder: ""
     property var forwardedUids: []
+
+    /// A mailto: link clicked in a message: a new message with the fields
+    /// the link asks for. The body is plain text from the link, so it goes
+    /// in as text — ahead of the signature openNew() put there.
+    function openMailto(link) {
+        const m = Mail.mailtoData(link)
+        if (!m || m.to === undefined)
+            return
+        openNew()
+        toField.text = m.to
+        ccField.text = m.cc
+        bccField.text = m.bcc
+        subjectField.text = m.subject
+        if (m.cc.length > 0 || m.bcc.length > 0)
+            content.ccExpanded = true
+        if (m.body.length > 0) {
+            // Line breaks as paragraphs; the rest escaped so a "<" in the
+            // link's text stays a "<".
+            const escaped = m.body.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                                  .replace(/>/g, "&gt;")
+            bodyEdit.text = "<p>" + escaped.split(/\r?\n/).join("</p><p>") + "</p>"
+                            + bodyEdit.text
+        }
+        // openNew() captured an empty composer; what the link filled in is
+        // the starting point, not an edit to ask about on close.
+        captureOpenedState()
+        if (m.to.length === 0)
+            toField.forceActiveFocus()
+        else if (m.subject.length === 0)
+            subjectField.forceActiveFocus()
+        else
+            bodyEdit.forceActiveFocus()
+    }
 
     /// d = Mail.draftData(): {to, cc, bcc, subject, body, uid}. Nothing is
     /// quoted or prefixed — the draft is resumed exactly as it was saved.
@@ -1013,6 +1106,22 @@ Item {
         }
 
         footer: QQC2.DialogButtonBox {
+            // The way out of a link being typed: the editor keeps extending
+            // a link at its end with whatever comes next, and there is no
+            // key for "stop". This puts the caret after the link and makes
+            // the next thing typed plain.
+            QQC2.Button {
+                text: "End link"
+                visible: linkDialog.editing
+                QQC2.DialogButtonBox.buttonRole: QQC2.DialogButtonBox.ActionRole
+                QQC2.ToolTip.text: "Keep the link and continue writing after it, unlinked"
+                QQC2.ToolTip.visible: hovered
+                onClicked: {
+                    docHandler.endLink()
+                    linkDialog.close()
+                    bodyEdit.forceActiveFocus()
+                }
+            }
             QQC2.Button {
                 text: "Remove link"
                 visible: linkDialog.editing
@@ -1375,10 +1484,14 @@ Item {
             QQC2.ToolButton {
                 activeFocusOnTab: false
                 icon.name: "insert-link"
+                // Lit while the caret is in a link — including at its end,
+                // where typing would still extend it.
+                checkable: true
+                checked: docHandler.inLink
                 onClicked: linkDialog.openForCursor()
-                QQC2.ToolTip.text: "Link (Ctrl+K): make the selection a link, or edit the "
-                                   + "link under the cursor. A typed web address becomes "
-                                   + "a link by itself."
+                QQC2.ToolTip.text: "Link (Ctrl+K): make the selection a link, or edit or "
+                                   + "end the link under the cursor. A typed web address "
+                                   + "becomes a link by itself."
                 QQC2.ToolTip.visible: hovered
             }
             Item { Layout.fillWidth: true }
@@ -1450,6 +1563,66 @@ Item {
             ]
         }
 
+        RowLayout {
+            id: findBar
+            Layout.fillWidth: true
+            spacing: Kirigami.Units.smallSpacing
+            visible: false
+
+            QQC2.TextField {
+                id: findField
+                Layout.fillWidth: true
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 20
+                placeholderText: "Find in message"
+                // Search as you type, staying on the current match while it
+                // still fits the longer term.
+                onTextChanged: sheet.findRun(false, false)
+                Keys.onReturnPressed: event => sheet.findRun(event.modifiers & Qt.ShiftModifier,
+                                                             !(event.modifiers & Qt.ShiftModifier))
+                Keys.onEnterPressed: event => sheet.findRun(event.modifiers & Qt.ShiftModifier,
+                                                            !(event.modifiers & Qt.ShiftModifier))
+                Keys.onEscapePressed: sheet.closeFind()
+            }
+            QQC2.Label {
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                color: (findField.text.length > 0 && sheet.findMatches === 0)
+                       ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
+                text: findField.text.length === 0 ? ""
+                    : sheet.findMatches === 0 ? "No matches"
+                    : sheet.findCurrent + " of " + sheet.findMatches
+                      + (sheet.findMatches === 1 ? " match" : " matches")
+            }
+            QQC2.ToolButton {
+                icon.name: "go-up"
+                enabled: sheet.findMatches > 0
+                onClicked: sheet.findRun(true, false)
+                QQC2.ToolTip.text: "Previous match (Shift+F3)"
+                QQC2.ToolTip.visible: hovered
+            }
+            QQC2.ToolButton {
+                icon.name: "go-down"
+                enabled: sheet.findMatches > 0
+                onClicked: sheet.findRun(false, true)
+                QQC2.ToolTip.text: "Next match (F3)"
+                QQC2.ToolTip.visible: hovered
+            }
+            QQC2.ToolButton {
+                id: findCase
+                text: "Aa"
+                checkable: true
+                onToggled: sheet.findRun(false, false)
+                QQC2.ToolTip.text: "Match case"
+                QQC2.ToolTip.visible: hovered
+            }
+            QQC2.ToolButton {
+                icon.name: "dialog-close"
+                onClicked: sheet.closeFind()
+                QQC2.ToolTip.text: "Close the find bar (Esc)"
+                QQC2.ToolTip.visible: hovered
+            }
+        }
+
         QQC2.ScrollView {
             id: bodyScroll
             Layout.fillWidth: true
@@ -1478,6 +1651,26 @@ Item {
                 // shortcut. Bold/italic are the standard ones; the list pair
                 // follows what mail clients already use (Ctrl+Shift+8 / 7).
                 Keys.onPressed: event => {
+                    // Right after "End link": the first thing typed goes in
+                    // through the handler, unlinked — the editor's own insert
+                    // would extend the link. Characters and Enter only; a
+                    // Backspace or an arrow is the editor's, and moving the
+                    // caret disarms this by itself.
+                    if (docHandler.linkEnded
+                            && (event.modifiers & (Qt.ControlModifier | Qt.AltModifier)) === 0) {
+                        if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                            if (docHandler.insertAfterEndedLink("\n")) {
+                                event.accepted = true
+                                return
+                            }
+                        } else if (event.text.length > 0 && event.text.charCodeAt(0) >= 32
+                                   && event.key !== Qt.Key_Delete) {
+                            if (docHandler.insertAfterEndedLink(event.text)) {
+                                event.accepted = true
+                                return
+                            }
+                        }
+                    }
                     if (event.modifiers & Qt.ControlModifier) {
                         if (event.key === Qt.Key_B) {
                             docHandler.bold = !docHandler.bold

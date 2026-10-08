@@ -7,6 +7,9 @@
 #include <QList>
 #include <QString>
 
+#include <QDateTime>
+#include <QStringList>
+
 #include <functional>
 
 #include "mailstore.h"
@@ -103,6 +106,58 @@ void collectBodies(KMime::Content *node, QString *text, QString *html);
 /// reader is being invited to click.
 void collectAttachments(KMime::Content *node, QStringList *names);
 
+// --- calendar invitations ----------------------------------------------------
+
+/// True for a part carrying an iCalendar object: text/calendar,
+/// application/ics, or a file named *.ics whatever its declared type.
+bool isCalendarPart(KMime::Content *part);
+
+/// The first calendar part anywhere in the tree, or null.
+KMime::Content *findCalendarPart(KMime::Content *root);
+
+/// The parts the reading pane lists as attachments: KMime's own list (a
+/// disposition or a filename) plus every calendar part it leaves out. An
+/// invitation's text/calendar sits inside multipart/alternative with no
+/// disposition and no name — an attachment by nobody's rules, and the only
+/// thing in the message worth saving. Order is document order.
+QList<KMime::Content *> attachmentParts(KMime::Content *root);
+
+/// What an invitation says, read from its VEVENT. Times are converted to the
+/// local zone; a date-only event is allDay with times at midnight.
+struct CalendarInvite {
+    bool valid = false;      ///< a VEVENT was found
+    QString method;          ///< REQUEST, CANCEL, REPLY, PUBLISH… (upper case) or empty
+    QString summary;
+    QString location;
+    QString description;
+    QString organizer;       ///< "Name <address>" or the address alone
+    QStringList attendees;   ///< same shape, "(optional)" appended for OPT-PARTICIPANT
+    QDateTime start;
+    QDateTime end;
+    bool allDay = false;
+    QString timeZone;        ///< the TZID the times were given in, if any
+};
+
+/// Reads the first VEVENT of \a ics. Folded lines, escaped values, Windows
+/// zone names (Exchange's "Central Europe Standard Time") and IANA ones are
+/// all understood; an unknown zone leaves the wall time as written.
+CalendarInvite parseCalendarInvite(const QByteArray &ics);
+
+/// The invitation as a card for the HTML view — every value escaped, the
+/// addresses as mailto: links — and as lines for the text view and the
+/// preview. Both empty when \a invite is not valid.
+QString calendarInviteHtml(const CalendarInvite &invite);
+QString calendarInviteText(const CalendarInvite &invite);
+
+/// True when \a html shows nothing: no text once rendered. Outlook's empty
+/// invitation body is a full Word page around a single &nbsp;.
+bool htmlIsBlank(const QString &html);
+
+/// \a card inserted at the top of \a html's body — after the <body> tag when
+/// there is one, so a document's <head> stays where it was — or in front of
+/// a bare fragment.
+QString prependToHtmlBody(const QString &html, const QString &card);
+
 /// True when any attached archive needs a password to open.
 ///
 /// Reads the ZIP local file headers directly rather than shelling out to an
@@ -137,6 +192,16 @@ struct InlineImage {
 /// RFC 2045 asks. Images referenced by anything other than a local file
 /// (http:, data:, an existing cid:) are left exactly as they are.
 QList<InlineImage> takeInlineImages(QString &html, const QString &idDomain);
+
+/// Removes every <img> whose src is a local file (file:) and for which
+/// \a drop returns true, given the file's path. Returns how many went.
+///
+/// Two callers: quoting received mail drops them all — a file: reference in
+/// a message someone sent is a path on *their* machine (Outlook for Mac
+/// writes its signature images that way), and one that happens to resolve
+/// here must never be read and attached to the reply. Sending drops the
+/// ones whose file no longer exists rather than refusing to send.
+int dropFileImages(QString &html, const std::function<bool(const QString &path)> &drop);
 
 /// Caps runs of blank lines at two — text renditions of layout-table mail
 /// pad the content with dozens of them. Whitespace-only lines count as
