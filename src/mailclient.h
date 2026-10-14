@@ -925,6 +925,13 @@ private:
     /// message per session, on the GUI thread, from a tooltip.
     QHash<QString, QSet<qint64>> m_attachCounted;
     void applySeenLocally(const QString &folder, const QList<qint64> &uids, bool seen);
+    /// Whether the open account files one message under several mailboxes
+    /// with a single set of flags (Gmail labels, JMAP mailboxIds), and how a
+    /// copy is recognised; false for plain folders, where a copy is a message.
+    bool sharedFlagKey(MailStore::CopyKey *by) const;
+    /// Carries a read-state change to the account's other cached copies of
+    /// the same messages. Cache and model only: the server shares the flag.
+    void mirrorSeen(const QString &folder, const QList<qint64> &uids, bool seen);
     /// The $Forwarded half of the same job: cache and, when the folder is the
     /// open one, the listed row.
     void applyForwardedLocally(const QString &folder, const QList<qint64> &uids, bool forwarded);

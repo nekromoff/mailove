@@ -33,6 +33,19 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.7.2" date="2026-10-14" type="stable">
+      <description>
+        <ul>
+          <li>A message opened right after switching accounts stays read
+              instead of turning unread again on the next visit.</li>
+          <li>A read or unread mark is no longer undone by a sync that was
+              already under way when it was made.</li>
+          <li>Gmail and JMAP: reading a message also reads its copies under
+              other labels or mailboxes, so their unread counts stay in
+              step.</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.7.1" date="2026-10-08" type="stable">
       <description>
         <ul>

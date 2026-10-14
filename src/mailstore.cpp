@@ -1594,7 +1594,40 @@ void MailStore::storeHeadersIn(const QString &account, const QString &folder,
     if (!m_db.isOpen())
         return;
     SlowGuard guard("storeHeaders");
-    storeHeadersOn(m_db, scopedIn(account, folder), headers, m_ftsAvailable);
+    // The upsert takes the server's seen/forwarded verbatim, on the promise
+    // that a folder owing the server a flag change is not synced. That holds
+    // when a fetch is *issued*, not when it lands: a header window asked for a
+    // moment before the user opened a message answers with the flag from
+    // before the mark, and would undo it. So a row still named by a live flag
+    // op keeps what the op says — the op is the newer truth until it lands.
+    QHash<qint64, bool> seen;
+    QHash<qint64, bool> forwarded;
+    for (const JournalOp &op : journalOpsFor(account, folder)) {
+        if (op.op != QLatin1String("flag") || op.folder != folder)
+            continue;
+        // In id order, so a later op on the same row wins, as it will on the
+        // server.
+        for (qint64 uid : op.uids) {
+            if (op.flagsAdd.contains(QLatin1String("seen")))
+                seen.insert(uid, true);
+            else if (op.flagsDel.contains(QLatin1String("seen")))
+                seen.insert(uid, false);
+            if (op.flagsAdd.contains(QLatin1String("forwarded")))
+                forwarded.insert(uid, true);
+            else if (op.flagsDel.contains(QLatin1String("forwarded")))
+                forwarded.insert(uid, false);
+        }
+    }
+    if (seen.isEmpty() && forwarded.isEmpty()) {
+        storeHeadersOn(m_db, scopedIn(account, folder), headers, m_ftsAvailable);
+        return;
+    }
+    QList<MessageListModel::Header> held = headers;
+    for (MessageListModel::Header &h : held) {
+        h.seen = seen.value(h.uid, h.seen);
+        h.forwarded = forwarded.value(h.uid, h.forwarded);
+    }
+    storeHeadersOn(m_db, scopedIn(account, folder), held, m_ftsAvailable);
 }
 
 void MailStore::storeHeadersOn(QSqlDatabase &db, const QString &scopedFolder,
@@ -3250,6 +3283,68 @@ int MailStore::backfillMessageIds(int limit)
     }
     m_db.commit();
     return rows.size();
+}
+
+QList<QPair<QString, qint64>> MailStore::sharedCopies(const QString &folder,
+                                                      const QList<qint64> &uids, CopyKey by)
+{
+    QList<QPair<QString, qint64>> out;
+    if (!m_db.isOpen() || uids.isEmpty())
+        return out;
+    const QString source = scoped(folder);
+    QSqlQuery q(m_db);
+    if (by == CopyKey::Uid) {
+        // The same uid in every mailbox, so this is primary-key lookups per
+        // folder rather than a scan of the account. Chunked: "mark all read"
+        // can name more uids than one statement may bind.
+        const QStringList others = cachedFolders(m_accountKey);
+        constexpr int kChunk = 500;
+        for (int at = 0; at < uids.size(); at += kChunk) {
+            const QList<qint64> chunk = uids.mid(at, kChunk);
+            QStringList marks;
+            for (int i = 0; i < chunk.size(); ++i)
+                marks.append(QStringLiteral("?"));
+            q.prepare(QStringLiteral("SELECT uid FROM messages WHERE folder = ? AND uid IN (%1)")
+                          .arg(marks.join(QLatin1Char(','))));
+            for (const QString &other : others) {
+                if (other == folder)
+                    continue;
+                q.addBindValue(scoped(other));
+                for (qint64 uid : chunk)
+                    q.addBindValue(uid);
+                if (!q.exec())
+                    continue;
+                while (q.next())
+                    out.append({other, q.value(0).toLongLong()});
+            }
+        }
+        return out;
+    }
+    // By Message-ID, over idx_messages_msgid, kept inside the open account: the
+    // same mail delivered to two accounts is two messages.
+    const QString prefix = scoped(QString());
+    QSqlQuery idq(m_db);
+    idq.prepare(QStringLiteral("SELECT msgid FROM messages WHERE folder = ? AND uid = ?"));
+    q.prepare(QStringLiteral("SELECT folder, uid FROM messages WHERE msgid = ? AND folder != ?"
+                             " AND substr(folder, 1, ?) = ?"));
+    for (qint64 uid : uids) {
+        idq.addBindValue(source);
+        idq.addBindValue(uid);
+        if (!idq.exec() || !idq.next())
+            continue;
+        const QString msgid = idq.value(0).toString();
+        if (msgid.isEmpty())
+            continue;
+        q.addBindValue(msgid);
+        q.addBindValue(source);
+        q.addBindValue(prefix.size());
+        q.addBindValue(prefix);
+        if (!q.exec())
+            continue;
+        while (q.next())
+            out.append({q.value(0).toString().mid(prefix.size()), q.value(1).toLongLong()});
+    }
+    return out;
 }
 
 QList<QPair<QString, qint64>> MailStore::locateByMessageId(const QString &msgid)

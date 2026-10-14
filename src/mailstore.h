@@ -681,6 +681,17 @@ public:
     /// the same message commonly exists in a folder and in All Mail.
     QList<QPair<QString, qint64>> locateByMessageId(const QString &msgid);
 
+    /// How the same server-side message is recognised in another folder.
+    enum class CopyKey {
+        Uid,       ///< JMAP: the local key is hashed from the Email id
+        MessageId, ///< Gmail IMAP: a label is a folder, uids differ per folder
+    };
+    /// The other cached folders of the open account holding the message that
+    /// \a folder / \a uids name, as (unscoped folder, uid). For servers where
+    /// one message lives under several mailboxes and has one set of flags.
+    QList<QPair<QString, qint64>> sharedCopies(const QString &folder,
+                                               const QList<qint64> &uids, CopyKey by);
+
     // --- soft delete --------------------------------------------------------
     //
     // A message the user has deleted or moved away is hidden, not destroyed:

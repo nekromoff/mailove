@@ -1,3 +1,25 @@
+mailove (3.7.2) unstable; urgency=medium
+
+  * A message opened right after switching accounts stays read. The top
+    row is opened from the cache before the connection is up, and that
+    read mark was sent to the server only if already connected and never
+    retried; the next sync then took the server's "unread" and the
+    message came back bold on the next visit. Reading a message now
+    queues the change like every other flag change: it is sent once the
+    connection is up, and the folder is not re-synced over it meanwhile.
+  * A header answer that arrives after a local read/unread or forwarded
+    mark no longer undoes it. The sync checked for unsent changes when a
+    fetch was sent, not when it landed; while a change is still waiting
+    to reach the server, what it says now wins.
+  * Gmail: reading a message in INBOX also reads its copies under other
+    labels ([Gmail]/Important, user labels), so their unread counts no
+    longer lag behind until the next check. The same applies to JMAP
+    accounts, where one message can sit in several mailboxes. Accounts
+    with plain folders (Exchange, Microsoft 365, most IMAP servers) are
+    unaffected: there a copy is a separate message.
+
+ -- dusoft <dusoft@staznosti.sk>  Wed, 14 Oct 2026 12:15:00 +0200
+
 mailove (3.7.1) unstable; urgency=medium
 
   * Meeting invitations show their content. An Outlook/Exchange request

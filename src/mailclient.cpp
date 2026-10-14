@@ -6496,10 +6496,12 @@ void MailClient::verifyCachedUnread(const QString &folder)
         // A row the server calls read is one of the stale ones this exists to
         // find; a row it still calls unread was right all along.
         int corrected = 0;
+        QList<qint64> readElsewhere;
         for (const MessageListModel::Header &h : fetched) {
             if (!h.seen)
                 continue;
             ++corrected;
+            readElsewhere.append(h.uid);
             // The rows on screen have to agree with the cache we just wrote,
             // or the list shows bold mail the badge no longer counts.
             if (folder != m_selectedFolder)
@@ -6513,6 +6515,7 @@ void MailClient::verifyCachedUnread(const QString &folder)
                           << "confirmed unread";
         if (corrected == 0)
             return;
+        mirrorSeen(folder, readElsewhere, true);
         scheduleUnreadRecount();
     });
 }
@@ -7387,6 +7390,7 @@ void MailClient::markMessagesSeen(const QVariantList &rows, bool seen)
     }
     if (op.uids.isEmpty())
         return;
+    mirrorSeen(m_selectedFolder, op.uids, seen);
     scheduleUnreadRecount();
 
     // Nothing here reopens the message. Marking the open one unread leaves it
@@ -8343,7 +8347,64 @@ void MailClient::applySeenLocally(const QString &folder, const QList<qint64> &ui
         else
             m_messageModel.markUnseen(row);
     }
+    // A rollback or replay is a read-state change like any other; the label
+    // copies follow it either way.
+    mirrorSeen(folder, uids, seen);
     scheduleUnreadRecount();
+}
+
+bool MailClient::sharedFlagKey(MailStore::CopyKey *by) const
+{
+    if (!m_backend)
+        return false;
+    // JMAP: an Email has mailboxIds, plural, and one keyword set; the local
+    // key is hashed from the Email id, so the copies share a uid.
+    if (m_backend->protocol() == MailBackend::Protocol::Jmap) {
+        *by = MailStore::CopyKey::Uid;
+        return true;
+    }
+    // Gmail over IMAP: a label is a mailbox and \Seen belongs to the message,
+    // so reading it in INBOX reads it under [Gmail]/Important too. Recognised
+    // by its All Mail living under the [Gmail] namespace — not by "has an
+    // \All folder", which a Dovecot virtual mailbox also advertises over real
+    // folders whose copies are independent messages. Exchange / Microsoft 365
+    // folders are plain folders and never get here.
+    if (m_allMailFolder.isEmpty())
+        return false;
+    const QChar sep = m_folderSeparator.isNull() ? QLatin1Char('/') : m_folderSeparator;
+    if (!isGmailNamespace(m_allMailFolder.section(sep, 0, 0)))
+        return false;
+    *by = MailStore::CopyKey::MessageId;
+    return true;
+}
+
+void MailClient::mirrorSeen(const QString &folder, const QList<qint64> &uids, bool seen)
+{
+    MailStore::CopyKey by;
+    if (uids.isEmpty() || !sharedFlagKey(&by))
+        return;
+    // Not journalled: the server already holds one flag for all of them, and a
+    // second STORE per label would only be the same change sent again.
+    const QList<QPair<QString, qint64>> copies = m_store.sharedCopies(folder, uids, by);
+    for (const auto &copy : copies) {
+        if (seen)
+            m_store.setSeen(copy.first, copy.second);
+        else
+            m_store.setUnseen(copy.first, copy.second);
+        if (copy.first != m_selectedFolder)
+            continue;
+        const int row = m_messageModel.rowForUid(copy.second);
+        if (row < 0)
+            continue;
+        if (seen)
+            m_messageModel.markSeen(row);
+        else
+            m_messageModel.markUnseen(row);
+    }
+    if (!copies.isEmpty())
+        qCInfo(logUnread) << "mirrored" << (seen ? "read" : "unread") << "to"
+                          << copies.size() << "label cop(ies) of" << uids.size()
+                          << "message(s) in" << folder;
 }
 
 void MailClient::applyForwardedLocally(const QString &folder, const QList<qint64> &uids,
@@ -8647,27 +8708,17 @@ void MailClient::applyReadMark(int row)
     const qint64 uid = m_messageModel.uidAt(row);
     if (uid < 0)
         return;
-    const bool alreadySeen = m_messageModel.seenAt(row);
-    m_messageModel.markSeen(row);
-    m_store.setSeen(m_selectedFolder, uid);
-    if (!alreadySeen)
-        scheduleUnreadRecount();
-    if (alreadySeen || !connected())
+    if (m_messageModel.seenAt(row))
         return;
-
-    // Push the read state to the server so other clients (and our next header
-    // sync) agree. Best effort: the cache row above already carries it, and
-    // reading a message never sets the flag as a side effect — a backend
-    // fetches bodies without disturbing them — so without this the server
-    // would never learn the message was read.
-    // The backend re-SELECTs only when the mailbox it holds will not do, so
-    // this costs a round trip on the first read in a folder and nothing after.
-    m_backend->setFlags(m_selectedFolder, {QString::number(uid)},
-                        {QStringLiteral("seen")}, {},
-                        [](MailBackend::Error error, const QString &message) {
-        if (error != MailBackend::Error::None)
-            qWarning() << "mailove: storing \\Seen failed:" << message;
-    });
+    // Through the journal, like every other flag change. This used to be a
+    // bare setFlags(), sent only when connected() and never retried — and the
+    // top row is auto-opened from cache on every account switch, before the
+    // session is up, so that mark routinely stayed local. The header sync then
+    // took the server's "unseen" verbatim (it can: only journalled changes are
+    // protected), and the message came back unread on the next visit. A
+    // journalled op is replayed after connect, holds the folder's sync off
+    // until it lands, and is what storeHeaders() defers to meanwhile.
+    markMessagesSeen({row}, true);
 }
 
 void MailClient::fetchMessage(int row)

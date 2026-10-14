@@ -357,6 +357,64 @@ int main(int argc, char **argv)
     check(store.softDeletedIn(account).isEmpty(),
           QStringLiteral("confirming the delete is what finally removes the row"));
 
+    // --- a header answer that lands after a local mark -----------------------
+
+    // The sync gate is checked when a fetch is issued; a header window asked
+    // for just before the user opened a message lands with the server's flag
+    // from before the mark. While the op is live, the op wins.
+    out() << "flags: a late header answer does not undo a pending mark" << Qt::endl;
+    const QString late = QStringLiteral("Late");
+    MessageListModel::Header unread;
+    unread.uid = 201;
+    unread.subject = QStringLiteral("opened on arrival");
+    unread.from = QStringLiteral("someone@example.com");
+    unread.date = QDateTime::currentDateTime();
+    unread.seen = false;
+    store.storeHeaders(late, {unread});
+    store.setSeen(late, 201);
+    const qint64 mark = store.appendJournalOp(flagOp(late, {"201"}, {201}, true));
+    store.storeHeaders(late, {unread});
+    check(store.unseenMessages(late).isEmpty(),
+          QStringLiteral("the read mark survives a header answer from before it"));
+    store.dropJournalOp(mark);
+    store.storeHeaders(late, {unread});
+    check(store.unseenMessages(late).size() == 1,
+          QStringLiteral("…and once the op is gone the server's answer is taken again"));
+
+    // --- label copies: one message under several mailboxes ------------------
+
+    out() << "flags: finding the other copies of a labelled message" << Qt::endl;
+    const auto header = [](qint64 uid, const QString &msgid) {
+        MessageListModel::Header h;
+        h.uid = uid;
+        h.subject = QStringLiteral("labelled");
+        h.from = QStringLiteral("someone@example.com");
+        h.date = QDateTime::currentDateTime();
+        h.msgid = msgid;
+        return h;
+    };
+    const QString inbox = QStringLiteral("INBOX");
+    const QString important = QStringLiteral("[Gmail]/Important");
+    store.storeFolders(account, {inbox, important});
+    // Gmail: different uids per label, the same Message-ID.
+    store.storeHeaders(inbox, {header(301, QStringLiteral("<a@x>")),
+                               header(302, QStringLiteral("<b@x>"))});
+    store.storeHeaders(important, {header(9001, QStringLiteral("<a@x>"))});
+    // The same mail in another account is another message.
+    store.storeHeadersIn(other, important, {header(9002, QStringLiteral("<a@x>"))});
+    const auto byMsgid = store.sharedCopies(inbox, {301, 302}, MailStore::CopyKey::MessageId);
+    check(byMsgid.size() == 1 && byMsgid.first().first == important
+              && byMsgid.first().second == 9001,
+          QStringLiteral("Gmail: the Important copy is found by Message-ID"));
+    // JMAP: the local key is hashed from the Email id, so it is the same uid.
+    store.storeHeaders(important, {header(302, QString())});
+    const auto byUid = store.sharedCopies(inbox, {302}, MailStore::CopyKey::Uid);
+    check(byUid.size() == 1 && byUid.first().first == important
+              && byUid.first().second == 302,
+          QStringLiteral("JMAP: the other mailbox's copy is found by uid"));
+    check(store.sharedCopies(inbox, {303}, MailStore::CopyKey::Uid).isEmpty(),
+          QStringLiteral("…and a message with no other copy has none"));
+
     if (probe.isOpen()) {
         probe.close();
         probe = QSqlDatabase();
