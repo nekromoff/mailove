@@ -42,7 +42,7 @@ Security-minded KDE-first IMAP and JMAP mail client, blazing fast.
 
 ## Screenshots
 <img width="1920" height="1031" alt="image" src="https://github.com/user-attachments/assets/80519f81-1efb-4531-9a13-01a3fd873294" />
-<img width="1104" height="831" alt="image" src="https://github.com/user-attachments/assets/1f23024d-4f21-4c7f-b5aa-cf0461ad4547" />
+<img width="1050" height="747" alt="image" src="https://github.com/user-attachments/assets/4449da6f-183c-4a4d-a9ab-57ed4983a215" />
 <img width="1915" height="1033" alt="image" src="https://github.com/user-attachments/assets/e32a511a-25c8-4731-ab15-5cf6dfaaa366" />
 <img width="1915" height="1033" alt="image" src="https://github.com/user-attachments/assets/e430745d-6119-4a77-bb97-5bfe719a1f79" />
 <img width="1920" height="1031" alt="image" src="https://github.com/user-attachments/assets/ab957822-6551-4bf4-ad98-372ef5f35434" />
