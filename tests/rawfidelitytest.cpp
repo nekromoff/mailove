@@ -64,9 +64,9 @@ static QByteArray realistic()
     return m;
 }
 
-/// The two halves as a server hands them over: BODY[HEADER] ends with the
-/// blank line that closes the header (RFC 9051 §7.5.2), BODY[TEXT] is
-/// everything after it. Joined, they are tightBoundary().
+/// The two halves as ImapBackend keeps them: the header block ending with the
+/// blank line that closes it, and BODY[TEXT] — everything after it. Joined,
+/// they are tightBoundary().
 static QByteArray tightHead()
 {
     QByteArray m;
@@ -173,25 +173,35 @@ int main(int argc, char **argv)
     // Gmail emits for a reply with attachments — comes back from
     // encodedContent() one byte longer than it went in, because assembly
     // unconditionally writes the delimiter with a trailing newline and the
-    // parent prepends its own ([KDE bug 523826]). ImapBackend no longer takes
-    // that path, and these assert both halves of why.
+    // parent prepends its own ([KDE bug 523826]). ImapBackend trusts that
+    // re-assembly only when it is the length the server reports, and fetches
+    // the TEXT section otherwise; these assert each piece of that.
     printf("\n-- tight nested boundary (KDE bug 523826)\n");
     const QByteArray tight = tightBoundary();
 
-    // Asserted so a KMime that fixes the bug is noticed here rather than
-    // silently making the workaround redundant: if this ever reads SAME,
-    // ImapBackend can go back to a plain BODY.PEEK[] fetch.
+    // Reported so a KMime that fixes the bug is noticed here: if this ever
+    // reads SAME, the TEXT fetch in ImapBackend::startBodyFetchJob() has
+    // nothing left to catch.
     KMime::Message loose;
     loose.setContent(KMime::CRLFtoLF(tight));
     loose.parse();
     if (report("unfrozen (documents the bug)",
                KMime::LFtoCRLF(loose.encodedContent()), tight)) {
-        printf("NOTE: KMime now round-trips a tight nested boundary. The section\n"
-               "      fetch in ImapBackend::startBodyFetchJob() is no longer needed.\n");
+        printf("NOTE: KMime now round-trips a tight nested boundary. The size check\n"
+               "      in ImapBackend::startBodyFetchJob() no longer has a case.\n");
+    }
+    // The size check is the whole guard: the fault must change the length,
+    // or a BODY.PEEK[] answer of this shape would be trusted and its body
+    // hash fail. Asserted.
+    if (KMime::LFtoCRLF(loose.encodedContent()).size() == tight.size()
+        && KMime::LFtoCRLF(loose.encodedContent()) != tight) {
+        printf("FAIL: the re-assembly fault no longer changes the length — the\n"
+               "      RFC822.SIZE check in ImapBackend cannot see it.\n");
+        ++failures;
     }
 
     // What ImapBackend::buildMessage() does. Asserted: this is the invariant
-    // the whole section-fetch path exists to provide.
+    // the frozen parse exists to provide.
     KMime::Message frozen;
     frozen.setContent(KMime::CRLFtoLF(tight));
     frozen.setFrozen(true);
@@ -211,21 +221,52 @@ int main(int argc, char **argv)
         ++failures;
     }
 
-    // And the fetch itself: BODY[HEADER] reaches KMime as setHead() and
-    // BODY[TEXT] as setBody(), neither of which re-encodes, so joining them is
-    // the message as it travelled. Simulated here — the live version needs a
-    // server, which is what tests/fidelitytool is for.
-    KMime::Content headPart;
-    headPart.setHead(tightHead());
-    headPart.parse();
+    // And the fetch itself, as KIMAP performs it. Simulated here — the live
+    // version needs a server, which is what tests/fidelitytool is for.
+    //
+    // BODY.PEEK[] (FetchScope::Full) is setContent() + parse(). The head has
+    // to come out of that untouched: it is the one half Gmail will not serve
+    // exact any other way (its BODY[HEADER] answers are re-folded), and a DKIM
+    // signature with simple header canonicalization hashes it byte for byte.
+    // encodedContent() is what ImapBackend splits, so that is what is checked.
+    printf("\n-- KIMAP fetch paths\n");
+    {
+        KMime::Message viaFull;
+        viaFull.setContent(KMime::CRLFtoLF(tight));
+        viaFull.parse();
+        const QByteArray whole = KMime::LFtoCRLF(viaFull.encodedContent());
+        const int split = whole.indexOf("\r\n\r\n");
+        if (!report("BODY[] head after parse()",
+                    split < 0 ? QByteArray() : whole.left(split + 4), tightHead())) {
+            printf("FAIL: parse() no longer leaves the header text alone — every\n"
+                   "      simple-canonicalization DKIM signature will fail.\n");
+            ++failures;
+        }
+        KMime::Message viaFullOk;
+        viaFullOk.setContent(KMime::CRLFtoLF(original));
+        viaFullOk.parse();
+        const QByteArray ok = KMime::LFtoCRLF(viaFullOk.encodedContent());
+        if (ok.size() != original.size()) {
+            printf("FAIL: an ordinary message re-assembles to %lld bytes, not %lld —\n"
+                   "      the size check would send every body to a second fetch.\n",
+                   (long long)ok.size(), (long long)original.size());
+            ++failures;
+        }
+    }
+
+    // BODY[TEXT] reaches KMime as setBody(), which re-encodes nothing, so
+    // the body of a message the size check rejected comes back exact.
     KMime::Content textPart;
     textPart.setBody(tightText());
     textPart.parse();
-    if (!report("BODY[HEADER] + BODY[TEXT]", headPart.head() + textPart.body(), tight)) {
+    if (!report("BODY[TEXT] via setBody()", textPart.body(), tightText())) {
         printf("FAIL: a section fetch no longer preserves its octets — the IMAP\n"
-               "      body path in ImapBackend has lost its reason to exist.\n");
+               "      body path in ImapBackend has lost its fallback.\n");
         ++failures;
     }
+    // And the two halves joined are the message as it travelled.
+    if (!report("BODY[] head + BODY[TEXT]", tightHead() + textPart.body(), tight))
+        ++failures;
 
     if (failures == 0)
         printf("all fidelity invariants hold\n");

@@ -6,6 +6,7 @@
 #include <QDateTime>
 #include <QObject>
 #include <QString>
+#include <QUrl>
 
 class QNetworkAccessManager;
 class QTcpServer;
@@ -31,7 +32,15 @@ public:
     explicit OAuthHelper(QObject *parent = nullptr);
 
     /// Interactive browser sign-in. Emits tokensReady() or failed().
-    void authorize(Provider provider, const QString &clientId, const QString &clientSecret);
+    /// \a loginHint (the account's address) preselects that account on the
+    /// provider's page, so a browser signed in as somebody else does not
+    /// quietly authorize the wrong one. With \a openBrowser false nothing is
+    /// launched: the listener waits all the same, and authorizationUrl() is
+    /// the only way in — for pasting into a different browser or profile.
+    void authorize(Provider provider, const QString &clientId, const QString &clientSecret,
+                   const QString &loginHint = QString(), bool openBrowser = true);
+    /// Where the sign-in in flight asks the user to go; empty when none is.
+    QUrl authorizationUrl() const { return m_authUrl; }
     /// Silent renewal from a refresh token. Emits tokensReady() or failed().
     void refresh(Provider provider, const QString &clientId, const QString &clientSecret,
                  const QString &refreshToken);
@@ -41,6 +50,8 @@ Q_SIGNALS:
     void tokensReady(const QString &accessToken, const QString &refreshToken,
                      const QDateTime &expiry);
     void failed(const QString &message);
+    /// authorizationUrl() changed: a sign-in started, or the one in flight ended.
+    void authorizationUrlChanged();
 
 private:
     struct Endpoints {
@@ -63,4 +74,5 @@ private:
     /// CSRF nonce tying the redirect back to the authorize() we started.
     /// Empty whenever no sign-in is in flight.
     QString m_state;
+    QUrl m_authUrl;
 };

@@ -188,8 +188,9 @@ Item {
     }
 
     function pgpKeyLabel(k) {
-        const who = (k.name && k.name !== "") ? k.name : k.email
-        let label = (who && who !== "" ? who + " — " : "") + pgpShortFingerprint(k.fingerprint)
+        const real = (k.name && k.name !== "") ? k.name : k.email
+        const who = Demo.on && real ? Demo.text(real) : real
+        let label = (who && who !== "" ? who + " — " : "") + pgpShortFingerprint(Demo.on ? Demo.fingerprint(k.fingerprint) : k.fingerprint)
         if (k.missing)
             label += " (not in your keyring)"
         else if (k.revoked)
@@ -265,7 +266,8 @@ Item {
                       + "expired cannot sign, and your correspondents' copies "
                       + "need the new date."
         }
-        const full = k.fingerprint.replace(/(.{4})/g, "$1 ").trim()
+        const fp = Demo.on ? Demo.fingerprint(k.fingerprint) : k.fingerprint
+        const full = fp.replace(/(.{4})/g, "$1 ").trim()
         // An invalid QDateTime — a key that never expires — arrives as an
         // Invalid Date, which formats as "Invalid Date" rather than failing.
         return full + (k.expires && !isNaN(k.expires.getTime())
@@ -312,9 +314,30 @@ Item {
         return h.length > 0 ? h.replace(/^imap/, "smtp") : ""
     }
 
+    // Demo mode switched with the form open: show the other set of values.
+    // Edits not yet saved are dropped, as on switching accounts.
+    Connections {
+        target: Demo
+        function onChanged() {
+            if (sheet.editIndex >= 0)
+                sheet.loadDetails()
+        }
+    }
+
     function loadDetails() {
         loading = true
-        const d = Mail.accountDetails(editIndex)
+        const real = Mail.accountDetails(editIndex)
+        // Demo mode fills the form with fake words. Safe only because nothing
+        // here saves while it is on — see savePrefs() and saveAccount().
+        const d = Demo.on ? Object.assign({}, real, {
+            host: Demo.text(real.host ?? ""),
+            user: Demo.text(real.user ?? ""),
+            displayName: Demo.text(real.displayName ?? ""),
+            organization: Demo.text(real.organization ?? ""),
+            email: Demo.text(real.email ?? ""),
+            smtpHost: Demo.text(real.smtpHost ?? ""),
+            signature: Demo.markup(real.signature ?? "")
+        }) : real
         hostPinned = (d.host ?? "") !== ""
         hostField.text = d.host ?? ""
         portField.value = d.port ?? 993
@@ -453,7 +476,10 @@ Item {
     /// field is finished with — focus left, box ticked — and again on the way
     /// out of the page, the account, or the tab.
     function savePrefs() {
-        if (loading || editIndex < 0)
+        signatureSaveTimer.stop()
+        // The form holds demo mode's fake words: storing them would overwrite
+        // the real account with them.
+        if (loading || editIndex < 0 || Demo.on)
             return
         // An account that has since been removed or reordered: editIndex would
         // now point at somebody else's settings. The C++ side bounds-checks
@@ -471,6 +497,14 @@ Item {
         Mail.saveAccountPrefs(editIndex, now)
         savedPrefs = now
         savedFlashTimer.restart()
+    }
+
+    /// The signature editor's autosave: it has no editingFinished, so a
+    /// short pause after the last edit stands in for one.
+    Timer {
+        id: signatureSaveTimer
+        interval: 1000
+        onTriggered: sheet.savePrefs()
     }
 
     /// How long "Saved" stays up. Long enough to be read, short enough that it
@@ -511,7 +545,7 @@ Item {
     /// saving is not leaving.
     function saveAccount() {
         // Look-page settings apply live; Save only persists account edits.
-        if (page !== 0)
+        if (page !== 0 || Demo.on)
             return
         // Belt and braces: the button is disabled, but Enter reaches here
         // without going through it.
@@ -608,7 +642,8 @@ Item {
         }
 
         contentItem: QQC2.Label {
-            text: "Remove \"" + (Mail.accountNames[sheet.editIndex] ?? "") + "\" from Mailove?\n\n"
+            text: "Remove \"" + (Demo.on ? Demo.text(Mail.accountNames[sheet.editIndex] ?? "")
+                                       : (Mail.accountNames[sheet.editIndex] ?? "")) + "\" from Mailove?\n\n"
                   + "Its settings and saved password are deleted from this computer. "
                   + "Mail on the server is not touched."
             wrapMode: Text.Wrap
@@ -860,7 +895,7 @@ Item {
                         required property int index
                         readonly property bool isDraft: index >= Mail.accountNames.length
                         width: accountList.width
-                        text: modelData
+                        text: Demo.on && !isDraft ? Demo.text(modelData) : modelData
                         icon.name: isDraft ? "list-add" : "user-identity"
                         font.italic: isDraft
                         highlighted: isDraft ? sheet.editIndex === -1
@@ -930,7 +965,8 @@ Item {
 
             Kirigami.Separator {
                 Kirigami.FormData.label: sheet.editIndex === -1
-                    ? "New account" : "Account: " + (Mail.accountNames[sheet.editIndex] ?? "")
+                    ? "New account" : "Account: " + (Demo.on ? Demo.text(Mail.accountNames[sheet.editIndex] ?? "")
+                                         : (Mail.accountNames[sheet.editIndex] ?? ""))
                 Kirigami.FormData.isSection: true
             }
             // Account type on top — the one choice everything else on this
@@ -1038,6 +1074,45 @@ Item {
                 wrapMode: Text.Wrap
                 opacity: 0.8
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
+            }
+            // The default browser decides which Google or Microsoft account
+            // gets authorized. When that is the wrong one, the link is the way
+            // out: paste it into the browser or profile signed in to this one.
+            // Only for the active account — the sign-in belongs to the session.
+            RowLayout {
+                visible: sheet.oauthAccount && sheet.editIndex >= 0
+                         && sheet.editIndex === Mail.currentAccount && !Demo.on
+                Kirigami.FormData.label: "Sign in again:"
+                QQC2.Button {
+                    text: "Copy sign-in link"
+                    icon.name: "edit-copy"
+                    onClicked: Mail.copyOAuthSignInLink()
+                    QQC2.ToolTip.visible: hovered
+                    QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+                    QQC2.ToolTip.text: "Starts a new sign-in without opening the "
+                                       + "browser and copies its link. Open it in "
+                                       + "the browser signed in to this account."
+                }
+            }
+            QQC2.TextField {
+                visible: sheet.oauthAccount && Mail.oauthSignInUrl !== ""
+                         && sheet.editIndex === Mail.currentAccount && !Demo.on
+                Kirigami.FormData.label: "Waiting for sign-in:"
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                readOnly: true
+                selectByMouse: true
+                text: Mail.oauthSignInUrl
+                cursorPosition: 0
+            }
+            QQC2.Label {
+                visible: sheet.oauthAccount && sheet.editIndex >= 0
+                         && sheet.editIndex !== Mail.currentAccount
+                Kirigami.FormData.label: ""
+                Layout.maximumWidth: Kirigami.Units.gridUnit * 22
+                wrapMode: Text.Wrap
+                opacity: 0.8
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                text: "Switch to this account to sign in to it again."
             }
 
             QQC2.Label {
@@ -1433,6 +1508,13 @@ Item {
                         // often than the text changes — savePrefs() writes
                         // only when something actually differs.
                         onActiveFocusChanged: if (!activeFocus) sheet.savePrefs()
+                        // Focus loss alone is not enough here: a signature is
+                        // typed or pasted and then left focused while the user
+                        // goes on to other things, and the Import button fills
+                        // it without the editor ever taking focus. Both sat
+                        // unsaved under an "All saved" footer. A pause in the
+                        // edits is the commit instead.
+                        onTextChanged: if (!sheet.loading) signatureSaveTimer.restart()
                     }
                 }
                 QQC2.Label {
@@ -1721,13 +1803,13 @@ Item {
                         Layout.fillWidth: true
                         spacing: 0
                         QQC2.Label {
-                            text: modelData.what + " from " + modelData.from
+                            text: modelData.what + " from " + (Demo.on ? Demo.text(modelData.from) : modelData.from)
                             font.bold: true
                             wrapMode: Text.Wrap
                             Layout.fillWidth: true
                         }
                         QQC2.Label {
-                            text: modelData.which
+                            text: Demo.on ? Demo.text(modelData.which) : modelData.which
                             wrapMode: Text.Wrap
                             opacity: 0.8
                             Layout.fillWidth: true
@@ -2268,15 +2350,20 @@ Item {
                     // savePrefs(). Nothing pending is a state worth stating
                     // rather than a button worth offering — reconnecting on
                     // demand is the toolbar's Reconnect button, not this.
-                    text: sheet.connectionDirty ? "Save" : "All saved"
-                    icon.name: sheet.connectionDirty ? "document-save" : "dialog-ok"
-                    enabled: sheet.connectionDirty && sheet.detailsMissing === ""
+                    text: Demo.on ? "Demo mode — not saved"
+                        : sheet.connectionDirty ? "Save" : "All saved"
+                    icon.name: Demo.on ? "dialog-cancel"
+                        : sheet.connectionDirty ? "document-save" : "dialog-ok"
+                    enabled: !Demo.on && sheet.connectionDirty && sheet.detailsMissing === ""
                     highlighted: enabled
                     onClicked: sheet.saveAccount()
                     opacity: sheet.prefsSaved ? 0.0 : 1.0
                     visible: sheet.page === 0 && opacity > 0
                     Behavior on opacity { NumberAnimation { duration: 300 } }
-                    QQC2.ToolTip.text: sheet.connectionDirty
+                    QQC2.ToolTip.text: Demo.on
+                        ? "Demo mode is on: the form shows made-up values, and nothing "
+                          + "on this page is stored until it is turned off."
+                        : sheet.connectionDirty
                         ? "Stores the server, address and password, and reconnects. "
                           + "The name, signature and encryption settings save themselves."
                         : "Everything on this page is stored. Use Reconnect in the "

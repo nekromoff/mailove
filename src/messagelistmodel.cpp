@@ -45,7 +45,7 @@ QVariant MessageListModel::data(const QModelIndex &index, int role) const
     case ToRole:
         return h.to;
     case DateRole: {
-        const QDateTime local = h.date.toLocalTime();
+        const QDateTime local = h.date.addSecs(m_dateShift).toLocalTime();
         if (local.date() == QDate::currentDate())
             return local.toString(QStringLiteral("hh:mm"));
         return local.toString(m_dateFormat + QStringLiteral(" hh:mm"));
@@ -123,6 +123,15 @@ void MessageListModel::setDateFormat(const QString &format)
     if (m_dateFormat == format)
         return;
     m_dateFormat = format;
+    if (!m_rows.isEmpty())
+        Q_EMIT dataChanged(index(0), index(m_rows.size() - 1), {DateRole});
+}
+
+void MessageListModel::setDateShift(qint64 secs)
+{
+    if (m_dateShift == secs)
+        return;
+    m_dateShift = secs;
     if (!m_rows.isEmpty())
         Q_EMIT dataChanged(index(0), index(m_rows.size() - 1), {DateRole});
 }

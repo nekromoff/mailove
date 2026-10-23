@@ -88,7 +88,8 @@ public:
     /// \a interactive likewise: every JMAP request already rides the same
     /// HTTP pipe, so there is no lesser leg to fall back from.
     void fetchBodies(const QString &folder, const QStringList &remoteIds,
-                     const OpCallback &done, bool interactive = false) override;
+                     const OpCallback &done, bool interactive = false,
+                     bool exactBody = false) override;
     int freeBodySlots() const override;
     bool bodyFetchActive() const override { return m_bodiesInFlight > 0; }
     /// Connected is ready: HTTP does not serialize requests, so background

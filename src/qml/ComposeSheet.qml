@@ -26,7 +26,8 @@ Item {
         if (first === "")
             return titleBase
         const named = first.match(/^\s*"?([^"<]*[^"<\s])"?\s*</)
-        return titleBase + " to: " + (named ? named[1] : first)
+        const who = named ? named[1] : first
+        return titleBase + " to: " + (Demo.on ? Demo.text(who) : who)
     }
     /// The same, plus the identity the message will be sent as. Only the
     /// window placement uses it: a title bar has room to say which account is
@@ -37,7 +38,7 @@ Item {
     /// login configured the fallback derives a bare "@", which is worse than
     /// saying nothing.
     readonly property string windowTitle: Mail.accountSendAddress.indexOf("@") > 0
-        ? title + " (" + Mail.accountSendAddress + ")"
+        ? title + " (" + (Demo.on ? Demo.text(Mail.accountSendAddress) : Mail.accountSendAddress) + ")"
         : title
     signal presentRequested()
     signal closeRequested()

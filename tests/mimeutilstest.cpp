@@ -207,6 +207,43 @@ int main(int argc, char **argv)
     check(MimeUtils::findPartByType(msg.get(), "text/nonexistent") == nullptr,
           "findPartByType returns null for a type that is not there");
 
+    // --- replySubject ----------------------------------------------------
+    // A run of reply markers collapses to one; nothing else is touched.
+    check(MimeUtils::replySubject(QStringLiteral("hello")) == QLatin1String("Re: hello"),
+          "replySubject adds one Re: to a fresh subject");
+    check(MimeUtils::replySubject(QStringLiteral("Re: hello")) == QLatin1String("Re: hello"),
+          "replySubject keeps a single Re:");
+    check(MimeUtils::replySubject(QStringLiteral("Re: re: RE: hello")) == QLatin1String("Re: hello"),
+          "replySubject collapses Re: re: RE:");
+    check(MimeUtils::replySubject(QStringLiteral("RE:Re[2]: Re(3) :  hello")) == QLatin1String("Re: hello"),
+          "replySubject collapses counted and spaced markers");
+    check(MimeUtils::replySubject(QStringLiteral("Re: Fwd: Re: hello")) == QLatin1String("Re: Fwd: Re: hello"),
+          "replySubject leaves markers behind a Fwd: alone");
+    check(MimeUtils::replySubject(QStringLiteral("Rebate: hello")) == QLatin1String("Re: Rebate: hello"),
+          "replySubject does not eat a word that starts with re");
+    check(MimeUtils::replySubject(QStringLiteral("AW: Re: SV: Odp: hello")) == QLatin1String("Re: hello"),
+          "replySubject collapses localized reply markers");
+    check(MimeUtils::replySubject(QStringLiteral("ΑΠ: Отв: 回复：hello")) == QLatin1String("Re: hello"),
+          "replySubject collapses non-Latin reply markers, full-width colon too");
+    check(MimeUtils::replySubject(QStringLiteral("Svetlo: hello")) == QLatin1String("Re: Svetlo: hello"),
+          "replySubject keeps a word that only starts like a marker");
+    check(MimeUtils::replySubject(QString()) == QLatin1String("Re: "),
+          "replySubject of an empty subject is a bare Re:");
+
+    // --- forwardSubject --------------------------------------------------
+    check(MimeUtils::forwardSubject(QStringLiteral("hello")) == QLatin1String("Fwd: hello"),
+          "forwardSubject adds one Fwd: to a fresh subject");
+    check(MimeUtils::forwardSubject(QStringLiteral("Fwd: FW: fwd: hello")) == QLatin1String("Fwd: hello"),
+          "forwardSubject collapses Fwd: FW: fwd:");
+    check(MimeUtils::forwardSubject(QStringLiteral("WG: TR: RV: VB[2]: hello")) == QLatin1String("Fwd: hello"),
+          "forwardSubject collapses localized forward markers");
+    check(MimeUtils::forwardSubject(QStringLiteral("转发：Пересл: hello")) == QLatin1String("Fwd: hello"),
+          "forwardSubject collapses non-Latin forward markers");
+    check(MimeUtils::forwardSubject(QStringLiteral("Fwd: Re: Fwd: hello")) == QLatin1String("Fwd: Re: Fwd: hello"),
+          "forwardSubject leaves markers behind a Re: alone");
+    check(MimeUtils::forwardSubject(QStringLiteral("Travel: hello")) == QLatin1String("Fwd: Travel: hello"),
+          "forwardSubject keeps a word that only starts like a marker");
+
     // --- the collectors the spam scorer reads ----------------------------
     {
         QString text, html;

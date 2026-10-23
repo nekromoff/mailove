@@ -208,6 +208,10 @@ class MailClient : public QObject
     /// went instead of leaving them apparently nowhere. 0 the moment the move
     /// is pushed, which offline means "on reconnect". See incomingCount().
     Q_PROPERTY(int incomingCount READ incomingCount NOTIFY journalChanged)
+    /// The browser sign-in link while one is waiting to be completed, empty
+    /// otherwise. Shown in the account settings so it can be opened in a
+    /// browser (or profile) signed in to the right account.
+    Q_PROPERTY(QString oauthSignInUrl READ oauthSignInUrl NOTIFY oauthSignInUrlChanged)
 
 public:
     // Keep in sync with the combo box in AccountSheet.qml
@@ -319,6 +323,13 @@ public:
     /// the cache and the wallet entry, so they go through the explicit save.
     Q_INVOKABLE void saveAccountPrefs(int index, const QVariantMap &details);
     Q_INVOKABLE void removeAccount(int index);
+    QString oauthSignInUrl() const;
+    /// Signs the active OAuth account in again without launching a browser:
+    /// starts a fresh interactive sign-in (whatever refresh token is stored)
+    /// and puts its link on the clipboard. For when the default browser is
+    /// signed in to a different Google or Microsoft account. A sign-in that
+    /// is already waiting is reused, not restarted.
+    Q_INVOKABLE void copyOAuthSignInLink();
     /// Imports a Thunderbird mail directory (mbox files, ".sbd" hierarchy)
     /// into a new local-archive account: browsable from the cache like any
     /// other account, but never connected or synced — unless server details
@@ -621,6 +632,15 @@ public:
     /// registered for mail — which may well be this client again, in a
     /// second instance.
     Q_INVOKABLE static QVariantMap mailtoData(const QUrl &url);
+    /// mailto: links handed to mailove from outside: the command line of
+    /// this process (a desktop's "Exec=mailove %U"), or a later launch that
+    /// found this one running and passed its links over instead of starting
+    /// a second client. Queued until QML takes them, so a link that arrives
+    /// before the window exists, or before there is an account to write
+    /// from, is not lost.
+    void queueExternalMailto(const QStringList &links);
+    /// Hands over and clears what queueExternalMailto() collected.
+    Q_INVOKABLE QStringList takeExternalMailto();
 
     // --- Cache maintenance (Settings → Storage) ---
     /// Human-readable cache size, e.g. "13.4 GB (6.2 GB reclaimable)".
@@ -648,6 +668,9 @@ public:
     Q_INVOKABLE void quitWhenIndexRebuildDone() { m_quitAfterIndex = true; }
 
 Q_SIGNALS:
+    /// queueExternalMailto() has links waiting: QML opens the composer and
+    /// brings the window forward.
+    void externalMailtoQueued();
     void reclaimingChanged();
     void indexRebuildChanged();
     void migrationChanged();
@@ -661,6 +684,7 @@ Q_SIGNALS:
     void spamSkipTrashChanged();
     void busyChanged();
     void statusTextChanged();
+    void oauthSignInUrlChanged();
     /// Fired when a full message body has been fetched and parsed.
     /// bodyUrl is a mailove:// URL the viewer should load.
     void messageLoaded(const QString &subject, const QString &from,
@@ -1432,6 +1456,11 @@ private:
     /// Continuations parked on the acquisition in flight; empty when none is.
     QList<std::function<void(bool, const QString &)>> m_tokenWaiters;
     bool m_tokenInFlight = false;
+    /// Set by copyOAuthSignInLink() for the acquisition it starts: skip the
+    /// refresh token, and copy the link instead of opening the browser.
+    bool m_signInLinkOnly = false;
+    /// The acquisition in flight is a refresh-token renewal, not a browser one.
+    bool m_refreshInFlight = false;
     bool m_connectWhenReady = false; ///< connect was requested before the secret arrived
     int m_cachedFolderRevision = 0; ///< see cachedFolderRevision property
 
@@ -1563,6 +1592,7 @@ private:
     bool m_searching = false;   ///< a search is in flight (server or local)
     int m_searchFound = 0;      ///< hits delivered by it so far
     bool m_quitAfterIndex = false; ///< close was attempted mid-rebuild
+    QStringList m_externalMailto; ///< see queueExternalMailto()
     QTimer m_pollTimer;      ///< IDLE-less fallback refresh of the open folder
     int m_refreshMinutes = 5;
     int m_spamRetentionDays = 30; ///< 0 = keep spam forever

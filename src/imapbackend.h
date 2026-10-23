@@ -107,7 +107,8 @@ public:
     qint64 messageCount(const QString &folder) const;
 
     void fetchBodies(const QString &folder, const QStringList &remoteIds,
-                     const OpCallback &done, bool interactive = false) override;
+                     const OpCallback &done, bool interactive = false,
+                     bool exactBody = false) override;
     int freeBodySlots() const override;
     bool bodyFetchActive() const override;
     /// The dedicated background connection being up and logged in. When it is
@@ -193,10 +194,12 @@ private:
     /// Interactive-only last resort: serves a body fetch on the main session
     /// when the pool and the background connection are both unavailable.
     void fetchBodiesOnMainSession(const QString &folder, const KIMAP::ImapSet &set,
-                                  const OpCallback &done);
+                                  const OpCallback &done, bool exactBody);
+    /// \a exactBody skips the size check and always fetches BODY[TEXT] — for a
+    /// caller that already knows the re-assembled body is not the original.
     void startBodyFetchJob(KIMAP::Session *session, const QString &folder,
                            const KIMAP::ImapSet &set, const OpCallback &done,
-                           const std::function<void()> &release);
+                           const std::function<void()> &release, bool exactBody);
     /// Whether \a folder is what \a session actually has selected — the
     /// delivery-time answer, from the SELECT that *completed*, not the one
     /// that was queued. A FETCH is queued behind its SELECT and normally runs

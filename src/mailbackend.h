@@ -228,8 +228,16 @@ public:
     /// interactive one included: for the backfill "no capacity right now" is
     /// an answer (the ids come back round), but for a click it is a failure
     /// the user reads.
+    ///
+    /// \a exactBody asks for the body octet for octet whatever it costs. The
+    /// IMAP backend normally trusts KMime's re-assembly of a BODY.PEEK[]
+    /// answer when it is the length the server reports and fetches the TEXT
+    /// section only otherwise; a caller re-asking because a body hash failed
+    /// already knows that trust was misplaced, and says so here. JMAP serves
+    /// the blob as stored and has nothing to do differently.
     virtual void fetchBodies(const QString &folder, const QStringList &remoteIds,
-                             const OpCallback &done, bool interactive = false) = 0;
+                             const OpCallback &done, bool interactive = false,
+                             bool exactBody = false) = 0;
     /// How many more body batches can be started right now. A backend may keep
     /// several connections for bulk transfer (IMAP does; HTTP does not need
     /// to), and the caller paces its queue by this rather than guessing.

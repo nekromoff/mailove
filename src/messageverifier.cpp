@@ -209,7 +209,7 @@ bool MessageVerifier::healCachedBody(MessageContext *ctx, HealReason reason)
     // next open would mismatch again. The verdict is what gets kept instead.
     const bool externalized = !m_store.partsFor(folder, uid).isEmpty();
 
-    qCDebug(logTrace) << "dkim: body mismatch from cache, refetching uid" << uid
+    qCDebug(logTrace) << "dkim: mismatch on cached bytes, refetching uid" << uid
                       << "in" << folder;
 
     // Could not get a second opinion, so do not offer one — and do not mark
@@ -309,7 +309,14 @@ void MessageVerifier::applyDkimResult(quint64 requestId, const DkimResult &resul
         break;
     case DkimResult::Fail:
         // The one case that earns an accusation: we fetched the key the
-        // signature names and the signature does not match it.
+        // signature names and the signature does not match it. Earned only
+        // against bytes known to be the original. A cached head may not be:
+        // until 2026-10 the body fetch took Gmail's BODY[HEADER] answer, which
+        // Gmail re-folds, and a signature with simple header canonicalization
+        // fails on that copy while passing on the wire octets. Refetch once
+        // and re-judge before saying so.
+        if (ctx->m_dkimFromCache && healCachedBody(ctx, HealReason::DkimBodyHash))
+            return;
         ctx->m_dkimStatus = QStringLiteral("fail");
         break;
     case DkimResult::PermError:

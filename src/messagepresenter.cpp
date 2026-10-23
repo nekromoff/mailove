@@ -5,6 +5,8 @@
 
 #include "advancedconfig.h"
 
+#include "demomode.h"
+
 #include "messagecontext.h"
 #include "mimeutils.h"
 #include "viewersecurity.h"
@@ -200,7 +202,7 @@ QString MessagePresenter::composePreviewUrl(MessageContext *ctx, quint64 *slot)
     return m_handler->setMessageHtml(
         *slot,
         QByteArrayLiteral("<meta charset=\"utf-8\">")
-            + messageCsp(ctx->remoteContentAllowed()) + html.toUtf8());
+            + messageCsp(ctx->remoteContentAllowed()) + DemoMode::html(html.toUtf8()));
 }
 
 void MessagePresenter::releasePreviewSlot(quint64 slot)
@@ -235,7 +237,7 @@ QString MessagePresenter::htmlViewUrl(MessageContext *ctx)
     return m_handler->setMessageHtml(
         ctx->viewerContext(),
         QByteArrayLiteral("<meta charset=\"utf-8\">")
-            + messageCsp(ctx->remoteContentAllowed()) + html.toUtf8());
+            + messageCsp(ctx->remoteContentAllowed()) + DemoMode::html(html.toUtf8()));
 }
 
 QString MessagePresenter::textViewUrl(MessageContext *ctx)
@@ -260,7 +262,7 @@ QString MessagePresenter::textViewUrl(MessageContext *ctx)
     // and falls apart in a proportional font. Linkified so URLs are clickable
     // like in the HTML view; the source view stays verbatim.
     return m_handler->setMessageHtml(ctx->viewerContext(),
-                                           preformattedPage(text, true, true));
+                                     DemoMode::html(preformattedPage(text, true, true)));
 }
 
 QString MessagePresenter::sourceViewUrl(MessageContext *ctx)
@@ -272,7 +274,8 @@ QString MessagePresenter::sourceViewUrl(MessageContext *ctx)
     // every part, verbatim. Showing just the HTML part here (as this once
     // did) left HTML mail with a "source" view that had no headers at all.
     return m_handler->setMessageHtml(
-        ctx->viewerContext(), preformattedPage(QString::fromUtf8(ctx->m_raw), true));
+        ctx->viewerContext(),
+        DemoMode::html(preformattedPage(QString::fromUtf8(ctx->m_raw), true)));
 }
 
 

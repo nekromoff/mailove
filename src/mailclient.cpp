@@ -4,6 +4,7 @@
 #include "mailclient.h"
 
 #include "advancedconfig.h"
+#include "demomode.h"
 #include "documenthandler.h"
 #include "mimeutils.h"
 #include "attachmentstore.h"
@@ -36,6 +37,7 @@
 #include <QThread>
 #include <QTimer>
 #include <QUrlQuery>
+#include <utility>
 
 #include <limits>
 
@@ -652,8 +654,10 @@ MailClient::MailClient(QObject *parent)
         // whose other folders go stalest: a background account at least gets
         // the STATUS sweep in pollOtherAccounts() every tick.
         //
-        // Skipped while something user-triggered is in flight: both of these
-        // queue on the interactive session, and the interval has no deadline.
+        // Skipped while something user-triggered is in flight: the sweep and
+        // the pass both run on the background connection now, but a refresh
+        // that just went out on the interactive one deserves the server's
+        // attention first, and the interval has no deadline.
         if (connected() && !m_busy) {
             refreshAccountUnreadCounts(); // the pills, now
             // …and the mail behind them. The all-folders sync pass latches
@@ -686,6 +690,10 @@ MailClient::MailClient(QObject *parent)
                        .value(QStringLiteral("ui/dateFormat"), QStringLiteral("yyyy-MM-dd"))
                        .toString();
     m_messageModel.setDateFormat(m_dateFormat);
+    // Demo mode moves the list's dates; the QML labels follow it on their own.
+    m_messageModel.setDateShift(DemoMode::dateShiftSecs());
+    connect(&DemoMode::instance(), &DemoMode::changed, this,
+            [this] { m_messageModel.setDateShift(DemoMode::dateShiftSecs()); });
 
     m_jobs->startReindexTimer();
 
@@ -3469,8 +3477,7 @@ QVariantMap MailClient::replyDataFor(MessageContext *ctx, bool replyAll)
     }
 
     QString subject = msg->subject() ? msg->subject()->asUnicodeString() : QString();
-    if (!subject.startsWith(QLatin1String("Re:"), Qt::CaseInsensitive))
-        subject = QStringLiteral("Re: ") + subject;
+    subject = MimeUtils::replySubject(subject);
 
     // Quote the HTML part when there is one so the reply keeps the original's
     // formatting; the plain-text part is the fallback. A big quote never
@@ -3616,9 +3623,7 @@ QVariantMap MailClient::forwardDataFor(MessageContext *ctx)
     const KMime::Message *msg = ctx->m_message.get();
 
     QString subject = msg->subject() ? msg->subject()->asUnicodeString() : QString();
-    if (!subject.startsWith(QLatin1String("Fwd:"), Qt::CaseInsensitive)
-        && !subject.startsWith(QLatin1String("Fw:"), Qt::CaseInsensitive))
-        subject = QStringLiteral("Fwd: ") + subject;
+    subject = MimeUtils::forwardSubject(subject);
 
     // Inline cid: images are rewritten to temp files first — quotableHtml()
     // drops any cid: image left over (the editor cannot resolve them), which
@@ -3713,9 +3718,7 @@ QVariantMap MailClient::forwardAsAttachmentDataFor(MessageContext *ctx)
 
     QString subject = msg->subject() ? msg->subject()->asUnicodeString() : QString();
     const QString origSubject = subject;
-    if (!subject.startsWith(QLatin1String("Fwd:"), Qt::CaseInsensitive)
-        && !subject.startsWith(QLatin1String("Fw:"), Qt::CaseInsensitive))
-        subject = QStringLiteral("Fwd: ") + subject;
+    subject = MimeUtils::forwardSubject(subject);
 
     // The message as it arrived, byte for byte — attachments, inline images,
     // headers and signatures intact and verifiable, which no inline forward
@@ -3852,9 +3855,7 @@ QVariantMap MailClient::forwardRowsAsAttachmentData(const QVariantList &rows)
         return {};
 
     QString subject = firstSubject;
-    if (!subject.startsWith(QLatin1String("Fwd:"), Qt::CaseInsensitive)
-        && !subject.startsWith(QLatin1String("Fw:"), Qt::CaseInsensitive))
-        subject = QStringLiteral("Fwd: ") + subject;
+    subject = MimeUtils::forwardSubject(subject);
     if (attachments.size() > 1)
         subject = tr("Fwd: %n messages", nullptr, int(attachments.size()));
     return {{QStringLiteral("to"), QString()},
@@ -4551,6 +4552,7 @@ void MailClient::acquireToken(std::function<void(bool, const QString &)> done)
         connect(m_oauth, &OAuthHelper::tokensReady, this,
                 [this](const QString &accessToken, const QString &refreshToken,
                        const QDateTime &expiry) {
+                    m_refreshInFlight = false;
                     m_accounts.setAccessToken(accessToken, expiry);
                     if (!refreshToken.isEmpty()
                         && refreshToken != m_accounts.refreshToken()) {
@@ -4574,11 +4576,16 @@ void MailClient::acquireToken(std::function<void(bool, const QString &)> done)
                     setBusy(false);
                     finishTokenWaiters(true, QString());
                 });
+        connect(m_oauth, &OAuthHelper::authorizationUrlChanged, this,
+                &MailClient::oauthSignInUrlChanged);
         connect(m_oauth, &OAuthHelper::failed, this, [this](const QString &message) {
             setBusy(false);
             // A dead refresh token would fail forever — drop it so the next
-            // attempt goes through the browser again.
-            if (!m_accounts.refreshToken().isEmpty()) {
+            // attempt goes through the browser again. Only when it was the
+            // refresh that failed: an abandoned copied sign-in link says
+            // nothing about the token, which may be perfectly good.
+            if (std::exchange(m_refreshInFlight, false)
+                && !m_accounts.refreshToken().isEmpty()) {
                 m_accounts.setRefreshToken(QString());
                 auto *del = new QKeychain::DeletePasswordJob(kWalletService, this);
                 del->setKey(oauthWalletKey());
@@ -4594,16 +4601,58 @@ void MailClient::acquireToken(std::function<void(bool, const QString &)> done)
 
     setBusy(true);
     const auto start = [this, provider](const QString &id, const QString &secret) {
-        if (!m_accounts.refreshToken().isEmpty()) {
+        const bool linkOnly = std::exchange(m_signInLinkOnly, false);
+        if (!linkOnly && !m_accounts.refreshToken().isEmpty()) {
             setStatus(tr("Refreshing sign-in"));
+            m_refreshInFlight = true;
             m_oauth->refresh(provider, id, secret, m_accounts.refreshToken());
-        } else {
+            return;
+        }
+        // The address, so the provider offers this account and not whichever
+        // one the browser happens to be signed in to.
+        const QString hint = !m_acct.email.isEmpty() ? m_acct.email : m_acct.user;
+        m_oauth->authorize(provider, id, secret, hint, !linkOnly);
+        if (!linkOnly) {
             setStatus(tr("Sign in in your browser"));
-            m_oauth->authorize(provider, id, secret);
+        } else if (!m_oauth->authorizationUrl().isEmpty()) {
+            if (QClipboard *clipboard = QGuiApplication::clipboard())
+                clipboard->setText(m_oauth->authorizationUrl().toString(QUrl::FullyEncoded));
+            setStatus(tr("Sign-in link copied — open it in the browser signed in to %1")
+                          .arg(hint));
         }
     };
 
     resolveOAuthClient(m_acct.authType, m_acct.clientId, m_acct.clientSecret, start);
+}
+
+QString MailClient::oauthSignInUrl() const
+{
+    return m_oauth ? m_oauth->authorizationUrl().toString(QUrl::FullyEncoded) : QString();
+}
+
+void MailClient::copyOAuthSignInLink()
+{
+    if (m_acct.authType == 0 || m_acct.local)
+        return;
+    // A browser sign-in already waiting: hand out its link rather than start
+    // another, which would invalidate the one the user may have open.
+    const QString waiting = oauthSignInUrl();
+    if (!waiting.isEmpty()) {
+        if (QClipboard *clipboard = QGuiApplication::clipboard())
+            clipboard->setText(waiting);
+        setStatus(tr("Sign-in link copied"));
+        return;
+    }
+    // A silent refresh in flight ends on its own, one way or the other.
+    if (m_tokenInFlight) {
+        setStatus(tr("Sign-in already in progress — try again in a moment"));
+        return;
+    }
+    m_signInLinkOnly = true;
+    acquireToken([this](bool ok, const QString &) {
+        if (ok && !connected())
+            connectAccount();
+    });
 }
 
 void MailClient::resolveOAuthClient(
@@ -6394,6 +6443,13 @@ void MailClient::refreshAccountUnreadCounts()
     QStringList folders = m_store.cachedFolders(key);
     if (folders.isEmpty())
         folders.append(QStringLiteral("INBOX"));
+    // The folder on screen first, then the inbox: over IMAP this is one STATUS
+    // per folder in list order, and the pill the user is looking at should
+    // not wait for every label on the account to be counted before it.
+    for (const QString &first : {QStringLiteral("INBOX"), m_selectedFolder}) {
+        if (!first.isEmpty() && folders.removeOne(first))
+            folders.prepend(first);
+    }
 
     // One call for every folder at once over JMAP, where IMAP would need a
     // STATUS each — which is why this hangs off a signal only JMAP raises.
@@ -9044,8 +9100,29 @@ bool MailClient::refetchBodyForVerification(const QString &folder, qint64 uid,
             }
             done({});
         },
-        /*interactive=*/true);
+        /*interactive=*/true,
+        // The hash failed on the copy we had; the one thing this refetch must
+        // not do is trust the same re-assembly again.
+        /*exactBody=*/true);
     return true;
+}
+
+void MailClient::queueExternalMailto(const QStringList &links)
+{
+    bool added = false;
+    for (const QString &link : links) {
+        if (!link.startsWith(QLatin1String("mailto:"), Qt::CaseInsensitive))
+            continue;
+        m_externalMailto.append(link);
+        added = true;
+    }
+    if (added)
+        Q_EMIT externalMailtoQueued();
+}
+
+QStringList MailClient::takeExternalMailto()
+{
+    return std::exchange(m_externalMailto, {});
 }
 
 QVariantMap MailClient::mailtoData(const QUrl &url)
@@ -9341,7 +9418,7 @@ void MailClient::presentMessage(const std::shared_ptr<KMime::Message> &message)
         : QString();
     QString date;
     if (cmsg->date()) {
-        const QDateTime local = cmsg->date()->dateTime().toLocalTime();
+        const QDateTime local = DemoMode::date(cmsg->date()->dateTime()).toLocalTime();
         date = local.date() == QDate::currentDate()
             ? local.toString(QStringLiteral("hh:mm"))
             : local.toString(m_dateFormat + QStringLiteral(" hh:mm"));

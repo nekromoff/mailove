@@ -260,6 +260,31 @@ Kirigami.ApplicationWindow {
         } else {
             accountSheet().open()
         }
+        openExternalMailto()
+    }
+
+    /// mailto: links from other apps — this launch's own, or a later
+    /// launch's, passed over by main.cpp. Each opens the composer with the
+    /// link's fields. With no account yet they wait in Mail until the
+    /// first-run sheet has made one.
+    function openExternalMailto() {
+        if (!Mail.hasAccount)
+            return
+        const links = Mail.takeExternalMailto()
+        if (links.length === 0)
+            return
+        if (root.visibility === Window.Minimized || !root.visible)
+            root.showNormal()
+        root.raise()
+        root.requestActivate()
+        // One composer: if several links come at once, the last one wins.
+        composeSheet().openMailto(links[links.length - 1])
+    }
+
+    Connections {
+        target: Mail
+        function onExternalMailtoQueued() { root.openExternalMailto() }
+        function onAccountChanged() { root.openExternalMailto() }
     }
 
     Connections {
@@ -1646,7 +1671,7 @@ Kirigami.ApplicationWindow {
                                                     }
                                                     QQC2.Label {
                                                         Layout.fillWidth: true
-                                                        text: accountSection.modelData
+                                                        text: Demo.on ? Demo.text(accountSection.modelData) : accountSection.modelData
                                                         font.bold: true
                                                             color: Kirigami.Theme.textColor
                                                         elide: Text.ElideRight
@@ -1968,7 +1993,7 @@ Kirigami.ApplicationWindow {
                                                         }
                                                         QQC2.Label {
                                                             Layout.fillWidth: true
-                                                            text: folderDelegate.name
+                                                            text: Demo.on ? Demo.text(folderDelegate.name) : folderDelegate.name
                                                             elide: Text.ElideRight
                                                             color: folderDelegate.highlighted
                                                                    ? Kirigami.Theme.highlightedTextColor
@@ -2266,7 +2291,8 @@ Kirigami.ApplicationWindow {
                                                             }
                                                             QQC2.Label {
                                                                 Layout.fillWidth: true
-                                                                text: cachedFolderDelegate.modelData.name
+                                                                text: Demo.on ? Demo.text(cachedFolderDelegate.modelData.name)
+                                                                              : cachedFolderDelegate.modelData.name
                                                                 elide: Text.ElideRight
                                                                 color: Kirigami.Theme.textColor
                                                             }
@@ -2955,7 +2981,8 @@ Kirigami.ApplicationWindow {
                                                 spacing: Kirigami.Units.smallSpacing
                                                 QQC2.Label {
                                                     Layout.fillWidth: true
-                                                    text: outboxDelegate.modelData.subject
+                                                    text: Demo.on ? Demo.text(outboxDelegate.modelData.subject)
+                                                                  : outboxDelegate.modelData.subject
                                                     font.bold: true
                                                     elide: Text.ElideRight
                                                 }
@@ -2970,7 +2997,8 @@ Kirigami.ApplicationWindow {
                                             QQC2.Label {
                                                 Layout.fillWidth: true
                                                 text: (outboxDelegate.modelData.bulk ? "Bulk · " : "")
-                                                      + "To: " + outboxDelegate.modelData.to
+                                                      + "To: " + (Demo.on ? Demo.text(outboxDelegate.modelData.to)
+                                                                         : outboxDelegate.modelData.to)
                                                 elide: Text.ElideRight
                                                 opacity: 0.8
                                                 font.pointSize: Kirigami.Theme.smallFont.pointSize
@@ -3713,6 +3741,13 @@ Kirigami.ApplicationWindow {
                                         // recipients column existed.
                                         readonly property string correspondent:
                                             (Mail.viewingOutgoing && to !== "") ? to : from
+                                        // What is painted: demo mode's fake words,
+                                        // or the real values. Everything that acts on
+                                        // a row reads subject and from, never these.
+                                        readonly property string shownSubject:
+                                            Demo.on ? Demo.text(subject) : subject
+                                        readonly property string shownCorrespondent:
+                                            Demo.on ? Demo.text(correspondent) : correspondent
                                         required property bool seen
                                         /// $Forwarded: this message has been
                                         /// forwarded, from here or from any
@@ -3866,7 +3901,7 @@ Kirigami.ApplicationWindow {
                                                            : [msgDelegate.index]
                                                 dragPayload.prepare(
                                                     "messages", rows, "",
-                                                    rows.length === 1 ? msgDelegate.subject
+                                                    rows.length === 1 ? msgDelegate.shownSubject
                                                                       : rows.length + " messages")
                                                 dragPayload.moveTo(msgDelegate.mapToItem(
                                                     QQC2.Overlay.overlay, mouse.x, mouse.y))
@@ -4052,8 +4087,8 @@ Kirigami.ApplicationWindow {
                                                             ? authMark.width + Kirigami.Units.smallSpacing * 2
                                                             : Kirigami.Units.smallSpacing
                                                         anchors.rightMargin: Kirigami.Units.smallSpacing
-                                                        text: rowCell.colId === "subject" ? msgDelegate.subject
-                                                            : rowCell.colId === "from" ? msgDelegate.correspondent
+                                                        text: rowCell.colId === "subject" ? msgDelegate.shownSubject
+                                                            : rowCell.colId === "from" ? msgDelegate.shownCorrespondent
                                                             : rowCell.colId === "date" ? msgDelegate.date : ""
                                                         elide: Text.ElideRight
                                                         font.bold: rowCell.colId === "subject" && !msgDelegate.seen
@@ -4116,7 +4151,7 @@ Kirigami.ApplicationWindow {
 
                                                     QQC2.Label {
                                                         Layout.fillWidth: true
-                                                        text: msgDelegate.correspondent
+                                                        text: msgDelegate.shownCorrespondent
                                                         elide: Text.ElideRight
                                                         font.bold: !msgDelegate.seen
                                                         color: msgDelegate.rowTextColor
@@ -4147,7 +4182,7 @@ Kirigami.ApplicationWindow {
                                                     }
                                                     QQC2.Label {
                                                         Layout.fillWidth: true
-                                                        text: msgDelegate.subject
+                                                        text: msgDelegate.shownSubject
                                                         elide: Text.ElideRight
                                                         font.bold: !msgDelegate.seen
                                                         color: msgDelegate.rowTextColor

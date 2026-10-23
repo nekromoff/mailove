@@ -55,67 +55,109 @@ bool isTooManyConnections(const QString &err)
 /// The two halves of a message as the server sent them, before KMime has been
 /// allowed near either.
 ///
-/// BODY.PEEK[] is the obvious way to ask for a message and the wrong one:
-/// KIMAP answers it with Message::setContent() followed by parse(), and a
-/// parsed KMime tree can no longer reproduce its own source. Where a nested
-/// multipart's closing delimiter sits tight against the parent boundary — no
-/// blank line between `--INNER--` and `--OUTER`, which is what Gmail emits for
-/// a reply with attachments — re-assembly inserts a blank line the wire did
-/// not have ([KDE bug 523826](https://bugs.kde.org/show_bug.cgi?id=523826)).
-/// The body hash then fails and mailove calls a perfectly good message
-/// "modified after signing".
+/// Neither of the two ways KIMAP can ask for a message gives both halves back
+/// octet-exact on its own, so the head and the body are trusted from
+/// different fetches:
 ///
-/// The section fetches take a different path through KIMAP: BODY[HEADER]
-/// reaches KMime as setHead() and BODY[TEXT] as setBody(), neither of which
-/// re-encodes anything, and a Content with no head of its own parses as
-/// text/plain so its body is never split. Both halves come back octet-exact,
-/// and joining them is the message as it travelled.
+/// BODY.PEEK[] (FetchScope::Full) is answered with Message::setContent()
+/// followed by parse(). The head survives that untouched — parse() reads the
+/// header text and leaves it where it was, so head() and the front of
+/// encodedContent() are the wire octets. The body does not: a parsed multipart
+/// is re-assembled from its parts, and where a nested multipart's closing
+/// delimiter sits tight against the parent boundary — no blank line between
+/// `--INNER--` and `--OUTER`, which is what Gmail emits for a reply with
+/// attachments — re-assembly inserts a blank line the wire did not have
+/// ([KDE bug 523826](https://bugs.kde.org/show_bug.cgi?id=523826)). The body
+/// hash then fails and mailove calls a perfectly good message "modified after
+/// signing".
+///
+/// BODY.PEEK[HEADER] + BODY.PEEK[TEXT] reach KMime as setHead() and setBody(),
+/// which re-encode nothing — but Gmail does not serve the HEADER section as
+/// stored. It unfolds every header line and folds it again at 78 columns with
+/// single-space continuations (its own Received lines prove it: the ones in a
+/// BODY[] answer break where Google wrote them, the ones in BODY[HEADER] do
+/// not). A DKIM signature with relaxed header canonicalization does not care;
+/// one with simple canonicalization — no c= tag, which is what purelymail
+/// signs with — hashes the header lines byte for byte and fails on every
+/// message Gmail holds. That was mailove's own sent mail showing
+/// "✗ DKIM signature invalid" next to Google's dkim=pass.
+///
+/// So: one BODY.PEEK[] fetch, the head taken from it, and the re-assembled
+/// body accepted when it is the size the server reports for the message —
+/// RFC822.SIZE rides along with Full — because the one known re-assembly fault
+/// changes the length. When the size disagrees (or the caller insists), a
+/// second fetch brings BODY.PEEK[TEXT], which is exact, for just those uids.
+/// The common case costs one transfer; the tight-boundary case two.
 struct RawMessage {
-    QByteArray head; ///< BODY[HEADER], including its terminating blank line
-    QByteArray body; ///< BODY[TEXT]
+    QByteArray head; ///< the header block, including its terminating blank line
+    QByteArray body; ///< everything after it
     bool haveHead = false;
     bool haveBody = false;
     /// Both halves arrived. They may come in one delivery or several.
     bool complete() const { return haveHead && haveBody; }
 };
 
-/// Takes whichever halves this delivery carried. First one wins: a server that
-/// repeats a section in a later untagged response is describing the same
-/// octets, and re-taking them would only risk a partial overwrite.
-///
-/// The two halves arrive through different doors, from different jobs. The
-/// head comes from the FullHeaders job as m.message->head() — that mode is one
-/// of the three whose responses assign msg.message at all; asking for HEADER
-/// as a Content part instead gets parsed into a message KIMAP never delivers.
-/// The body comes from the Content job's parts map, where TEXT lands via
-/// setBody(). The parts fallback for HEADER costs nothing and keeps this
-/// working if KIMAP ever routes it there.
-void mergeRawParts(const KIMAP::Message &m, RawMessage &raw)
+/// What a BODY.PEEK[] answer is worth: the head, always; the body, when the
+/// re-assembled message is the length the server says the original is.
+struct FullFetch {
+    RawMessage raw;
+    bool bodyTrusted = false;
+};
+
+/// Splits KIMAP's parsed Full-mode message back into the two halves. The head
+/// is the original text (CRLF restored: KIMAP converted the literal to LF for
+/// setContent(), and nothing on the wire is bare LF). The body is KMime's
+/// re-assembly, trusted only on a size match — see RawMessage. A message
+/// without a header/body separator at all is left head-only, so the TEXT
+/// fetch decides what the body is.
+FullFetch splitFullFetch(const KIMAP::Message &m)
 {
-    if (!raw.haveHead) {
-        if (m.message && !m.message->head().isEmpty()) {
-            raw.head = m.message->head();
-            raw.haveHead = true;
-        } else if (const auto part = m.parts.value(QByteArrayLiteral("HEADER"))) {
-            raw.head = part->head();
-            raw.haveHead = true;
-        }
+    FullFetch out;
+    if (!m.message)
+        return out;
+    const QByteArray whole = KMime::LFtoCRLF(m.message->encodedContent());
+    const int split = whole.indexOf("\r\n\r\n");
+    if (split < 0) {
+        out.raw.head = whole;
+        out.raw.haveHead = !whole.isEmpty();
+        return out;
     }
-    if (!raw.haveBody) {
-        if (const auto part = m.parts.value(QByteArrayLiteral("TEXT"))) {
-            raw.body = part->body();
-            raw.haveBody = true;
-        }
+    out.raw.head = whole.left(split + 4);
+    out.raw.body = whole.mid(split + 4);
+    out.raw.haveHead = true;
+    out.raw.haveBody = true;
+    // RFC822.SIZE counts the wire octets, CRLF included, which is what `whole`
+    // is. A server that does not report it (0) earns no trust: the TEXT
+    // section is cheap insurance next to a wrong body hash.
+    out.bodyTrusted = m.size > 0 && whole.size() == m.size;
+    return out;
+}
+
+/// Takes the BODY[TEXT] section of this delivery, if it carried one. First one
+/// wins: a server that repeats a section in a later untagged response is
+/// describing the same octets, and re-taking them would only risk a partial
+/// overwrite. TEXT lands in the Content job's parts map via setBody(), which
+/// is the one route through KIMAP that neither parses nor re-encodes the
+/// payload: a Content with no head of its own parses as text/plain, so its
+/// body is never split.
+void mergeTextPart(const KIMAP::Message &m, RawMessage &raw)
+{
+    if (raw.haveBody)
+        return;
+    if (const auto part = m.parts.value(QByteArrayLiteral("TEXT"))) {
+        raw.body = part->body();
+        raw.haveBody = true;
     }
 }
 
-/// Header section and body section back into one RFC 5322 message.
+/// Header block and body back into one RFC 5322 message.
 ///
-/// RFC 9051 §7.5.2 says BODY[HEADER] ends with the blank line that closes the
-/// header, so the two normally concatenate untouched. The fallbacks are for
-/// servers that trim it: the separator is rebuilt in whatever line ending the
-/// header itself used, because guessing CRLF for an LF message would put a
-/// stray byte into the very octets this whole path exists to preserve.
+/// The head normally ends with the blank line that closes the header (the
+/// BODY[] split keeps it; RFC 9051 §7.5.2 says BODY[HEADER] does too), so the
+/// two concatenate untouched. The fallbacks are for a head that lost it: the
+/// separator is rebuilt in whatever line ending the header itself used,
+/// because guessing CRLF for an LF message would put a stray byte into the
+/// very octets this whole path exists to preserve.
 QByteArray joinRawWire(const QByteArray &head, const QByteArray &body)
 {
     if (head.isEmpty())
@@ -1330,7 +1372,7 @@ void ImapBackend::ensureBodyPool()
 }
 
 void ImapBackend::fetchBodies(const QString &folder, const QStringList &remoteIds,
-                              const OpCallback &done, bool interactive)
+                              const OpCallback &done, bool interactive, bool exactBody)
 {
     const KIMAP::ImapSet set = uidSet(remoteIds);
     if (set.isEmpty()) {
@@ -1355,14 +1397,14 @@ void ImapBackend::fetchBodies(const QString &folder, const QStringList &remoteId
         conn->busy = true;
         const auto release = [conn] { conn->busy = false; };
         if (conn->folder == folder) {
-            startBodyFetchJob(conn->session.data(), folder, set, done, release);
+            startBodyFetchJob(conn->session.data(), folder, set, done, release, exactBody);
             return;
         }
         auto *select = new KIMAP::SelectJob(conn->session);
         select->setMailBox(folder);
         select->setOpenReadOnly(true);
         connect(select, &KJob::result, this,
-                [this, conn, folder, set, done, release](KJob *job) {
+                [this, conn, folder, set, done, release, exactBody](KJob *job) {
                     if (job->error() || !conn->session) {
                         // Dropped ids come back round on a later pass.
                         release();
@@ -1371,7 +1413,8 @@ void ImapBackend::fetchBodies(const QString &folder, const QStringList &remoteId
                         return;
                     }
                     conn->folder = folder;
-                    startBodyFetchJob(conn->session.data(), folder, set, done, release);
+                    startBodyFetchJob(conn->session.data(), folder, set, done, release,
+                                      exactBody);
                 });
         select->start();
         return;
@@ -1381,11 +1424,12 @@ void ImapBackend::fetchBodies(const QString &folder, const QStringList &remoteId
     // background connection, when it is up and free.
     if (!m_bodyFallbackBusy && m_syncSession && m_syncReady) {
         m_bodyFallbackBusy = true;
-        withSyncSession(folder, [this, folder, set, done, interactive](KIMAP::Session *s) {
+        withSyncSession(folder, [this, folder, set, done, interactive,
+                                 exactBody](KIMAP::Session *s) {
             if (!s) {
                 m_bodyFallbackBusy = false;
                 if (interactive && m_session) {
-                    fetchBodiesOnMainSession(folder, set, done);
+                    fetchBodiesOnMainSession(folder, set, done, exactBody);
                     return;
                 }
                 if (done)
@@ -1393,7 +1437,8 @@ void ImapBackend::fetchBodies(const QString &folder, const QStringList &remoteId
                          tr("No connection available for %1.").arg(folder));
                 return;
             }
-            startBodyFetchJob(s, folder, set, done, [this] { m_bodyFallbackBusy = false; });
+            startBodyFetchJob(s, folder, set, done, [this] { m_bodyFallbackBusy = false; },
+                              exactBody);
         });
         return;
     }
@@ -1405,7 +1450,7 @@ void ImapBackend::fetchBodies(const QString &folder, const QStringList &remoteId
     // right next to it. The user's own connection is exactly the one a request
     // the user is waiting on may ride.
     if (interactive && m_session) {
-        fetchBodiesOnMainSession(folder, set, done);
+        fetchBodiesOnMainSession(folder, set, done, exactBody);
         return;
     }
     if (m_bodyFallbackBusy) {
@@ -1423,130 +1468,156 @@ void ImapBackend::fetchBodies(const QString &folder, const QStringList &remoteId
 /// connection are both unavailable, so nothing bulk is borrowing the user's
 /// connection here — this IS the user's request.
 void ImapBackend::fetchBodiesOnMainSession(const QString &folder, const KIMAP::ImapSet &set,
-                                           const OpCallback &done)
+                                           const OpCallback &done, bool exactBody)
 {
     qCDebug(logTrace, "bodies: pool and sync connection down - serving %s on the "
                       "interactive session", qUtf8Printable(folder));
     if (m_queuedFolder != folder)
         issueSelect(folder, false);
-    startBodyFetchJob(m_session.data(), folder, set, done, [] {});
+    startBodyFetchJob(m_session.data(), folder, set, done, [] {}, exactBody);
 }
 
 void ImapBackend::startBodyFetchJob(KIMAP::Session *session, const QString &folder,
                                     const KIMAP::ImapSet &set, const OpCallback &done,
-                                    const std::function<void()> &release)
+                                    const std::function<void()> &release, bool exactBody)
 {
-    // Two FETCHes per batch, not one. The halves have to be asked for
-    // separately because of how KIMAP hands each back:
-    //
-    //  - FullHeaders answers BODY.PEEK[HEADER] and is one of the three modes
-    //    whose end-of-response code assigns msg.message at all — Content mode
-    //    parses the same header into a message it then never delivers. This is
-    //    also where FLAGS and RFC822.SIZE ride along.
-    //  - Content with parts={TEXT} answers BODY.PEEK[TEXT] into the parts map
-    //    via setBody(), which is the one route through KIMAP that neither
-    //    KMime-parses nor re-encodes the payload (setContent() does both, and
-    //    is where KDE bug 523826 lives — see RawMessage above).
-    //
-    // Both jobs queue on the same session, so this is one extra round trip per
-    // batch, not per message.
-    auto *headers = new KIMAP::FetchJob(session);
-    headers->setSequenceSet(set);
-    headers->setUidBased(true);
-    KIMAP::FetchJob::FetchScope headScope;
-    headScope.mode = KIMAP::FetchJob::FetchScope::FullHeaders;
-    headers->setScope(headScope);
+    // One FETCH per batch, and a second only for the messages it could not
+    // settle. Full answers BODY.PEEK[] — the head of which is the wire octets,
+    // the body of which is KMime's re-assembly — with RFC822.SIZE riding
+    // along to say whether that re-assembly is the right length. The uids
+    // whose body is not trusted (size mismatch, or the caller asking for
+    // exact bytes because it already knows the hash failed) go into a
+    // BODY.PEEK[TEXT] fetch on the same session once the first job is done.
+    // See RawMessage for why neither fetch alone is enough.
+    auto *full = new KIMAP::FetchJob(session);
+    full->setSequenceSet(set);
+    full->setUidBased(true);
+    KIMAP::FetchJob::FetchScope fullScope;
+    fullScope.mode = KIMAP::FetchJob::FetchScope::Full;
+    full->setScope(fullScope);
 
-    auto *content = new KIMAP::FetchJob(session);
-    content->setSequenceSet(set);
-    content->setUidBased(true);
-    KIMAP::FetchJob::FetchScope textScope;
-    textScope.mode = KIMAP::FetchJob::FetchScope::Content;
-    textScope.parts = {QByteArrayLiteral("TEXT")};
-    content->setScope(textScope);
-
-    // Emit each body the moment its second half lands: memory stays flat
-    // (roughly one body at a time) however big the batch is, and the parse and
-    // indexing work downstream spreads across the socket events. `found`
-    // stashes half-arrived messages — the two jobs stream independently.
-    auto found = std::make_shared<QHash<qint64, RawMessage>>();
+    // Emit each body the moment it is whole: memory stays flat (roughly one
+    // body at a time) however big the batch is, and the parse and indexing
+    // work downstream spreads across the socket events. `pending` holds the
+    // heads whose body is still owed by the TEXT fetch.
+    auto pending = std::make_shared<QHash<qint64, RawMessage>>();
+    auto needText = std::make_shared<KIMAP::ImapSet>();
     auto sent = std::make_shared<QSet<qint64>>();
-    const auto onMessages =
-        [this, session, folder, found, sent](const QMap<qint64, KIMAP::Message> &messages) {
-            // Same wrong-mailbox hole as the header fetch: a body delivered
-            // with another mailbox selected is another message entirely, and
-            // caching it under this folder's uid is exactly the mis-filed
-            // body body_msgid_heal1 exists to clean up. Dropped instead; the
-            // backfill re-asks.
-            if (!sessionHasSelected(session, folder)) {
-                qCWarning(logTrace, "body fetch for %s answered with another "
-                                    "mailbox selected - batch dropped",
-                          qUtf8Printable(folder));
-                return;
-            }
-            for (const KIMAP::Message &m : messages) {
-                if (m.uid <= 0 || sent->contains(m.uid))
-                    continue;
-                RawMessage &raw = (*found)[m.uid];
-                mergeRawParts(m, raw);
-                if (raw.complete()) {
-                    sent->insert(m.uid);
-                    // take(), not remove-then-use: raw is a reference into the
-                    // hash and dies with the entry.
-                    const RawMessage whole = found->take(m.uid);
-                    Q_EMIT bodyFetched(folder, QString::number(m.uid),
-                                       buildMessage(whole));
+    // Same wrong-mailbox hole as the header fetch: a body delivered with
+    // another mailbox selected is another message entirely, and caching it
+    // under this folder's uid is exactly the mis-filed body body_msgid_heal1
+    // exists to clean up. Dropped instead; the backfill re-asks.
+    const auto wrongMailbox = [this, session, folder] {
+        if (sessionHasSelected(session, folder))
+            return false;
+        qCWarning(logTrace, "body fetch for %s answered with another "
+                            "mailbox selected - batch dropped",
+                  qUtf8Printable(folder));
+        return true;
+    };
+    connect(full, &KIMAP::FetchJob::messagesAvailable, this,
+            [this, folder, pending, needText, sent, exactBody,
+             wrongMailbox](const QMap<qint64, KIMAP::Message> &messages) {
+                if (wrongMailbox())
+                    return;
+                for (const KIMAP::Message &m : messages) {
+                    if (m.uid <= 0 || sent->contains(m.uid) || pending->contains(m.uid))
+                        continue;
+                    FullFetch got = splitFullFetch(m);
+                    if (!got.raw.haveHead)
+                        continue; // no literal in this response; a later one may carry it
+                    if (got.bodyTrusted && !exactBody) {
+                        sent->insert(m.uid);
+                        Q_EMIT bodyFetched(folder, QString::number(m.uid),
+                                           buildMessage(got.raw));
+                        continue;
+                    }
+                    if (got.raw.haveBody && !exactBody) {
+                        qCDebug(logTrace) << "bodies: uid" << m.uid << "in" << folder
+                                          << "re-assembles to"
+                                          << got.raw.head.size() + got.raw.body.size()
+                                          << "bytes, server says" << m.size
+                                          << "- fetching BODY[TEXT]";
+                    }
+                    got.raw.body.clear();
+                    got.raw.haveBody = false;
+                    pending->insert(m.uid, got.raw);
+                    needText->add(m.uid);
                 }
-            }
-        };
-    connect(headers, &KIMAP::FetchJob::messagesAvailable, this, onMessages);
-    connect(content, &KIMAP::FetchJob::messagesAvailable, this, onMessages);
+            });
 
-    // One shared completion: the batch is done when both jobs are, and a
-    // failure of either reports once and silences the survivor.
-    auto remaining = std::make_shared<int>(2);
-    auto failed = std::make_shared<bool>(false);
-    const QPointer<KIMAP::FetchJob> headersPtr(headers);
-    const QPointer<KIMAP::FetchJob> contentPtr(content);
-    const auto onResult = [this, found, folder, done, release, remaining, failed,
-                           headersPtr, contentPtr](KJob *job) {
-        if (job->error()) {
-            if (*failed)
-                return; // the other job already reported this batch
-            *failed = true;
-            if (headersPtr && headersPtr != job)
-                headersPtr->kill(KJob::Quietly);
-            if (contentPtr && contentPtr != job)
-                contentPtr->kill(KJob::Quietly);
-            release();
-            // Server pushback. On the concurrent-connection cap specifically,
-            // shed a pool connection too so a retry does not hit the same wall.
-            if (isTooManyConnections(job->errorString()))
-                shrinkBodyPool();
-            Q_EMIT throttled();
-            if (done)
-                done(Error::Throttled, job->errorString());
-            return;
-        }
-        if (--*remaining > 0 || *failed)
-            return;
-        // Leftovers with only one half (rare — the server answered one FETCH
-        // and not the other) are dropped, not emitted. Emitting a half-message
-        // put headerless bodies into the viewer, the cache and the spam scorer
-        // at once; saying nothing costs one backfill retry. uidsWithoutBody
-        // cannot tell "dropped" from "never fetched", so they come back round.
-        for (auto it = found->cbegin(); it != found->cend(); ++it)
+    const auto fail = [this, done, release](KJob *job) {
+        release();
+        // Server pushback. On the concurrent-connection cap specifically,
+        // shed a pool connection too so a retry does not hit the same wall.
+        if (isTooManyConnections(job->errorString()))
+            shrinkBodyPool();
+        Q_EMIT throttled();
+        if (done)
+            done(Error::Throttled, job->errorString());
+    };
+    const auto finish = [this, pending, folder, done, release] {
+        // Leftovers whose body never came (rare — the server answered one
+        // FETCH and not the other) are dropped, not emitted. Emitting a
+        // half-message put headerless bodies into the viewer, the cache and
+        // the spam scorer at once; saying nothing costs one backfill retry.
+        // uidsWithoutBody cannot tell "dropped" from "never fetched", so they
+        // come back round.
+        for (auto it = pending->cbegin(); it != pending->cend(); ++it)
             qWarning() << "mailove: uid" << it.key() << "in" << folder
-                       << "arrived" << (it.value().haveHead ? "head-only" : "body-only")
-                       << "- dropped for refetch";
+                       << "arrived head-only - dropped for refetch";
         release();
         if (done)
             done(Error::None, QString());
     };
-    connect(headers, &KJob::result, this, onResult);
-    connect(content, &KJob::result, this, onResult);
-    headers->start();
-    content->start();
+
+    connect(full, &KJob::result, this,
+            [this, session, folder, pending, needText, sent, wrongMailbox, fail,
+             finish](KJob *job) {
+                if (job->error()) {
+                    fail(job);
+                    return;
+                }
+                if (needText->isEmpty()) {
+                    finish();
+                    return;
+                }
+                auto *text = new KIMAP::FetchJob(session);
+                text->setSequenceSet(*needText);
+                text->setUidBased(true);
+                KIMAP::FetchJob::FetchScope textScope;
+                textScope.mode = KIMAP::FetchJob::FetchScope::Content;
+                textScope.parts = {QByteArrayLiteral("TEXT")};
+                text->setScope(textScope);
+                connect(text, &KIMAP::FetchJob::messagesAvailable, this,
+                        [this, folder, pending, sent,
+                         wrongMailbox](const QMap<qint64, KIMAP::Message> &messages) {
+                            if (wrongMailbox())
+                                return;
+                            for (const KIMAP::Message &m : messages) {
+                                const auto it = pending->find(m.uid);
+                                if (it == pending->end())
+                                    continue;
+                                mergeTextPart(m, *it);
+                                if (!it->complete())
+                                    continue;
+                                sent->insert(m.uid);
+                                // take(), not remove-then-use: the reference
+                                // dies with the entry.
+                                const RawMessage whole = pending->take(m.uid);
+                                Q_EMIT bodyFetched(folder, QString::number(m.uid),
+                                                   buildMessage(whole));
+                            }
+                        });
+                connect(text, &KJob::result, this, [fail, finish](KJob *job) {
+                    if (job->error())
+                        fail(job);
+                    else
+                        finish();
+                });
+                text->start();
+            });
+    full->start();
 }
 
 void ImapBackend::folderUnreadCounts(
@@ -1558,17 +1629,28 @@ void ImapBackend::folderUnreadCounts(
             done(m_session ? Error::None : Error::Connection, {}, QString());
         return;
     }
+    // The background connection, when it is up. STATUS needs no mailbox
+    // selected, so any connection can answer it — and this is one command per
+    // folder, serialized by KIMAP behind whatever is already queued on that
+    // connection. On the interactive session a Gmail account with dozens of
+    // labels put the user's next click, and the refresh of the folder they
+    // are reading, behind the whole sweep. The interactive session is the
+    // fallback only, and only while the sweep has nowhere else to run.
+    QPointer<KIMAP::Session> session =
+        (m_syncSession && m_syncReady) ? m_syncSession : m_session;
     auto pending = std::make_shared<QStringList>(folders);
     auto counts = std::make_shared<QHash<QString, int>>();
     auto step = std::make_shared<std::function<void()>>();
-    *step = [this, pending, counts, step, done] {
-        if (pending->isEmpty() || !m_session) {
+    *step = [this, pending, counts, step, done, session] {
+        // A connection that dropped mid-sweep ends it with what it has: the
+        // counts so far are real, and the next tick asks again.
+        if (pending->isEmpty() || !session) {
             if (done)
                 done(Error::None, *counts, QString());
             return;
         }
         const QString folder = pending->takeFirst();
-        auto *status = new KIMAP::StatusJob(m_session);
+        auto *status = new KIMAP::StatusJob(session.data());
         status->setMailBox(folder);
         // UNSEEN only, and STATUS rather than SELECT: this must not disturb the
         // mailbox state of a client idling on the same account elsewhere.

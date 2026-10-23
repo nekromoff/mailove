@@ -11,6 +11,9 @@
 #include <QFileInfo>
 #include <QStandardPaths>
 #include <QIcon>
+#include <QCryptographicHash>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QTimer>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -19,6 +22,7 @@
 #include <qt6keychain/keychain.h>
 
 #include "advancedconfig.h"
+#include "demomode.h"
 #include "avatarprovider.h"
 #include "diagnosticslog.h"
 #include "settingsbackup.h"
@@ -194,6 +198,106 @@ void startStallSampler(QCoreApplication *app)
     Q_UNUSED(app);
 #endif
 }
+
+/// mailto: links on the command line — what a desktop passes through the
+/// entry's "Exec=mailove %U" when the user clicks one in another app.
+QStringList mailtoArguments()
+{
+    QStringList links;
+    const QStringList args = QCoreApplication::arguments();
+    for (int i = 1; i < args.size(); ++i) {
+        if (args.at(i).startsWith(QLatin1String("mailto:"), Qt::CaseInsensitive))
+            links.append(args.at(i));
+    }
+    return links;
+}
+
+/// Where a running mailove listens for links from later launches. Per user
+/// (the runtime dir) and per configuration: a run with its own
+/// XDG_CONFIG_HOME is a different client with different accounts, and must
+/// neither take a running one's links nor hand its own to it.
+QString instanceSocketPath()
+{
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+    if (dir.isEmpty())
+        dir = QDir::tempPath();
+    const QByteArray config =
+        QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation).toUtf8();
+    const QString tag = QString::fromLatin1(
+        QCryptographicHash::hash(config, QCryptographicHash::Sha256).toHex().left(12));
+    return dir + QStringLiteral("/mailove-") + tag + QStringLiteral(".sock");
+}
+
+/// Hands \a links to a mailove already running under this configuration.
+/// True when one took them, and this process has nothing left to do. One
+/// line per item: "token <xdg-activation token>" first when there is one,
+/// so the running window may raise itself on Wayland, then "url <link>".
+bool forwardToRunningInstance(const QStringList &links)
+{
+    QLocalSocket socket;
+    socket.connectToServer(instanceSocketPath());
+    if (!socket.waitForConnected(1000))
+        return false;
+    QByteArray payload;
+    const QByteArray token = qgetenv("XDG_ACTIVATION_TOKEN");
+    if (!token.isEmpty())
+        payload += "token " + token + '\n';
+    for (const QString &link : links)
+        payload += "url " + link.toUtf8() + '\n';
+    socket.write(payload);
+    if (!socket.waitForBytesWritten(1000))
+        return false;
+    socket.disconnectFromServer();
+    if (socket.state() != QLocalSocket::UnconnectedState)
+        socket.waitForDisconnected(1000);
+    return true;
+}
+
+/// Listens for forwardToRunningInstance() from later launches and queues
+/// what they send on \a client. A socket left behind by a crashed run is
+/// cleared first — nothing answered on it, or this process would not be here.
+void listenForOtherInstances(MailClient *client)
+{
+    auto *server = new QLocalServer(qApp);
+    server->setSocketOptions(QLocalServer::UserAccessOption);
+    const QString path = instanceSocketPath();
+    if (!server->listen(path)) {
+        QLocalServer::removeServer(path);
+        if (!server->listen(path)) {
+            qWarning("mailto forwarding unavailable: %s", qPrintable(server->errorString()));
+            delete server;
+            return;
+        }
+    }
+    QObject::connect(server, &QLocalServer::newConnection, server, [server, client] {
+        while (QLocalSocket *peer = server->nextPendingConnection()) {
+            auto *buffer = new QByteArray;
+            QObject::connect(peer, &QLocalSocket::readyRead, peer, [peer, buffer] {
+                buffer->append(peer->readAll());
+                if (buffer->size() > 64 * 1024)
+                    peer->abort();
+            });
+            QObject::connect(peer, &QLocalSocket::disconnected, peer, [peer, buffer, client] {
+                buffer->append(peer->readAll());
+                QStringList links;
+                for (const QByteArray &line : buffer->split('\n')) {
+                    if (line.startsWith("token ")) {
+                        // Read by the Wayland platform plugin on the next
+                        // requestActivate(), which QML makes when it raises
+                        // the window for these links.
+                        qputenv("XDG_ACTIVATION_TOKEN", line.mid(6));
+                    } else if (line.startsWith("url ")) {
+                        links.append(QString::fromUtf8(line.mid(4)));
+                    }
+                }
+                delete buffer;
+                peer->deleteLater();
+                qCDebug(logTrace, "mailto: %lld link(s) from another launch", qint64(links.size()));
+                client->queueExternalMailto(links);
+            });
+        }
+    });
+}
 } // namespace
 
 int main(int argc, char *argv[])
@@ -286,6 +390,16 @@ int main(int argc, char *argv[])
     }
     if (!desktopId.isEmpty())
         QGuiApplication::setDesktopFileName(desktopId);
+
+    // A mailto: link clicked in another app while mailove is already open:
+    // the running client gets it and opens its composer, rather than a
+    // second client starting against the same cache. Only for launches that
+    // carry a link — a plain second launch behaves as it always has.
+    const QStringList externalMailto = mailtoArguments();
+    if (!externalMailto.isEmpty() && forwardToRunningInstance(externalMailto)) {
+        DiagnosticsLog::instance().stop();
+        return 0;
+    }
 
     // Where the spare copy of the settings is taken from at exit. Nothing is
     // read from the backup here or anywhere else — see settingsbackup.h.
@@ -389,6 +503,10 @@ int main(int argc, char *argv[])
 
     MailClient client;
     qCDebug(logTrace, "boot: MailClient %lld ms", boot.restart());
+    // Links from this launch's command line wait in the client until the
+    // window takes them; later launches' links arrive through the socket.
+    client.queueExternalMailto(externalMailto);
+    listenForOtherInstances(&client);
     client.setViewerHandler(viewerHandler);
 
     // Constructed before the QML engine so PgpEngine::instance() is already
@@ -407,6 +525,7 @@ int main(int argc, char *argv[])
     // the values it edits are read from every corner of the client, and there
     // is exactly one file behind them.
     qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "Advanced", &AdvancedConfig::instance());
+    qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "Demo", &DemoMode::instance());
     qmlRegisterSingletonInstance("Mailove.Core", 1, 0, "UiSettings", &UiSettings::instance());
     // Whether a newer release exists. Its own singleton rather than three more
     // properties on Mail: nothing about it touches mail, and it answers long

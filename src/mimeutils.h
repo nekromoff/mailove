@@ -106,6 +106,19 @@ void collectBodies(KMime::Content *node, QString *text, QString *html);
 /// reader is being invited to click.
 void collectAttachments(KMime::Content *node, QStringList *names);
 
+/// The subject a reply carries: exactly one "Re: " in front of the original's
+/// text. Every leading reply marker is cut first — "Re: re: RE:", "Re[2]:",
+/// "Re :", and the localized ones other clients write ("AW:", "SV:", "Odp:",
+/// "回复：", …) — so a thread that bounced between clients stops growing a
+/// prefix per hop. Markers after something else ("Fwd: Re:") are part of the
+/// text.
+QString replySubject(const QString &subject);
+
+/// The forward's counterpart: exactly one "Fwd: ", every leading forward
+/// marker cut first — "Fwd: FW: fwd:", and the localized "WG:", "TR:", "RV:",
+/// "VB:", "转发：", … A reply marker behind them ("Fwd: Re:") stays.
+QString forwardSubject(const QString &subject);
+
 // --- calendar invitations ----------------------------------------------------
 
 /// True for a part carrying an iCalendar object: text/calendar,

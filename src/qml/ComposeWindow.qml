@@ -83,6 +83,7 @@ Window {
     function openDraft(d) { sheet.openDraft(d) }
     function openReply(r) { sheet.openReply(r) }
     function openForward(r) { sheet.openForward(r) }
+    function openMailto(l) { sheet.openMailto(l) }
 
     ComposeSheet {
         id: sheet

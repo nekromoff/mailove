@@ -806,7 +806,7 @@ int JmapBackend::freeBodySlots() const
 }
 
 void JmapBackend::fetchBodies(const QString &folder, const QStringList &remoteIds,
-                              const OpCallback &done, bool)
+                              const OpCallback &done, bool, bool)
 {
     if (remoteIds.isEmpty()) {
         report(done, Error::None, QString());

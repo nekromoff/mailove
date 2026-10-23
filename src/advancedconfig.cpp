@@ -65,6 +65,10 @@ const GroupDoc kGroups[] = {
      "remote pictures fetched once you allow them."},
     {"db", "Database",
      "How the local cache database behaves when something else is writing to it."},
+    {"demo", "Demo mode",
+     "For screenshots: every account, folder, sender, subject, date and message body on "
+     "screen is shown as made-up words instead. Display only — what is stored, synced "
+     "and sent is never touched, and turning it off shows the real mail again."},
     {"dkim", "DKIM / DNS",
      "How long the DNS records used to verify a DKIM signature are remembered, "
      "including the lookups that found nothing."},
@@ -168,6 +172,16 @@ const AdvancedConfig::Knob kSchema[] = {
      "How long a query waits for another writer before failing."},
     {"db/rebuildBusyTimeoutMs", Type::Int, 30000, 1000, 600000, Reload::Restart,
      "The same, on the index-rebuild connection, which waits behind the GUI."},
+
+    // --- demo ----------------------------------------------------------------
+    // Read at the point of painting, so a save switches what is on screen
+    // without a restart; an already open message changes when it is reopened.
+    {"demo/enabled", Type::Bool, false, {}, {}, Reload::Live,
+     "Replace every real name, address, subject, date and body text on screen with "
+     "fake English words. Display only: nothing stored or sent changes."},
+    {"demo/seed", Type::Int, 0, 0, 2147483647, Reload::Live,
+     "Picks the fake words. 0 draws a new mapping at every launch; any other number "
+     "gives the same fake text every time, for screenshots that must match."},
 
     // --- dkim ----------------------------------------------------------------
     {"dkim/dnsCacheMinTtl", Type::Int, 1800, 0, 86400, Reload::Live,

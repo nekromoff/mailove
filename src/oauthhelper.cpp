@@ -61,7 +61,8 @@ static QString randomString(int length)
 }
 
 void OAuthHelper::authorize(Provider provider, const QString &clientId,
-                            const QString &clientSecret)
+                            const QString &clientSecret, const QString &loginHint,
+                            bool openBrowser)
 {
     if (clientId.isEmpty()) {
         Q_EMIT failed(tr("No OAuth client ID configured for this account."));
@@ -99,7 +100,14 @@ void OAuthHelper::authorize(Provider provider, const QString &clientId,
     q.addQueryItem(QStringLiteral("state"), m_state);
     q.addQueryItem(QStringLiteral("access_type"), QStringLiteral("offline")); // Google
     q.addQueryItem(QStringLiteral("prompt"), QStringLiteral("consent"));      // force refresh token
+    // Both providers honour it. Without it whichever account the browser is
+    // signed in to gets authorized, and the token then fails on this
+    // account's IMAP login as a mystery.
+    if (!loginHint.isEmpty())
+        q.addQueryItem(QStringLiteral("login_hint"), loginHint);
     url.setQuery(q);
+    m_authUrl = url;
+    Q_EMIT authorizationUrlChanged();
 
     connect(m_server, &QTcpServer::newConnection, this,
             [this, provider, clientId, clientSecret, redirect] {
@@ -190,12 +198,17 @@ void OAuthHelper::authorize(Provider provider, const QString &clientId,
         Q_EMIT failed(tr("Browser sign-in timed out."));
     });
 
-    QDesktopServices::openUrl(url);
+    if (openBrowser)
+        QDesktopServices::openUrl(url);
 }
 
 void OAuthHelper::endRedirectListener()
 {
     m_state.clear();
+    if (!m_authUrl.isEmpty()) {
+        m_authUrl.clear();
+        Q_EMIT authorizationUrlChanged();
+    }
     if (m_server) {
         m_server->close();
         m_server->deleteLater();

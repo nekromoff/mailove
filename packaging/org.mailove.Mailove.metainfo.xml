@@ -33,6 +33,25 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.8.0" date="2026-10-23" type="stable">
+      <description>
+        <ul>
+          <li>DKIM signatures with simple header canonicalization no longer
+              fail on messages held by Gmail: the header block is taken from
+              the full message rather than Gmail's re-folded header section.
+          </li>
+          <li>Refreshing the open folder on a Gmail account with many labels
+              no longer waits behind the unread-count sweep.</li>
+          <li>Demo mode paints fake names, addresses and text for screenshots
+              and screen sharing.</li>
+          <li>mailto: links from other apps open the composer in the running
+              mailove.</li>
+          <li>OAuth sign-in preselects the account's address, and the sign-in
+              link can be copied for another browser or profile.</li>
+          <li>Replies and forwards carry exactly one "Re: " or "Fwd: ".</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.7.2" date="2026-10-14" type="stable">
       <description>
         <ul>

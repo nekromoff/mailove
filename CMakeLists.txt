@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailove VERSION 3.7.2 LANGUAGES CXX)
+project(mailove VERSION 3.8.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -53,6 +53,9 @@ qt_add_executable(mailove
     src/main.cpp
     src/advancedconfig.cpp
     src/advancedconfig.h
+    src/demomode.cpp
+    src/demomode.h
+    src/saslnoise.cpp
     src/diagnosticslog.cpp
     src/diagnosticslog.h
     src/settingsbackup.cpp
@@ -195,6 +198,13 @@ target_link_libraries(mailove PRIVATE
     PkgConfig::ZSTD
     PkgConfig::LIBCRYPTO
 )
+
+# src/saslnoise.cpp's __fprintf_chk only replaces the XOAUTH2 plugin's if the
+# plugin, dlopen'd long after startup, can see it — which takes it being in the
+# executable's dynamic symbol table, where nothing else would put it.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(mailove PRIVATE "LINKER:--export-dynamic-symbol=__fprintf_chk")
+endif()
 
 if(MAILOVE_HAVE_OPENPGP)
     target_link_libraries(mailove PRIVATE Gpgmepp QGpgmeQt6)
@@ -653,6 +663,14 @@ target_include_directories(mimeutilstest PRIVATE src)
 target_link_libraries(mimeutilstest PRIVATE
     Qt6::Core Qt6::Gui Qt6::Network Qt6::Sql KPim6::Mime PkgConfig::ZSTD)
 set_target_properties(mimeutilstest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)
+
+# Demo mode's scrambler: words replaced consistently, markup left alone.
+qt_add_executable(demomodetest tests/demomodetest.cpp
+    src/demomode.cpp src/demomode.h
+    src/advancedconfig.cpp src/advancedconfig.h)
+target_include_directories(demomodetest PRIVATE src)
+target_link_libraries(demomodetest PRIVATE Qt6::Core)
+set_target_properties(demomodetest PROPERTIES RUNTIME_OUTPUT_DIRECTORY tests)
 
 # The advanced-settings file: parsing, clamping and the verbatim round trip.
 # Writes into a throwaway XDG_CONFIG_HOME, so it never touches a real config.

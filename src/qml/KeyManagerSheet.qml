@@ -323,7 +323,7 @@ Window {
 
                                 QQC2.Label {
                                     Layout.fillWidth: true
-                                    text: keyDelegate.uid
+                                    text: Demo.on ? Demo.text(keyDelegate.uid) : keyDelegate.uid
                                     elide: Text.ElideRight
                                     font.bold: keyDelegate.secret
                                 }
@@ -339,7 +339,8 @@ Window {
                             }
                             QQC2.Label {
                                 Layout.fillWidth: true
-                                text: keyManager.groupFingerprint(keyDelegate.fingerprint)
+                                text: keyManager.groupFingerprint(Demo.on ? Demo.fingerprint(keyDelegate.fingerprint)
+                                                                         : keyDelegate.fingerprint)
                                 elide: Text.ElideRight
                                 opacity: 0.8
                                 font.family: "monospace"
@@ -464,7 +465,7 @@ Window {
 
         QQC2.Label {
             padding: Kirigami.Units.smallSpacing
-            text: trustMenu.uid
+            text: Demo.on ? Demo.text(trustMenu.uid) : trustMenu.uid
             elide: Text.ElideRight
             width: Math.min(implicitWidth, Kirigami.Units.gridUnit * 24)
             opacity: 0.8
@@ -544,7 +545,7 @@ Window {
         }
         onAccepted: Pgp.deletePublicKey(fingerprint)
         contentItem: QQC2.Label {
-            text: "Delete " + confirmDeleteDialog.uid + " from your keyring?\n\n"
+            text: "Delete " + (Demo.on ? Demo.text(confirmDeleteDialog.uid) : confirmDeleteDialog.uid) + " from your keyring?\n\n"
                   + "Messages already signed with it can no longer be verified. "
                   + "The key can be imported again if you still have it."
             wrapMode: Text.Wrap

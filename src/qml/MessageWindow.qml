@@ -33,7 +33,7 @@ Item {
 
     /// Tab page contract (see Main.qml).
     property string title: context && context.subject.length > 0
-                           ? context.subject : "Message"
+                           ? (Demo.on ? Demo.text(context.subject) : context.subject) : "Message"
     signal presentRequested()
     signal closeRequested()
     function present() { presentRequested() }

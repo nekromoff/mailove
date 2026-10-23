@@ -103,7 +103,7 @@ ColumnLayout {
             if (context.signerTrusted) {
                 const who = context.signerName.length > 0 ? context.signerName
                                                           : context.signerEmail
-                return "✓ Signed by " + who
+                return "✓ Signed by " + viewer.shown(who)
             }
             return "⚠ Signed by another address"
         case "modified":
@@ -160,6 +160,12 @@ ColumnLayout {
                 return found[addr]
         }
         return ""
+    }
+
+    /// \a s as painted: demo mode's fake words, or \a s itself. Display only —
+    /// lookups and actions keep reading the context's real values.
+    function shown(s) {
+        return Demo.on ? Demo.text(s) : s
     }
 
     /// The bare address of the sender, for a key lookup. The From header is
@@ -479,7 +485,9 @@ ColumnLayout {
             Image {
                 id: senderAvatar
                 readonly property int px: Mail.avatarSize()
-                source: viewer.context ? Mail.avatarSource(viewer.context.from) : ""
+                // None in demo mode: a real face would name the sender the fake
+                // words are hiding.
+                source: viewer.context && !Demo.on ? Mail.avatarSource(viewer.context.from) : ""
                 visible: status === Image.Ready
                 Layout.preferredWidth: visible ? px : 0
                 Layout.preferredHeight: visible ? px : 0
@@ -493,7 +501,7 @@ ColumnLayout {
             }
             SelectableValue {
                 id: fromLabel
-                text: viewer.context ? viewer.context.from : ""
+                text: viewer.context ? viewer.shown(viewer.context.from) : ""
             }
             // Explicit arrow glyphs — theme icons for reply/forward are not
             // reliably recognizable as arrows.
@@ -573,7 +581,7 @@ ColumnLayout {
             // Lines the caret up under the date: the From row and this one are
             // the same grid column, so the date's x is the same offset here.
             caretX: dateLabel.x
-            text: viewer.context ? viewer.context.to : ""
+            text: viewer.context ? viewer.shown(viewer.context.to) : ""
         }
 
         QQC2.Label {
@@ -586,7 +594,7 @@ ColumnLayout {
             id: ccLabel
             caretX: dateLabel.x
             visible: text.length > 0
-            text: viewer.context ? viewer.context.cc : ""
+            text: viewer.context ? viewer.shown(viewer.context.cc) : ""
         }
 
         QQC2.Label { text: "Subject:"; opacity: 0.8 }
@@ -598,7 +606,7 @@ ColumnLayout {
                 id: subjectLabel
                 font.bold: true
                 text: viewer.context
-                      ? (viewer.context.subject.length > 0 ? viewer.context.subject
+                      ? (viewer.context.subject.length > 0 ? viewer.shown(viewer.context.subject)
                                                            : (viewer.hasMessage ? "(no subject)" : ""))
                       : ""
             }
@@ -731,7 +739,8 @@ ColumnLayout {
                     text: {
                         if (!viewer.context)
                             return ""
-                        const detail = viewer.context.cryptoDetail
+                        const detail = Demo.on ? Demo.identifiers(viewer.context.cryptoDetail)
+                                               : viewer.context.cryptoDetail
                         return viewer.inspectableKey() === ""
                             ? detail
                             : detail + "\n\nClick to inspect the key."
@@ -1149,7 +1158,7 @@ ColumnLayout {
                         required property var modelData
                         required property int index
                         icon.name: "mail-attachment"
-                        text: modelData.name + " (" + modelData.sizeText + ")"
+                        text: viewer.shown(modelData.name) + " (" + modelData.sizeText + ")"
                         onClicked: { // left click = open (risky types need confirmation)
                             if (viewer.context.attachmentRisky(index)) {
                                 confirmOpenDialog.attachmentIndex = index

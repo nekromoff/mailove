@@ -341,6 +341,48 @@ void collectBodies(KMime::Content *node, QString *text, QString *html)
         *text = node->decodedText();
 }
 
+/// \a prefix in front of \a subject once \a leading — a run of markers — is
+/// cut from its start.
+static QString withSinglePrefix(const QString &subject, const QRegularExpression &leading,
+                                const QString &prefix)
+{
+    QString rest = subject;
+    rest.remove(leading);
+    return prefix + rest;
+}
+
+/// A leading run of \a words, each a whole word with an optional "[2]" or "(2)"
+/// count and a colon (full-width too), as one anchored pattern.
+static QString markerRun(const QString &words)
+{
+    return QStringLiteral(R"(^(?:\s*(?:%1)\s*(?:\[\d+\]|\(\d+\))?\s*[:：])+\s*)").arg(words);
+}
+
+QString replySubject(const QString &subject)
+{
+    // The reply prefixes Outlook, Thunderbird and Apple Mail write in their
+    // localizations. Only whole words followed by a colon match, so a subject
+    // that merely starts with one ("Svetlo: …", "Rebate: …") is left alone.
+    // Single letters (Italian "R:") and "Ref:" are left out: too easily real
+    // text.
+    static const QRegularExpression leading(
+        markerRun(QStringLiteral("re|aw|antw|antwort|sv|vs|odp|odg|ynt|vá|atb|ats|"
+                                 "res|rif|απ|σχετ|отв|ответ|השב|رد|回复|回覆|答复|返信|회신|답장")),
+        QRegularExpression::CaseInsensitiveOption);
+    return withSinglePrefix(subject, leading, QStringLiteral("Re: "));
+}
+
+QString forwardSubject(const QString &subject)
+{
+    // Same idea for forwards. "VS" is left to the reply list (Finnish reply,
+    // Norwegian forward) and Italian "I:" is a single letter.
+    static const QRegularExpression leading(
+        markerRun(QStringLiteral("fwd|fw|wg|tr|rv|enc|doorst|vb|vl|pd|pfw|"
+                                 "πρθ|пересл|הועבר|转发|轉寄|轉發|転送|전달")),
+        QRegularExpression::CaseInsensitiveOption);
+    return withSinglePrefix(subject, leading, QStringLiteral("Fwd: "));
+}
+
 void collectAttachments(KMime::Content *node, QStringList *names)
 {
     if (!node)

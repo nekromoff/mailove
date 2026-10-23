@@ -1,3 +1,36 @@
+mailove (3.8.0) unstable; urgency=medium
+
+  * DKIM: a signature with simple header canonicalization (no c= tag,
+    e.g. purelymail) was reported invalid on every message held by
+    Gmail. Gmail re-folds header lines in its BODY[HEADER] answers,
+    which the body fetch had used since 3.0. The message is now fetched
+    whole, the header block taken from that, and the re-assembled body
+    trusted only when it is the size the server reports; otherwise the
+    TEXT section is fetched for it. A failure judged on cached bytes
+    refetches the message once before the badge says invalid.
+  * IMAP: the unread-count sweep over the account's folders ran on the
+    interactive connection, so on a Gmail account with many labels a
+    folder click or a refresh of the open folder waited behind it. It
+    runs on the background connection now, open folder and INBOX first.
+  * Demo mode: names, addresses, subjects and text are painted as fake
+    words for screenshots and screen sharing; nothing saves while it is
+    on.
+  * mailto: links from other apps open the composer in the running
+    mailove instead of starting a second one; links that arrive before
+    the window or the first account exist are kept until then.
+  * OAuth: the sign-in preselects the account's address, and the sign-in
+    link can be copied for a browser or profile signed in to a different
+    Google or Microsoft account.
+  * Replies and forwards carry exactly one "Re: " or "Fwd: ", with the
+    localized markers other clients write ("AW:", "SV:", "Odp:", "WG:",
+    "TR:", ...) cut first.
+  * The signature editor saves after a pause in typing, not only on
+    focus loss.
+  * The XOAUTH2 SASL plugin's "[SASL-XOAUTH2]" lines no longer reach
+    stderr on every login.
+
+ -- dusoft <dusoft@staznosti.sk>  Fri, 23 Oct 2026 17:00:00 +0200
+
 mailove (3.7.2) unstable; urgency=medium
 
   * A message opened right after switching accounts stays read. The top

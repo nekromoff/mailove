@@ -185,6 +185,9 @@ public:
     /// Date pattern (Qt format string) used for non-today rows; today's rows
     /// always show only the time.
     void setDateFormat(const QString &format);
+    /// Seconds every shown date is moved by — demo mode's fake dates. Display
+    /// only: sorting and everything else keep reading the real date.
+    void setDateShift(qint64 secs);
 
     void setHeaders(QList<Header> headers);
     /// Returns the number of rows actually inserted (uid duplicates skipped).
@@ -295,6 +298,7 @@ private:
     bool matchesFilter(const Header &h) const;
 
     QString m_dateFormat = QStringLiteral("yyyy-MM-dd");
+    qint64 m_dateShift = 0;
     /// Everything fetched for the folder, in arrival order. Rows are only ever
     /// appended here, so the indices held in m_rows and m_byUid stay valid;
     /// removeByUids() is the one exception and rebuilds both.
