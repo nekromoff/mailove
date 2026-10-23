@@ -41,13 +41,15 @@ Security-minded KDE-first IMAP and JMAP mail client, blazing fast.
 - **Imported mail** - point it at a folder of mbox files and it imports as an offline account (Thunderbird, Evolution, KMail etc.). Subfolders become folder hierarchy, and Thunderbird's .sbd naming is understood. Add servers later to promote it to a live account.
 
 ## Screenshots
-<img width="1920" height="1034" alt="1" src="https://github.com/user-attachments/assets/37cb8a95-5e58-4fdf-bbe4-1db994fc3848" />
-<img width="1132" height="818" alt="compose" src="https://github.com/user-attachments/assets/128b1bf7-6eab-4ecd-9b98-afd7d1ec78ab" />
-<img width="1920" height="1038" alt="02-settings-accounts" src="https://github.com/user-attachments/assets/108c1e8c-dc90-406f-8719-4fb24efef692" />
-<img width="1920" height="1038" alt="03-settings-general" src="https://github.com/user-attachments/assets/594e49de-5bf6-43cb-8868-2c11bc185974" />
-<img width="1920" height="1038" alt="04-settings-look" src="https://github.com/user-attachments/assets/cfa9486b-bdb6-41e1-8db1-28fcaffc104e" />
-<img width="1920" height="1038" alt="05-settings-shortcuts" src="https://github.com/user-attachments/assets/a01aa48d-3a70-40ea-ac71-47e5afd9e115" />
-<img width="1920" height="1038" alt="06-settings-about" src="https://github.com/user-attachments/assets/14543538-9c8d-4f1b-8b94-5bb9c9296783" />
+<img width="1920" height="1031" alt="image" src="https://github.com/user-attachments/assets/80519f81-1efb-4531-9a13-01a3fd873294" />
+<img width="1050" height="747" alt="image" src="https://github.com/user-attachments/assets/4449da6f-183c-4a4d-a9ab-57ed4983a215" />
+<img width="1915" height="1033" alt="image" src="https://github.com/user-attachments/assets/e32a511a-25c8-4731-ab15-5cf6dfaaa366" />
+<img width="1915" height="1033" alt="image" src="https://github.com/user-attachments/assets/e430745d-6119-4a77-bb97-5bfe719a1f79" />
+<img width="1920" height="1031" alt="image" src="https://github.com/user-attachments/assets/ab957822-6551-4bf4-ad98-372ef5f35434" />
+<img width="1920" height="1031" alt="image" src="https://github.com/user-attachments/assets/00397a2d-8f02-4cbb-9bd6-bd394287ffac" />
+<img width="1920" height="1031" alt="image" src="https://github.com/user-attachments/assets/c7e4a598-ee2a-4d28-ba63-6ede11d660e5" />
+<img width="1920" height="1031" alt="image" src="https://github.com/user-attachments/assets/8ebd90b8-b2e8-4024-9c0e-f59bcec570b8" />
+
 
 ### Various states of email sender verification
 
