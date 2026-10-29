@@ -10,7 +10,6 @@
 #include <QDateTime>
 #include <QLoggingCategory>
 #include <QHash>
-#include <QThread>
 #include <QTimer>
 
 #include <kmime/content.h>
@@ -222,65 +221,56 @@ QString explainLoginFailure(const QString &serverReply)
 /// gain here.
 enum Security { SslTls = 0, StartTls = 1, None = 2 };
 
-/// Where retired sessions are destroyed. One thread for the whole process,
-/// never stopped: it only ever holds sessions on their way out.
-QThread *sessionReaper()
-{
-    static QThread *reaper = [] {
-        auto *t = new QThread;
-        t->setObjectName(QStringLiteral("imap-reaper"));
-        t->start();
-        return t;
-    }();
-    return reaper;
-}
-
-/// True once a session has been handed to the reaper. A QPointer to it stays
-/// non-null until the reaper gets round to it, so code holding one checks this
+/// Set on a session once retireSession() has had it. A QPointer to it stays
+/// non-null until it is finally deleted, so code holding one checks this
 /// before queueing more work there.
+constexpr char kRetiredProperty[] = "mailoveRetired";
+
+/// How long a retired session is kept before it is deleted: past the 30 s
+/// KIMAP's parser can sit in waitForReadyRead() on a stalled response.
+constexpr int kRetiredSessionGraceMs = 35 * 1000;
+
 bool isRetired(const KIMAP::Session *session)
 {
-    return session && session->thread() == sessionReaper();
+    return session && session->property(kRetiredProperty).toBool();
 }
 
 /// deleteLater() for a KIMAP::Session, minus the GUI freeze. ~Session waits up
 /// to 10 s for its socket thread, then terminates it — and that thread is
 /// regularly stuck: KIMAP's parser blocks in waitForReadyRead(30000) whenever a
 /// response stops mid-literal, which is exactly the dead connection we are
-/// throwing away. Deleted on the GUI thread that was a ~13 s stall.
+/// throwing away. Deleted at once on the GUI thread, that was a ~13 s stall.
 ///
-/// So the session is finished off here the way ~Session would (its jobs fail
-/// with "connection lost", on this thread, as their result handlers expect),
-/// cut loose from every receiver, and destroyed on the reaper, which can afford
-/// to wait. Its own connectionLost/Failed are not re-sent: whoever retires a
-/// session has already stopped treating it as live. Deferred a turn like
-/// deleteLater, since callers retire a session from inside its own signals.
+/// So the session is finished off now the way ~Session would (its jobs fail
+/// with "connection lost", as their result handlers expect), its socket close
+/// is queued, and the object itself is deleted only once that blocking read
+/// has had time to give up, when ~Session's wait returns immediately. Its own
+/// connectionLost/Failed are not re-sent: whoever retires a session has
+/// already stopped treating it as live. Deferred a turn like deleteLater, since
+/// callers retire a session from inside its own signals.
+///
+/// Not destroyed on another thread instead: KIMAP keeps QTimers as plain
+/// members (SessionPrivate::socketTimer, IdleJob's stats timer), which
+/// moveToThread() leaves registered here — deleting them over there crashed
+/// the GUI thread when the stale timer fired.
 void retireSession(KIMAP::Session *session)
 {
     if (!session || isRetired(session))
         return;
+    session->setProperty(kRetiredProperty, true);
     QTimer::singleShot(0, session, [session] {
-        if (isRetired(session)) // retired twice in one turn; the first won
-            return;
         QObject *priv = nullptr;
         for (QObject *child : session->children()) {
             if (qstrcmp(child->metaObject()->className(), "KIMAP::SessionPrivate") == 0)
                 priv = child;
         }
-        if (!priv) { // a KIMAP we don't know the insides of: block, as before
-            session->deleteLater();
-            return;
-        }
-        // Stops the idle timer for good: it lives on this thread, and a
-        // restart from the reaper would only warn.
+        // The idle timer would only report a timeout nobody is listening for.
         session->setTimeout(-1);
         session->disconnect();
-        QMetaObject::invokeMethod(priv, "socketDisconnected", Qt::DirectConnection);
-        for (auto *job : session->findChildren<KJob *>(Qt::FindDirectChildrenOnly))
-            job->disconnect();
-        session->setParent(nullptr);
-        session->moveToThread(sessionReaper());
-        session->deleteLater();
+        if (priv)
+            QMetaObject::invokeMethod(priv, "socketDisconnected", Qt::DirectConnection);
+        session->close();
+        QTimer::singleShot(kRetiredSessionGraceMs, session, &QObject::deleteLater);
     });
 }
 }

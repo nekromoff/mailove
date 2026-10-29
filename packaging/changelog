@@ -2,8 +2,9 @@ mailove (3.8.1) unstable; urgency=medium
 
   * The GUI could freeze for 10+ seconds when a dead IMAP connection was
     dropped: KIMAP waits for the connection's socket thread, which hangs
-    when a server stops partway through a response. Dropped connections
-    are now closed on a background thread.
+    when a server stops partway through a response. A dropped connection
+    now fails its pending work at once and is deleted only after that
+    read has timed out, when deleting it no longer waits.
   * Search: the local index answers first, on every account, instead of
     waiting for the server's SEARCH and a re-fetch of its hits. The
     server's answer, where there is one, only adds mail the cache has not
