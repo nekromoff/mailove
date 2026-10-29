@@ -1394,6 +1394,36 @@ QList<MessageListModel::Header> MailStore::cachedHeaders(const QString &folder, 
     return rows;
 }
 
+QList<MessageListModel::Header> MailStore::cachedHeadersByUids(const QString &folder,
+                                                               const QList<qint64> &uids)
+{
+    if (!m_db.isOpen() || uids.isEmpty())
+        return {};
+    QList<MessageListModel::Header> rows;
+    // SQLite's bound-parameter limit is comfortably above a search answer's
+    // 200, but chunk anyway: the cap is the caller's, not the store's.
+    constexpr int chunk = 500;
+    for (int at = 0; at < uids.size(); at += chunk) {
+        const int n = qMin(chunk, int(uids.size()) - at);
+        QString marks;
+        for (int i = 0; i < n; ++i)
+            marks += i ? QStringLiteral(",?") : QStringLiteral("?");
+        QSqlQuery q(m_db);
+        q.prepare(QStringLiteral("SELECT uid, subject, sender, date, seen, suspicious, auth, attach,"
+                                 " color, crypto, spam_score, spam_state, spam_detail,"
+                                 " IFNULL(remote_id, CAST(uid AS TEXT)), IFNULL(recipients, ''),"
+                                 " forwarded, attach_n, ics_n"
+                                 " FROM messages WHERE folder = ? AND soft_deleted = 0"
+                                 " AND uid IN (") + marks + QLatin1Char(')'));
+        q.addBindValue(scoped(folder));
+        for (int i = 0; i < n; ++i)
+            q.addBindValue(uids.at(at + i));
+        rows += readHeaderRows(q);
+    }
+    applyJunkVerdict(rows, scoped(folder));
+    return rows;
+}
+
 QList<MessageListModel::Header> MailStore::cachedHeadersBefore(const QString &folder,
                                                                qint64 dateSecs, qint64 uid,
                                                                int limit)
@@ -4008,6 +4038,14 @@ void MailStore::searchOn(QSqlDatabase &db, const QString &scopedFolder, const QS
             readRows(q);
         else
             qWarning() << "mailstore: fts search failed:" << q.lastError().text();
+        // A pass that stopped on an error was sqlite3_interrupt()ed from the
+        // GUI thread (see MailClient::abandonLocalSearch); the interrupt
+        // flag only outlives the statement it hit, so the next pass would
+        // run to the end. Ask the sink instead — an empty batch is the
+        // question "still wanted?" — and it also covers an interrupt that
+        // landed in the gap between the two statements.
+        if (q.lastError().isValid() || !deliver({}))
+            return;
     }
     if (cancelled)
         return;

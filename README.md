@@ -22,6 +22,7 @@ Security-minded KDE-first IMAP and JMAP mail client, blazing fast.
 - **Fast by design** - a 20 ms limit on the GUI thread, one frame: anything slower runs on a worker. Nothing ever snaps or stalls mid-scroll.
 - **UX to taste** - Look and feel sets the layout (message preview below or beside the list), row density, background colour and tab or window to compose email; Message sorting by any column; Shortcuts rebinds every action; Color labels for messages; Change the date format, refresh interval, spam retention, cache limits and debug logging
 - **Compose & send** - SMTP with rich text, pasted images, attachments, signature and resumable drafts.
+- **Address autocomplete** - email address autosuggest as you type, most-used and most-recent first. Learned only from mail you send.
 - **Attachments** - click to open, right-click to save. Stored zstd-compressed and deduplicated outside the database.
 - **OpenPGP** - read and send signed and encrypted mail through GnuPG. Key manager, WKD discovery. Decrypted plaintext is never indexed, never cached, and is wiped from memory when the message closes.
 - **Keyboard-first** - arrows, Page Up/Down, Home/End, Enter to open, Ctrl+W to close a tab, and the keyboard follows the folder you open.
@@ -98,7 +99,7 @@ Debian / Ubuntu / KDE neon / KDE Linux and similar:
 sudo apt install cmake ninja-build extra-cmake-modules qt6-webengine-dev \
   kf6-kmime-dev kpim6-kimap-dev kpim6-ksmtp-dev qtkeychain-qt6-dev \
   qt6-base-dev qt6-declarative-dev kf6-kirigami-dev \
-  libgpgmepp-dev libqgpgmeqt6-dev libzstd-dev
+  libgpgmepp-dev libqgpgmeqt6-dev libzstd-dev libsqlite3-dev
 ```
 
 Fedora:
@@ -107,7 +108,7 @@ Fedora:
 sudo dnf install cmake ninja-build extra-cmake-modules qt6-qtwebengine-devel \
   kf6-kmime-devel kimap-devel ksmtp-devel qtkeychain-qt6-devel \
   qt6-qtbase-devel qt6-qtdeclarative-devel kf6-kirigami-devel \
-  gpgmepp-devel qgpgme-qt6-devel libzstd-devel
+  gpgmepp-devel qgpgme-qt6-devel libzstd-devel sqlite-devel
 ```
 
 openSUSE Tumbleweed:
@@ -116,7 +117,7 @@ openSUSE Tumbleweed:
 sudo zypper install cmake ninja extra-cmake-modules qt6-webenginequick-devel \
   kf6-kmime-devel kimap-devel ksmtp-devel qtkeychain-qt6-devel \
   qt6-base-devel qt6-declarative-devel kf6-kirigami-devel \
-  gpgmepp-devel qgpgmeqt6-devel libzstd-devel
+  gpgmepp-devel qgpgmeqt6-devel libzstd-devel sqlite3-devel
 ```
 
 Then:

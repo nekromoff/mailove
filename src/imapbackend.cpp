@@ -10,6 +10,7 @@
 #include <QDateTime>
 #include <QLoggingCategory>
 #include <QHash>
+#include <QThread>
 #include <QTimer>
 
 #include <kmime/content.h>
@@ -220,6 +221,68 @@ QString explainLoginFailure(const QString &serverReply)
 /// registered with QML and moving it would change the singleton's API for no
 /// gain here.
 enum Security { SslTls = 0, StartTls = 1, None = 2 };
+
+/// Where retired sessions are destroyed. One thread for the whole process,
+/// never stopped: it only ever holds sessions on their way out.
+QThread *sessionReaper()
+{
+    static QThread *reaper = [] {
+        auto *t = new QThread;
+        t->setObjectName(QStringLiteral("imap-reaper"));
+        t->start();
+        return t;
+    }();
+    return reaper;
+}
+
+/// True once a session has been handed to the reaper. A QPointer to it stays
+/// non-null until the reaper gets round to it, so code holding one checks this
+/// before queueing more work there.
+bool isRetired(const KIMAP::Session *session)
+{
+    return session && session->thread() == sessionReaper();
+}
+
+/// deleteLater() for a KIMAP::Session, minus the GUI freeze. ~Session waits up
+/// to 10 s for its socket thread, then terminates it — and that thread is
+/// regularly stuck: KIMAP's parser blocks in waitForReadyRead(30000) whenever a
+/// response stops mid-literal, which is exactly the dead connection we are
+/// throwing away. Deleted on the GUI thread that was a ~13 s stall.
+///
+/// So the session is finished off here the way ~Session would (its jobs fail
+/// with "connection lost", on this thread, as their result handlers expect),
+/// cut loose from every receiver, and destroyed on the reaper, which can afford
+/// to wait. Its own connectionLost/Failed are not re-sent: whoever retires a
+/// session has already stopped treating it as live. Deferred a turn like
+/// deleteLater, since callers retire a session from inside its own signals.
+void retireSession(KIMAP::Session *session)
+{
+    if (!session || isRetired(session))
+        return;
+    QTimer::singleShot(0, session, [session] {
+        if (isRetired(session)) // retired twice in one turn; the first won
+            return;
+        QObject *priv = nullptr;
+        for (QObject *child : session->children()) {
+            if (qstrcmp(child->metaObject()->className(), "KIMAP::SessionPrivate") == 0)
+                priv = child;
+        }
+        if (!priv) { // a KIMAP we don't know the insides of: block, as before
+            session->deleteLater();
+            return;
+        }
+        // Stops the idle timer for good: it lives on this thread, and a
+        // restart from the reaper would only warn.
+        session->setTimeout(-1);
+        session->disconnect();
+        QMetaObject::invokeMethod(priv, "socketDisconnected", Qt::DirectConnection);
+        for (auto *job : session->findChildren<KJob *>(Qt::FindDirectChildrenOnly))
+            job->disconnect();
+        session->setParent(nullptr);
+        session->moveToThread(sessionReaper());
+        session->deleteLater();
+    });
+}
 }
 
 ImapBackend::ImapBackend(QObject *parent)
@@ -296,16 +359,17 @@ void ImapBackend::closeSessions()
     m_queuedFolder.clear();
     m_queuedReadWrite = false;
     m_messageCounts.clear();
+    m_uidValidity.clear();
     for (const auto &conn : std::as_const(m_bodyPool)) {
-        if (conn->session)
-            conn->session->deleteLater();
+        retireSession(conn->session);
+        conn->session.clear(); // pending lambdas hold conn; see isRetired
     }
     m_bodyPool.clear();
     m_bodyPoolBroken = false;
     m_bodyFallbackBusy = false;
     if (m_syncSession) {
         m_syncSession->disconnect(this); // same reason as the main session below
-        m_syncSession->deleteLater();
+        retireSession(m_syncSession);
         m_syncSession.clear();
     }
     if (m_session) {
@@ -316,7 +380,7 @@ void ImapBackend::closeSessions()
         // to reconnect from.
         m_session->disconnect(this);
         m_session->close();
-        m_session->deleteLater();
+        retireSession(m_session);
         m_session.clear();
     }
 }
@@ -414,7 +478,7 @@ void ImapBackend::startSyncSession()
         m_syncFolder.clear();
     m_syncQueuedFolder.clear();
         if (m_syncSession) {
-            m_syncSession->deleteLater();
+            retireSession(m_syncSession);
             m_syncSession.clear();
         }
         Q_EMIT throttled();
@@ -496,7 +560,7 @@ void ImapBackend::stopPush()
     m_pushRetry.stop();
     m_idleJob.clear(); // owned by the session; dies with it
     if (m_idleSession) {
-        m_idleSession->deleteLater();
+        retireSession(m_idleSession);
         m_idleSession.clear();
     }
 }
@@ -795,7 +859,7 @@ KIMAP::SelectJob *ImapBackend::issueSelect(const QString &folder, bool readWrite
         // windows need the first, and the caller compares the second against
         // what it stored to notice a mailbox the server regenerated.
         m_messageCounts[folder] = sel->messageCount();
-        m_lastUidValidity = sel->uidValidity();
+        m_uidValidity[folder] = sel->uidValidity();
     });
     select->start();
     return select;
@@ -1057,8 +1121,8 @@ void ImapBackend::openFolder(const QString &folder, const QString &syncToken)
         // uid the caller cached now names a different message, or nothing. That
         // reading is made here rather than by the caller because it is true of
         // IMAP and false of JMAP, whose token changes whenever anything does.
-        const QString current = m_lastUidValidity > 0 ? QString::number(m_lastUidValidity)
-                                                      : QString();
+        const qint64 validity = m_uidValidity.value(folder, 0);
+        const QString current = validity > 0 ? QString::number(validity) : QString();
         if (!syncToken.isEmpty() && !current.isEmpty() && current != syncToken) {
             qWarning() << "mailove: UIDVALIDITY of" << folder << "changed" << syncToken << "->"
                        << current << "- the cached messages are void";
@@ -1311,8 +1375,8 @@ void ImapBackend::shrinkBodyPool()
     for (int i = 0; i < m_bodyPool.size(); ++i) {
         if (!m_bodyPool.at(i)->busy) {
             auto conn = m_bodyPool.takeAt(i);
-            if (conn->session)
-                conn->session->deleteLater();
+            retireSession(conn->session);
+            conn->session.clear();
             break;
         }
     }
@@ -1346,8 +1410,8 @@ void ImapBackend::ensureBodyPool()
                                            quint16(m_credentials.port), this);
         m_bodyPool.append(conn);
         const auto drop = [this, conn] {
-            if (conn->session)
-                conn->session->deleteLater();
+            retireSession(conn->session);
+            conn->session.clear();
             m_bodyPool.removeAll(conn);
         };
         connect(conn->session, &KIMAP::Session::connectionFailed, this, drop);
@@ -1644,7 +1708,7 @@ void ImapBackend::folderUnreadCounts(
     *step = [this, pending, counts, step, done, session] {
         // A connection that dropped mid-sweep ends it with what it has: the
         // counts so far are real, and the next tick asks again.
-        if (pending->isEmpty() || !session) {
+        if (pending->isEmpty() || !session || isRetired(session)) {
             if (done)
                 done(Error::None, *counts, QString());
             return;
@@ -1732,23 +1796,36 @@ void ImapBackend::search(const QString &folder, const QString &query, bool heade
                        KIMAP::Term(KIMAP::Term::Subject, query)})
         : KIMAP::Term(KIMAP::Term::Text, query);
 
-    withFolderSelected(folder, false, [this, folder, term, done](bool ok,
-                                                                 const QString &error) {
-        if (!ok) {
+    // The background connection, like the unseen search: Gmail takes seconds
+    // over a big folder, and on the interactive session every click queued
+    // behind it. The caller already shows the local index's answer; this only
+    // tops it up, so it must never be what the user waits on.
+    withReadSession(folder, /*background=*/true, [this, folder, term, done](KIMAP::Session *s) {
+        if (!s) {
             if (done)
-                done(Error::Protocol, error);
+                done(Error::Connection, tr("No connection available for %1.").arg(folder));
             return;
         }
-        auto *search = new KIMAP::SearchJob(m_session);
+        auto *search = new KIMAP::SearchJob(s);
         search->setUidBased(true);
         search->setTerm(term);
-        connect(search, &KJob::result, this, [this, folder, done](KJob *job) {
+        connect(search, &KJob::result, this, [this, s, folder, done](KJob *job) {
             if (job->error()) {
                 // Some servers reject SEARCH variants outright; the caller
                 // falls back to matching against its own index.
                 qWarning() << "mailove: IMAP SEARCH failed:" << job->errorString();
                 if (done)
                     done(Error::Protocol, job->errorString());
+                return;
+            }
+            // The wrong-mailbox hole (see sessionHasSelected): hits named
+            // against another mailbox's uids would fetch the wrong messages.
+            if (!sessionHasSelected(s, folder)) {
+                qCWarning(logTrace, "search in %s answered with another mailbox "
+                                    "selected - discarded",
+                          qUtf8Printable(folder));
+                if (done)
+                    done(Error::Protocol, QStringLiteral("wrong mailbox selected"));
                 return;
             }
             const QList<qint64> uids = static_cast<KIMAP::SearchJob *>(job)->results();

@@ -1166,17 +1166,20 @@ private:
     /// the default path's — those run right here on the GUI thread. The other
     /// columns sort the whole folder per page and go through the worker.
     bool sortPagesInline() const;
-    /// Fetches the given uids as search results; when \a localMergeKeyword is
-    /// set, local partial-match hits are merged into the result list.
-    void fetchHeadersByUids(const QList<qint64> &uids, const QString &localMergeKeyword = {},
-                            bool headersOnly = true);
+    /// Fetches server search hits the cache does not hold and appends them to
+    /// the result list; ends the server half of the search either way.
+    /// \a seq names the search these belong to — a later query drops them.
+    void fetchHeadersByUids(const QList<qint64> &uids, quint64 seq);
     /// Local index search, off the GUI thread and streamed: rows appear as the
-    /// worker finds them instead of after the last one. \a append keeps what is
-    /// already listed (server hits being topped up with local partial matches);
-    /// otherwise the first batch replaces the list.
+    /// worker finds them instead of after the last one. Returns the sequence
+    /// number the search runs under, for the server half to carry.
     /// \a headersOnly limits matching to sender and subject.
-    void localKeywordFilter(const QString &keyword, const QString &reason, bool append = false,
-                            bool headersOnly = true);
+    quint64 localKeywordFilter(const QString &keyword, bool headersOnly = true);
+    /// The server half of a search is done (answered, failed or skipped); if
+    /// the local half is too, the search is over.
+    void finishServerSearch(quint64 seq);
+    /// Both halves are in: prune what neither confirmed, drop the overlay.
+    void finishSearch();
     /// Copies the search index into one that folds diacritics, in slices on a
     /// worker, resuming where a previous run stopped.
     void startIndexRebuild();
@@ -1184,7 +1187,12 @@ private:
     void pruneSearchResults();
     /// Stops caring about the search in flight, if any. The worker notices on
     /// its next batch and gives up.
-    void abandonLocalSearch() { m_searchSeq.fetchAndAddOrdered(1); }
+    void abandonLocalSearch();
+    /// The server half of a search: one in flight at a time. A query typed
+    /// while one is out waits as the single queued one and replaces any
+    /// earlier wait — the server cannot be told to stop a SEARCH, so the
+    /// least it can be asked is not to run every letter typed past.
+    void startServerSearch(const QString &query, bool headersOnly, quint64 seq);
     void appendToSentFolder(const QByteArray &rawMessage,
                             const std::function<void()> &done = {});
     /// Builds the MIME message shared by sendMail() and saveDraft().
@@ -1614,6 +1622,24 @@ private:
     /// Ids the backend's last server search returned, held between the
     /// searchResults signal and the request's completion callback.
     QStringList m_pendingSearchIds;
+    /// The two halves of the search in flight. The local index pass answers
+    /// first and is the search; the server's answer, where there is a server,
+    /// tops it up with mail the cache has not reached. Pruning waits for both.
+    bool m_searchLocalDone = false;
+    bool m_searchServerPending = false;
+    bool m_searchServerInFlight = false; ///< a SEARCH is out on the server
+    struct QueuedServerSearch {
+        bool set = false;
+        QString query;
+        bool headersOnly = true;
+        quint64 seq = 0;
+    } m_searchServerQueued;
+    /// The local search worker's database handle, for sqlite3_interrupt():
+    /// the scan is one SQL statement, and the batch sink cannot stop a
+    /// statement from the inside. Shared with the worker, which registers
+    /// the handle after opening and withdraws it before closing.
+    struct SearchInterrupt;
+    std::shared_ptr<SearchInterrupt> m_searchInterrupt;
 
     MessageContext *m_reading = nullptr; ///< the reading pane's message state
 

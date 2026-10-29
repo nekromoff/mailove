@@ -1,3 +1,26 @@
+mailove (3.8.1) unstable; urgency=medium
+
+  * The GUI could freeze for 10+ seconds when a dead IMAP connection was
+    dropped: KIMAP waits for the connection's socket thread, which hangs
+    when a server stops partway through a response. Dropped connections
+    are now closed on a background thread.
+  * Search: the local index answers first, on every account, instead of
+    waiting for the server's SEARCH and a re-fetch of its hits. The
+    server's answer, where there is one, only adds mail the cache has not
+    reached; hits already cached are shown from the cache. One SEARCH is
+    sent at a time, and the latest query typed replaces any waiting one.
+    A local scan the user has typed past is stopped (sqlite3_interrupt)
+    instead of running to the end.
+  * Clearing a search refills the folder from the cache on online
+    accounts too; the list no longer trickles back through backfill.
+  * IMAP: UIDVALIDITY is tracked per mailbox. A quick folder switch could
+    compare it against another mailbox's value, discard a sound cache and
+    refetch it.
+  * More harmless Qt warnings from senders' HTML (zero point sizes,
+    "#transparent") are kept out of the log.
+
+ -- dusoft <dusoft@staznosti.sk>  Thu, 29 Oct 2026 12:30:00 +0100
+
 mailove (3.8.0) unstable; urgency=medium
 
   * DKIM: a signature with simple header canonicalization (no c= tag,

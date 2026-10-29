@@ -52,14 +52,18 @@
 
 Q_DECLARE_LOGGING_CATEGORY(logTrace)
 
-/// Drops Qt warnings that say nothing about mailove. Two come out of
+/// Drops Qt warnings that say nothing about mailove. Most come out of
 /// QTextDocument while it parses a sender's HTML for the plain-text preview
 /// and the search index:
 ///
 ///   QFont::setPixelSize: Pixel size <= 0        — "font-size:0", the standard
-///                                                 way to hide preheader text
+///   QFont::setPointSizeF: Point size <= 0         way to hide preheader text
+///                                                 (px and pt respectively)
 ///   QTextHtmlParser: Unknown color name '#abc ' — a colour with a stray space,
 ///                                                 which Qt does not trim
+///   QCssParser: Unknown color name '#transparent' — the same, from a style
+///                                                 attribute ("#" glued onto a
+///                                                 keyword)
 ///
 /// Neither is actionable, both fire per message, and their volume is chosen by
 /// the sender — a single message can bury the log in them, which is enough to
@@ -76,8 +80,10 @@ static void filterMailHtmlNoise(QtMsgType type, const QMessageLogContext &contex
                                 const QString &message)
 {
     if (message.startsWith(QLatin1String("QFont::setPixelSize: Pixel size <= 0"))
+        || message.startsWith(QLatin1String("QFont::setPointSizeF: Point size <= 0"))
         || message.startsWith(QLatin1String("QTextHtmlParser::applyAttributes: "
-                                            "Unknown color name")))
+                                            "Unknown color name"))
+        || message.startsWith(QLatin1String("QCssParser::parseHexColor: Unknown color name")))
         return;
     if (message.contains(QLatin1String("ToolBarPageHeader.qml"))
         && message.contains(QLatin1String("Unable to assign [undefined] to bool")))

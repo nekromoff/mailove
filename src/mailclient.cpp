@@ -32,6 +32,10 @@
 #include <QSet>
 #include <QSettings>
 #include <QSqlQuery>
+#include <QSqlDriver>
+#include <QMutex>
+#include <QMutexLocker>
+#include <sqlite3.h>
 #include <QLoggingCategory>
 #include <QTemporaryDir>
 #include <QThread>
@@ -6977,20 +6981,6 @@ void MailClient::searchMessages(const QString &query, int field)
     // until the field was cleared. The filter belongs to the query that set it.
     m_messageModel.applyFilter(QRegularExpression());
 
-    // A local archive has no server to ask, and an offline account has none it
-    // can reach — either way the cache is what there is to search, and the
-    // local index pass IS the search. Refusing here with "Not connected" was
-    // the whole complaint: the mail is sitting in the index, unsearchable.
-    if (m_acct.local || !connected()) {
-        m_searchSeen.clear();
-        m_searching = true;
-        m_searchFound = 0;
-        Q_EMIT searchingChanged();
-        localKeywordFilter(trimmed, tr("Search results"), /*append=*/false, field == 0);
-        return;
-    }
-
-    setBusy(true);
     // Progress lives in the list itself (Mail.searching drives an overlay
     // there), not in the status breadcrumb. The previous results are NOT
     // cleared here: the search field re-fires on every keystroke, and a clear
@@ -7004,44 +6994,135 @@ void MailClient::searchMessages(const QString &query, int field)
     // 0 = from + subject, the default: body search drags in every newsletter
     // that ever mentioned the word. "Everything" (1) is the opt-in.
     const bool headersOnly = field == 0;
+
+    // The cache is what there is to search, and the local index pass IS the
+    // search — for every account, not just offline ones. It used to run only
+    // after a server SEARCH and a re-fetch of the hits had both come back,
+    // which on Gmail is seconds per keystroke with the answer sitting in the
+    // index the whole time. Now it starts first; the server, where there is
+    // one, tops it up with whatever the cache has not reached.
+    const quint64 seq = localKeywordFilter(trimmed, headersOnly);
+
+    // A local archive has no server to ask, and an offline account has none
+    // it can reach.
+    if (m_acct.local || !connected()) {
+        m_searchServerPending = false;
+        return;
+    }
+
+    m_searchServerPending = true;
+    startServerSearch(trimmed, headersOnly, seq);
+}
+
+void MailClient::startServerSearch(const QString &query, bool headersOnly, quint64 seq)
+{
+    if (m_searchServerInFlight) {
+        // Not queued behind the running one on the connection — on Gmail each
+        // SEARCH is seconds, and five letters typed would be five of them in
+        // a row, every answer but the last thrown away on arrival. The newest
+        // query waits alone and goes out when the connection frees up.
+        m_searchServerQueued = {true, query, headersOnly, seq};
+        return;
+    }
+    m_searchServerInFlight = true;
     m_pendingSearchIds.clear();
     // In the user's own outgoing folders the header pass looks at To: every
     // message there is from them, so a From search is either the whole folder
     // or nothing, and the name a person types is the one they wrote to.
     const bool byRecipient = listsRecipients(m_selectedFolder);
-    m_backend->search(m_selectedFolder, trimmed, headersOnly, byRecipient,
-                      [this, trimmed, headersOnly](MailBackend::Error error,
-                                                   const QString &message) {
+    m_backend->search(m_selectedFolder, query, headersOnly, byRecipient,
+                      [this, seq](MailBackend::Error error, const QString &message) {
         QStringList ids = m_pendingSearchIds;
         m_pendingSearchIds.clear();
-        if (error != MailBackend::Error::None) {
-            // Some servers reject SEARCH variants; fall back to local matching.
-            setBusy(false);
-            localKeywordFilter(trimmed, tr("Server search failed (%1)").arg(message),
-                               /*append=*/false, headersOnly);
-            return;
+        m_searchServerInFlight = false;
+        if (m_searchServerQueued.set) {
+            // Whatever waited is the query the user actually wants; this
+            // answer is stale by definition and the seq check below says so.
+            const QueuedServerSearch next = m_searchServerQueued;
+            m_searchServerQueued = {};
+            if (m_searchSeq.loadAcquire() == next.seq)
+                startServerSearch(next.query, next.headersOnly, next.seq);
         }
-        if (ids.isEmpty()) {
-            setBusy(false);
-            localKeywordFilter(trimmed, tr("No server matches"), /*append=*/false,
-                               headersOnly);
+        if (m_searchSeq.loadAcquire() != seq)
+            return; // the user typed on; that query owns the list now
+        if (error != MailBackend::Error::None) {
+            // Some servers reject SEARCH variants, and a dropped connection
+            // is no reason to lose the search: the local answer stands.
+            qCDebug(logTrace, "server search skipped: %s", qUtf8Printable(message));
+            finishServerSearch(seq);
             return;
         }
         // Newest 200 hits are plenty for a result list.
         if (ids.size() > 200)
             ids = ids.mid(ids.size() - 200);
+        // Only what the local pass did not already deliver — many servers
+        // (Gmail…) match whole words only, so this is mostly a subset of the
+        // local hits; what is left is mail the cache has not reached, or body
+        // matches in bodies never cached.
         QList<qint64> uids;
         uids.reserve(ids.size());
-        for (const QString &id : std::as_const(ids))
-            uids.append(m_backend->localKeyFor(id));
-        // Merge in local partial-word hits — many servers (Gmail…) match whole
-        // words only, so "hung" would otherwise miss "hungarian".
-        fetchHeadersByUids(uids, trimmed, headersOnly);
+        for (const QString &id : std::as_const(ids)) {
+            const qint64 uid = m_backend->localKeyFor(id);
+            if (!m_searchSeen.contains(uid))
+                uids.append(uid);
+        }
+        // Of those, what the cache holds is shown from the cache: a re-fetch
+        // of headers already on disk was most of the old wait.
+        const QList<MessageListModel::Header> cached =
+            m_store.cachedHeadersByUids(m_selectedFolder, uids);
+        if (!cached.isEmpty()) {
+            m_sync->markFullySynced();
+            m_messageModel.appendHeaders(cached);
+            for (const auto &h : cached) {
+                m_searchSeen.insert(h.uid);
+                uids.removeOne(h.uid);
+            }
+            m_searchFound = int(m_searchSeen.size());
+            Q_EMIT searchingChanged();
+        }
+        fetchHeadersByUids(uids, seq);
     });
 }
 
-void MailClient::localKeywordFilter(const QString &keyword, const QString &reason, bool append,
-                                    bool headersOnly)
+void MailClient::finishServerSearch(quint64 seq)
+{
+    if (m_searchSeq.loadAcquire() != seq)
+        return;
+    m_searchServerPending = false;
+    if (m_searchLocalDone)
+        finishSearch();
+}
+
+void MailClient::finishSearch()
+{
+    setBusy(false);
+    m_searching = false;
+    pruneSearchResults();
+    m_searchFound = m_messageModel.rowCount();
+    Q_EMIT searchingChanged();
+}
+
+struct MailClient::SearchInterrupt {
+    QMutex mutex;
+    sqlite3 *handle = nullptr;
+};
+
+void MailClient::abandonLocalSearch()
+{
+    // The sequence bump is what every late answer checks against; the
+    // interrupt is for the one thing that cannot check — the statement the
+    // worker is inside right now. Typing the next letter, clearing the
+    // field, switching scope or folder all land here, and none of them
+    // should wait on a scan of the whole folder for a word already gone.
+    m_searchSeq.fetchAndAddOrdered(1);
+    if (!m_searchInterrupt)
+        return;
+    QMutexLocker lock(&m_searchInterrupt->mutex);
+    if (m_searchInterrupt->handle)
+        sqlite3_interrupt(m_searchInterrupt->handle);
+}
+
+quint64 MailClient::localKeywordFilter(const QString &keyword, bool headersOnly)
 {
     // The substring pass walks the folder's whole date index, which on a large
     // mailbox is far past a frame's worth of work — so it runs on a worker and
@@ -7051,6 +7132,7 @@ void MailClient::localKeywordFilter(const QString &keyword, const QString &reaso
     const QString scopedFolder = m_store.scopedKey(m_selectedFolder);
     const bool fts = m_store.ftsAvailable();
     const QString connection = QStringLiteral("mailstore-search-%1").arg(seq);
+    m_searchLocalDone = false;
 
     // Shared with the worker: what it has delivered so far, so the finish
     // handler can tell "no matches" from "matches already on screen" without
@@ -7058,23 +7140,48 @@ void MailClient::localKeywordFilter(const QString &keyword, const QString &reaso
     auto delivered = std::make_shared<QAtomicInt>(0);
     if (!m_searching) {
         m_searching = true;
-        m_searchFound = append ? m_messageModel.rowCount() : 0;
+        m_searchFound = 0;
         Q_EMIT searchingChanged();
     }
 
     const bool byRecipient = listsRecipients(m_selectedFolder);
+    auto interrupt = std::make_shared<SearchInterrupt>();
+    m_searchInterrupt = interrupt;
     auto *thread = QThread::create([this, seq, scopedFolder, keyword, fts, connection, delivered,
-                                    headersOnly, byRecipient] {
+                                    headersOnly, byRecipient, interrupt] {
         // Scoped so the handle is gone before removeDatabase — a live handle
         // is "still in use" to Qt and the removal only warns.
         {
         QSqlDatabase db = MailStore::openWorkerConnection(connection);
         if (db.isOpen()) {
-            MailStore::searchOn(
+            // Registered for the GUI thread's abandonLocalSearch(): the
+            // substring pass is one statement over the whole folder, and
+            // only sqlite3_interrupt() stops a statement from outside.
+            sqlite3 *handle = nullptr;
+            const QVariant v = db.driver()->handle();
+            if (v.isValid() && qstrcmp(v.typeName(), "sqlite3*") == 0)
+                handle = *static_cast<sqlite3 *const *>(v.constData());
+            bool wanted = true;
+            {
+                QMutexLocker lock(&interrupt->mutex);
+                interrupt->handle = handle;
+                // Abandoned between the start and this point: the interrupt
+                // call found no handle yet, so honour it here instead.
+                if (m_searchSeq.loadAcquire() != seq) {
+                    interrupt->handle = nullptr;
+                    wanted = false;
+                }
+            }
+            if (!handle)
+                qCDebug(logTrace, "search worker: no sqlite handle, scan not interruptible");
+            if (wanted) {
+                MailStore::searchOn(
                 db, scopedFolder, keyword, fts,
                 [this, seq, delivered](const QList<MessageListModel::Header> &batch) -> bool {
                     if (m_searchSeq.loadAcquire() != seq)
                         return false; // nobody is waiting for this any more
+                    if (batch.isEmpty())
+                        return true; // only asking whether to go on
                     delivered->fetchAndAddOrdered(batch.size());
                     // Queued, never blocking: both passes are capped at 200
                     // rows, so this is a handful of posts and there is nothing
@@ -7101,25 +7208,32 @@ void MailClient::localKeywordFilter(const QString &keyword, const QString &reaso
                     return m_searchSeq.loadAcquire() == seq;
                 },
                 headersOnly, byRecipient);
+            }
+            {
+                // Withdrawn before close: an interrupt on a closed handle is
+                // undefined, and the GUI thread may be about to call one.
+                QMutexLocker lock(&interrupt->mutex);
+                interrupt->handle = nullptr;
+            }
             db.close();
         }
         }
         QSqlDatabase::removeDatabase(connection);
     });
     connect(thread, &QThread::finished, this,
-            [this, thread, seq, keyword, reason, delivered, append] {
+            [this, thread, seq, keyword, delivered] {
                 thread->deleteLater();
                 if (m_searchSeq.loadAcquire() != seq)
                     return; // superseded; whoever replaced us owns the status line
-                setBusy(false);
-                m_searching = false;
-                pruneSearchResults();
-                m_searchFound = m_messageModel.rowCount();
-                Q_EMIT searchingChanged();
+                m_searchLocalDone = true;
+                // The server's answer is still coming: the overlay stays and
+                // nothing is pruned yet, or its hits would land in a list the
+                // user already saw settle.
+                if (m_searchServerPending)
+                    return;
+                finishSearch();
                 if (delivered->loadAcquire() > 0)
                     return;
-                if (append)
-                    return; // server hits stand on their own
                 // Nothing in the index: fall back to filtering what is loaded.
                 const QRegularExpression re(QRegularExpression::escape(keyword),
                                             QRegularExpression::CaseInsensitiveOption);
@@ -7127,6 +7241,7 @@ void MailClient::localKeywordFilter(const QString &keyword, const QString &reaso
             });
     // Below the UI's own work: typing the next letter must not wait for this.
     thread->start(QThread::LowPriority);
+    return seq;
 }
 
 /// Drops rows the just-finished search did not deliver. Runs only at
@@ -7151,6 +7266,7 @@ void MailClient::clearSearch()
 {
     setSearchActive(false);
     abandonLocalSearch(); // its rows would land in the folder we are restoring
+    m_searchServerPending = false; // a late server answer is ignored by seq
     if (m_searching) {
         m_searching = false;
         Q_EMIT searchingChanged();
@@ -7158,19 +7274,23 @@ void MailClient::clearSearch()
     m_messageModel.applyFilter(QRegularExpression());
     if (m_selectedFolder.isEmpty())
         return;
-    // Offline (and every local archive): no server refresh is coming to replace
-    // the result rows, and openFolder() treats a folder that still has rows as
-    // a reopen and leaves them standing — so drop them and let it refill from
-    // the cache. Otherwise clearing the search left the hits on screen.
-    if (!connected())
-        m_messageModel.clear();
+    // The rows on screen are search hits, not the folder, and openFolder()
+    // treats a folder that still has rows as a reopen and leaves them standing.
+    // Online or not, drop them so it refills from the cache. Online used to
+    // skip this on the theory that the server refresh replaces them — it only
+    // merges one cached page into the hits, and with the page anchor still
+    // wherever the search left it, the rest of the folder trickled back
+    // through backfill. Offline, nothing replaced them at all.
+    m_messageModel.clear();
     openFolder(m_selectedFolder);
 }
 
-void MailClient::fetchHeadersByUids(const QList<qint64> &uids, const QString &localMergeKeyword,
-                                    bool headersOnly)
+void MailClient::fetchHeadersByUids(const QList<qint64> &uids, quint64 seq)
 {
-
+    if (uids.isEmpty()) {
+        finishServerSearch(seq);
+        return;
+    }
     const QString folder = m_selectedFolder;
     QStringList ids;
     ids.reserve(uids.size());
@@ -7178,15 +7298,14 @@ void MailClient::fetchHeadersByUids(const QList<qint64> &uids, const QString &lo
         ids.append(QString::number(uid));
 
     m_backend->fetchHeadersById(folder, ids,
-            [this, folder, localMergeKeyword, headersOnly](MailBackend::Error error,
-                                                           const QString &message) {
+            [this, folder, seq](MailBackend::Error error, const QString &message) {
         const QList<MessageListModel::Header> fetched = m_sync->takePendingHeaders(folder);
-        setBusy(false);
+        if (m_searchSeq.loadAcquire() != seq)
+            return;
         if (error != MailBackend::Error::None) {
-            setStatus(tr("Fetching results failed"));
-            m_searching = false;
-            Q_EMIT searchingChanged();
-            Q_EMIT errorOccurred(message);
+            // The local hits are already showing; the top-up is what failed.
+            qCDebug(logTrace, "search top-up fetch failed: %s", qUtf8Printable(message));
+            finishServerSearch(seq);
             return;
         }
         // disable load-more while showing results
@@ -7196,17 +7315,8 @@ void MailClient::fetchHeadersByUids(const QList<qint64> &uids, const QString &lo
         for (const auto &h : fetched)
             m_searchSeen.insert(h.uid);
         m_searchFound = int(m_searchSeen.size());
-        // Local partial-word hits are topped up afterwards, on a worker: the
-        // server's answer is already on screen and must not wait for ours.
-        // Only that top-up ends the searching state; without one it ends here.
-        if (!localMergeKeyword.isEmpty()) {
-            localKeywordFilter(localMergeKeyword, tr("Search results"), /*append=*/true,
-                               headersOnly);
-        } else {
-            m_searching = false;
-            pruneSearchResults();
-        }
         Q_EMIT searchingChanged();
+        finishServerSearch(seq);
     });
 }
 

@@ -268,7 +268,13 @@ private:
     /// A positional window is "the newest N", which in IMAP can only be turned
     /// into a sequence range once the mailbox's size is known.
     QHash<QString, qint64> m_messageCounts;
-    qint64 m_lastUidValidity = 0; ///< from the most recent SELECT/EXAMINE
+    /// UIDVALIDITY per mailbox, from its last completed SELECT/EXAMINE. Per
+    /// mailbox, not "the most recent": openFolder() takes a fast path when
+    /// the folder is already queued on the session, and one scalar then
+    /// answered with whatever mailbox the last *completed* SELECT opened —
+    /// a false "changed" that voided a sound cache, then a second one when
+    /// the real value arrived.
+    QHash<QString, qint64> m_uidValidity;
 
     /// Runs one header FETCH on \a session, decoding each batch into
     /// HeaderInfo and emitting it. \a minUid drops entries at or below it,

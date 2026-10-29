@@ -103,6 +103,11 @@ public:
     static void setJunkFolderTest(std::function<bool(const QString &)> isJunk);
 
     QList<MessageListModel::Header> cachedHeaders(const QString &folder, int limit = 1000);
+    /// The cached rows among \a uids, in no particular order; uids the cache
+    /// does not hold are simply absent. For a server search answer: what the
+    /// index already has is shown from here, only the rest is fetched.
+    QList<MessageListModel::Header> cachedHeadersByUids(const QString &folder,
+                                                        const QList<qint64> &uids);
     /// Next page of cached headers strictly older than the (date, uid) anchor
     /// — keyset pagination for endless scrolling through the disk cache.
     QList<MessageListModel::Header> cachedHeadersBefore(const QString &folder, qint64 dateSecs,

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(mailove VERSION 3.8.0 LANGUAGES CXX)
+project(mailove VERSION 3.8.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,6 +18,8 @@ find_package(KPim6IMAP REQUIRED)
 find_package(KPim6Mime REQUIRED)
 find_package(KPim6SMTP REQUIRED)
 find_package(Qt6Keychain REQUIRED)
+# sqlite3_interrupt(): the only way to stop a search scan the user has typed past.
+find_package(SQLite3 REQUIRED)
 # Attachment payloads are stored compressed on disk (see attachmentstore.cpp).
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
@@ -197,6 +199,7 @@ target_link_libraries(mailove PRIVATE
     Qt6Keychain::Qt6Keychain
     PkgConfig::ZSTD
     PkgConfig::LIBCRYPTO
+    SQLite::SQLite3
 )
 
 # src/saslnoise.cpp's __fprintf_chk only replaces the XOAUTH2 plugin's if the
@@ -779,3 +782,21 @@ foreach(_target ${_mailove_all_targets})
     set_target_properties(${_target} PROPERTIES
         AUTOGEN_BUILD_DIR "${CMAKE_BINARY_DIR}/autogen/${_target}_autogen")
 endforeach()
+
+# The QML import scan exists to link static QML plugins into an executable.
+# Against a shared Qt it links nothing, yet still warns once per installed
+# module whose qmldir names a static link target (Union, Kirigami, ...) — some
+# 400 "The plugin will not be linked" lines per configure, from every
+# executable that links Qt Qml. The plugins load at run time either way, and
+# the AppImage traces imports itself (QML_SOURCES_PATHS). Swept for the same
+# reason as above; the scan runs as a deferred finalizer, so setting it here,
+# after the targets, is still in time.
+get_target_property(_qt_core_type Qt6::Core TYPE)
+if(_qt_core_type STREQUAL "SHARED_LIBRARY")
+    foreach(_target ${_mailove_all_targets})
+        get_target_property(_target_type ${_target} TYPE)
+        if(_target_type STREQUAL "EXECUTABLE")
+            set_target_properties(${_target} PROPERTIES QT_QML_MODULE_NO_IMPORT_SCAN TRUE)
+        endif()
+    endforeach()
+endif()
