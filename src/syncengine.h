@@ -8,6 +8,7 @@
 #include <QList>
 #include <QObject>
 #include <QPair>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 #include <QTimer>
@@ -233,7 +234,38 @@ private:
     void requestHeaderWindow(const QString &folder, qint64 fromNewest, int count,
                              bool append, bool background, bool arrivals = false);
     void applyFetchedHeaders(const QString &folder, qint64 reachedFromNewest,
-                             bool append, bool background, bool arrivals = false);
+                             bool append, bool background, bool arrivals,
+                             quint64 stream);
+
+    /// A header fetch on the open folder whose batches reach the cache and the
+    /// list as they land, rather than all at once when the request completes —
+    /// a window of a few hundred rows used to sit invisible until its last
+    /// row was in, and a search waited behind it. The first fetch on the
+    /// folder owns it; batches of any other fetch of the same folder that land
+    /// meanwhile go through it too (they are rows of the same folder).
+    struct HeaderStream {
+        quint64 serial = 0;
+        QString folder;
+        /// The cache's high-water mark when it began. Rows above it have never
+        /// been cached, so they are arrivals and go through the arrival filter
+        /// — fixed at the start, so a batch stored a moment ago does not turn
+        /// the next batch's new mail into "already known".
+        qint64 knownUid = 0;
+        bool startedEmpty = false; ///< the list had no rows when it began
+        int added = 0;             ///< rows it put on the list
+    };
+    /// Starts streaming \a folder; 0 when another fetch already streams it.
+    quint64 beginStream(const QString &folder);
+    /// Ends stream \a serial and hands back its record; an empty one for 0.
+    HeaderStream endStream(quint64 serial);
+    /// Filters, stores and shows one batch; returns the rows that survived
+    /// the arrival filter.
+    QList<MessageListModel::Header> streamBatch(const QString &folder,
+                                                QList<MessageListModel::Header> rows);
+    /// Takes \a folder's buffered rows. Returns those a stream already
+    /// filtered, cached and showed; \a rest gets what still needs that.
+    QList<MessageListModel::Header> takeSplit(const QString &folder,
+                                              QList<MessageListModel::Header> *rest);
     /// Idle-time body caching: queues \a folder's next few headers that have
     /// no cached body yet. Runs only after the header backfill has finished,
     /// so a fresh account always shows the full list first. Returns false when
@@ -271,6 +303,11 @@ private:
     FolderOpenIntent m_folderOpenIntent = FolderOpenIntent::None;
 
     QHash<QString, QList<MessageListModel::Header>> m_pendingHeaders;
+    HeaderStream m_stream;
+    quint64 m_streamSerial = 0;
+    /// Uids in m_pendingHeaders that a stream has already handled, per folder;
+    /// whoever takes the buffer takes these with it.
+    QHash<QString, QSet<qint64>> m_streamedUids;
 
     /// How many of the folder's newest messages have been fetched. Counted
     /// from the newest rather than in IMAP sequence numbers, which are the

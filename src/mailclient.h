@@ -46,6 +46,7 @@ class Message;
 class OAuthHelper;
 class PgpEngine;
 class ViewerSchemeHandler;
+class QNetworkAccessManager;
 
 /**
  * Central mail controller exposed to QML as the "Mail" singleton.
@@ -471,6 +472,16 @@ public:
     /// Copy the given text to the system clipboard (used to grab the full
     /// status breadcrumb trail on right-click).
     Q_INVOKABLE void copyToClipboard(const QString &text) const;
+    /// Where message images are saved: attachments/imageSaveDir, or the
+    /// Downloads folder when that is empty.
+    Q_INVOKABLE QUrl imageSaveFolder() const;
+    /// Saves the images a message view shows — \a urls as the page names
+    /// them (inline parts, data: URIs, remote images the reader allowed) —
+    /// into imageSaveFolder(), never overwriting a file already there.
+    Q_INVOKABLE void saveImages(const QStringList &urls);
+    /// The images the message page at \a pageUrl shows — what Save all
+    /// images saves. See ViewerSchemeHandler::pageImages().
+    Q_INVOKABLE QStringList pageImages(const QUrl &pageUrl) const;
     /// Initial body for a brand-new message: a blank line for the cursor
     /// followed by the account's signature (empty when no signature is set).
     Q_INVOKABLE QString newMessageBody() const;
@@ -1475,6 +1486,8 @@ private:
     /// Keeps the cache and the visible list in step with the server.
     SyncEngine *m_sync = nullptr;
     ViewerSchemeHandler *m_viewerHandler = nullptr;
+    /// Fetches remote images for saveImages(); created on first use.
+    QNetworkAccessManager *m_imageNam = nullptr;
     /// Renders a message into a MessageContext: bodies, inline parts,
     /// attachments and the three view URLs.
     MessagePresenter *m_presenter = nullptr;

@@ -125,6 +125,9 @@ const AdvancedConfig::Knob kSchema[] = {
      "Compress only when the sample shrinks below this fraction of its size."},
     {"attachments/maxPayloadBytes", Type::Int, 1073741824, 1048576, 2000000000, Reload::Live,
      "Largest attachment payload decompressed into memory."},
+    {"attachments/imageSaveDir", Type::String, QString(), {}, {}, Reload::Live,
+     "Folder the viewer's Save all images writes to, and where Save image as "
+     "starts. Empty uses the Downloads folder."},
 
     // --- avatars -------------------------------------------------------------
     // Off by default and deliberately so: asking gravatar.com for a picture
@@ -1252,6 +1255,15 @@ QVariantList AdvancedConfig::reference() const
             {QStringLiteral("set"), m_values.contains(key)},
         });
     }
+    // Groups in the alphabetical order of the titles the sheet shows — the
+    // schema's own order is by key ("view" is titled "Reading"), which read as
+    // no order at all. Stable, so each group keeps its keys in schema order.
+    std::stable_sort(out.begin(), out.end(), [](const QVariant &a, const QVariant &b) {
+        return QString::compare(a.toMap().value(QStringLiteral("groupTitle")).toString(),
+                                b.toMap().value(QStringLiteral("groupTitle")).toString(),
+                                Qt::CaseInsensitive)
+            < 0;
+    });
     qCDebug(logAdvanced, "advanced: reference() %lld ms (%d rows)", elapsed.elapsed(),
             int(out.size()));
     return out;

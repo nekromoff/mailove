@@ -184,9 +184,13 @@ void SyncEngine::refreshFolderHeaders(const QString &folder)
     m_backend->fetchHeadersSince(
         folder, QString::number(maxUid),
         [this, folder](MailBackend::Error error, const QString &) {
-            auto rows = m_pendingHeaders.take(folder);
-            if (error != MailBackend::Error::None || rows.isEmpty())
+            QList<MessageListModel::Header> rows;
+            const bool streamed = !takeSplit(folder, &rows).isEmpty();
+            if (error != MailBackend::Error::None || rows.isEmpty()) {
+                if (streamed)
+                    Q_EMIT unreadRecountNeeded();
                 return; // best-effort; the next pass covers whatever this missed
+            }
             // New arrivals — the one moment spam may be auto-filed (see
             // setArrivalFilter). Rows it files are removed from the list.
             if (m_arrivalFilter)
@@ -219,12 +223,95 @@ void SyncEngine::handleThrottled()
 void SyncEngine::addPendingHeaders(const QString &folder,
                                    const QList<MessageListModel::Header> &rows)
 {
+    // Still buffered when streamed: every request's completion reads the
+    // buffer for its own bookkeeping, and skips what the stream handled.
+    if (m_stream.serial != 0 && folder == m_stream.folder && folder == m_selectedFolder) {
+        m_pendingHeaders[folder] += streamBatch(folder, rows);
+        return;
+    }
     m_pendingHeaders[folder] += rows;
 }
 
 QList<MessageListModel::Header> SyncEngine::takePendingHeaders(const QString &folder)
 {
+    m_streamedUids.remove(folder);
     return m_pendingHeaders.take(folder);
+}
+
+QList<MessageListModel::Header> SyncEngine::takeSplit(const QString &folder,
+                                                      QList<MessageListModel::Header> *rest)
+{
+    const QSet<qint64> streamed = m_streamedUids.take(folder);
+    QList<MessageListModel::Header> done;
+    for (const MessageListModel::Header &h : m_pendingHeaders.take(folder)) {
+        if (streamed.contains(h.uid))
+            done.append(h);
+        else
+            rest->append(h);
+    }
+    return done;
+}
+
+quint64 SyncEngine::beginStream(const QString &folder)
+{
+    if (folder != m_selectedFolder)
+        return 0; // no list to stream onto
+    if (m_stream.serial != 0 && m_stream.folder == folder)
+        return 0; // already streaming; this fetch's batches go through it
+    m_stream = HeaderStream();
+    m_stream.serial = ++m_streamSerial;
+    m_stream.folder = folder;
+    m_stream.knownUid = m_store.maxCachedUid(folder);
+    m_stream.startedEmpty = m_messages.totalCount() == 0;
+    return m_stream.serial;
+}
+
+SyncEngine::HeaderStream SyncEngine::endStream(quint64 serial)
+{
+    if (serial == 0 || m_stream.serial != serial)
+        return HeaderStream();
+    return std::exchange(m_stream, HeaderStream());
+}
+
+QList<MessageListModel::Header> SyncEngine::streamBatch(const QString &folder,
+                                                        QList<MessageListModel::Header> rows)
+{
+    // No mark means a first listing, which is never filed: every row would
+    // read as an arrival (see applyFetchedHeaders).
+    if (m_arrivalFilter && m_stream.knownUid > 0) {
+        QList<MessageListModel::Header> fresh;
+        for (const MessageListModel::Header &h : std::as_const(rows)) {
+            if (h.uid > m_stream.knownUid)
+                fresh.append(h);
+        }
+        const int before = fresh.size();
+        if (before > 0)
+            m_arrivalFilter(folder, fresh);
+        if (fresh.size() != before) {
+            // Rows the filter took are filed elsewhere now.
+            QSet<qint64> kept;
+            for (const MessageListModel::Header &h : std::as_const(fresh))
+                kept.insert(h.uid);
+            QList<MessageListModel::Header> survivors;
+            survivors.reserve(rows.size());
+            for (const MessageListModel::Header &h : std::as_const(rows)) {
+                if (h.uid <= m_stream.knownUid || kept.contains(h.uid))
+                    survivors.append(h);
+            }
+            rows = survivors;
+        }
+    }
+    if (rows.isEmpty())
+        return rows;
+    m_store.storeHeaders(folder, rows);
+    QSet<qint64> &streamed = m_streamedUids[folder];
+    for (const MessageListModel::Header &h : std::as_const(rows))
+        streamed.insert(h.uid);
+    // Search results and sorted pages are not this folder's newest-first
+    // list; the rows are cached either way and those views read them there.
+    if (!m_searchActive && !sortedBrowse())
+        m_stream.added += m_messages.appendHeaders(rows);
+    return rows;
 }
 
 bool SyncEngine::handleBackgroundOpenFailure(const QString &message)
@@ -330,14 +417,19 @@ void SyncEngine::fetchNewerThanCache(qint64 maxCachedUid, int cachedCount)
 {
     const QString folder = m_selectedFolder;
     Q_EMIT statusMessage(tr("%1 — checking").arg(folder));
+    // Everything this answers is newer than the cache, so all of it is an
+    // arrival — filtered and shown batch by batch as it lands.
+    const quint64 stream = beginStream(folder);
     // "Everything newer than this", not a positional window: after a reconnect
     // the point is to catch up on whatever arrived, and how much that is, is
     // exactly what is not yet known. JMAP answers the same question with
     // Email/changes against the stored sync state.
     m_backend->fetchHeadersSince(
         folder, QString::number(maxCachedUid),
-        [this, folder, cachedCount](MailBackend::Error error, const QString &message) {
-            QList<MessageListModel::Header> headers = m_pendingHeaders.take(folder);
+        [this, folder, cachedCount, stream](MailBackend::Error error, const QString &message) {
+            endStream(stream);
+            QList<MessageListModel::Header> headers;
+            const QList<MessageListModel::Header> done = takeSplit(folder, &headers);
             if (error != MailBackend::Error::None) {
                 Q_EMIT busyRequested(false);
                 Q_EMIT statusMessage(tr("Fetching headers failed"));
@@ -348,9 +440,10 @@ void SyncEngine::fetchNewerThanCache(qint64 maxCachedUid, int cachedCount)
             // New arrivals — the one moment spam may be auto-filed (see
             // setArrivalFilter). Rows it files are removed from the list, so
             // the merge below never shows them.
-            if (m_arrivalFilter)
+            if (m_arrivalFilter && !headers.isEmpty())
                 m_arrivalFilter(folder, headers);
             m_store.storeHeaders(folder, headers);
+            headers += done;
             invalidateMissingBodies();
             Q_EMIT unreadRecountNeeded(); // freshly synced headers change the pills
             // Cache is updated above either way, but the visible list and the
@@ -752,6 +845,10 @@ void SyncEngine::requestHeaderWindow(const QString &folder, qint64 fromNewest, i
                                      bool append, bool background, bool arrivals)
 {
     m_headerFetch = true;
+    // The open folder's windows stream onto the list; a window of a folder
+    // nobody is looking at has no list to stream onto. The mark is read now,
+    // before any batch moves it — see applyFetchedHeaders for why it matters.
+    const quint64 stream = beginStream(folder);
     if (background && folder != m_selectedFolder) {
         // The pass walking a folder nobody is looking at is not the user's
         // news. Announcing every folder here kept the status bar cycling
@@ -770,7 +867,7 @@ void SyncEngine::requestHeaderWindow(const QString &folder, qint64 fromNewest, i
     }
     m_backend->fetchHeaderWindow(
         folder, int(fromNewest), count, background,
-        [this, folder, fromNewest, count, append, background, arrivals](
+        [this, folder, fromNewest, count, append, background, arrivals, stream](
             MailBackend::Error error, const QString &message) {
             m_headerFetch = false;
             if (background)
@@ -778,7 +875,10 @@ void SyncEngine::requestHeaderWindow(const QString &folder, qint64 fromNewest, i
             else
                 Q_EMIT busyRequested(false);
             if (error != MailBackend::Error::None) {
+                // Rows the stream already showed are real and stay cached.
+                endStream(stream);
                 m_pendingHeaders.remove(folder);
+                m_streamedUids.remove(folder);
                 if (!background) {
                     Q_EMIT statusMessage(tr("Fetching headers failed"));
                     Q_EMIT errorOccurred(message);
@@ -797,14 +897,20 @@ void SyncEngine::requestHeaderWindow(const QString &folder, qint64 fromNewest, i
             qint64 reached = fromNewest + count;
             if (total > 0)
                 reached = qMin(reached, total);
-            applyFetchedHeaders(folder, reached, append, background, arrivals);
+            applyFetchedHeaders(folder, reached, append, background, arrivals, stream);
         });
 }
 
 void SyncEngine::applyFetchedHeaders(const QString &folder, qint64 reachedFromNewest,
-                                     bool append, bool background, bool arrivals)
+                                     bool append, bool background, bool arrivals,
+                                     quint64 stream)
 {
-    QList<MessageListModel::Header> headers = m_pendingHeaders.take(folder);
+    // Rows the stream handled are filtered, cached and on the list already;
+    // only the rest (a folder switched away from mid-fetch, a stream a newer
+    // fetch took over) goes through the filter and the store below.
+    const HeaderStream streamed = endStream(stream);
+    QList<MessageListModel::Header> headers;
+    const QList<MessageListModel::Header> done = takeSplit(folder, &headers);
     if (arrivals && m_arrivalFilter && !headers.isEmpty()) {
         // New arrivals — the same moment the delta paths hand to the filter
         // (see setArrivalFilter). This window is a *top-up*, so most of it is
@@ -845,6 +951,7 @@ void SyncEngine::applyFetchedHeaders(const QString &folder, qint64 reachedFromNe
         }
     }
     m_store.storeHeaders(folder, headers);
+    headers += done;
     invalidateMissingBodies();
     Q_EMIT unreadRecountNeeded(); // freshly synced headers change the pills
 
@@ -872,7 +979,8 @@ void SyncEngine::applyFetchedHeaders(const QString &folder, qint64 reachedFromNe
     if (sortedBrowse()) {
         // nothing — visible list is fed by applySortedPage()
     } else if (append) {
-        const int added = m_messages.appendHeaders(headers); // dedupes by uid
+        // dedupes by uid, so the streamed rows cost nothing a second time
+        const int added = m_messages.appendHeaders(headers) + streamed.added;
         if (added == 0 && moreHistory && !background) {
             // This window was already on screen from the cache — keep walking
             // older windows until something new shows up, otherwise the scroll
@@ -884,7 +992,12 @@ void SyncEngine::applyFetchedHeaders(const QString &folder, qint64 reachedFromNe
         // Union of fresh fetch + everything cached, so previously scrolled-in
         // older messages stay visible across sessions.
         const auto merged = m_store.cachedHeaders(m_selectedFolder);
-        if (m_messages.totalCount() > 0) {
+        if (streamed.serial != 0 && streamed.startedEmpty) {
+            // The list was empty and only the stream filled it: the page
+            // anchor still has to be the one setHeaders() below would set.
+            updatePageAnchor(merged);
+            m_messages.appendHeaders(merged);
+        } else if (m_messages.totalCount() > 0) {
             // A background refresh (the poll timer, IDLE, a reconnect) landing
             // as setHeaders() here was a full model reset over a list already
             // showing: every paged-in row thrown away, every delegate rebuilt

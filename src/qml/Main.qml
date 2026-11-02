@@ -1709,6 +1709,16 @@ Kirigami.ApplicationWindow {
                                                     onClicked: folderPane.setCollapsed(
                                                         accountSection.modelData, accountSection.open)
                                                 }
+                                                // Right-click opens that account's settings.
+                                                // Its own area, right button only, so left
+                                                // presses still reach the collapse/drag one
+                                                // beneath and a right press never starts a
+                                                // reorder.
+                                                MouseArea {
+                                                    anchors.fill: parent
+                                                    acceptedButtons: Qt.RightButton
+                                                    onClicked: accountSheet().openAccount(accountSection.index)
+                                                }
 
                                                 // Two kinds of drop land on an account
                                                 // name: a folder being moved out to the top

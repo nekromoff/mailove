@@ -66,6 +66,14 @@ Item {
         present()
     }
 
+    /// Shows the settings tab on the Accounts page with \a index's form — a
+    /// right-click on an account in the folder pane.
+    function openAccount(index) {
+        page = 0
+        selectAccount(index)
+        present()
+    }
+
     Shortcut {
         sequence: "Esc"
         // Only the visible tab may act on a window-wide shortcut.

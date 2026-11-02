@@ -5,6 +5,8 @@
 
 #include <QByteArray>
 #include <QHash>
+#include <QStringList>
+#include <QUrl>
 #include <QWebEngineUrlRequestInterceptor>
 #include <QWebEngineUrlSchemeHandler>
 
@@ -94,6 +96,16 @@ public:
                        const QByteArray &mimeType, const QByteArray &data);
     /// Drops \a context's inline parts (call before loading a new message).
     void clearInlineParts(quint64 context);
+    /// The inline part a mailove:cid/<context>/<contentId> URL serves, for
+    /// saving the image a page shows. False when no such part is registered.
+    bool inlinePart(const QUrl &url, QByteArray *mimeType, QByteArray *data) const;
+    /// The images the page at \a pageUrl (a mailove:message/<context>/… URL)
+    /// shows, read from the body it was served: inline parts, data: URIs and,
+    /// when the body's policy allows them, remote images. Tracking pixels
+    /// (declared 1×1 or 0×0) are left out; each URL appears once.
+    QStringList pageImages(const QUrl &pageUrl) const;
+    /// The same, over an already-served body — split out for tests.
+    static QStringList imagesInHtml(const QByteArray &html);
 
     /// Forwards the remote-content opt-in to the profile's interceptor.
     void setRemoteContentAllowed(bool allow);

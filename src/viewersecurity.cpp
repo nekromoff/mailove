@@ -436,6 +436,93 @@ static bool splitContextPath(const QString &path, quint64 *context, QString *res
     return ok;
 }
 
+bool ViewerSchemeHandler::inlinePart(const QUrl &url, QByteArray *mimeType,
+                                     QByteArray *data) const
+{
+    const QString path = url.path();
+    if (url.scheme() != QLatin1String("mailove") || !path.startsWith(QLatin1String("cid/")))
+        return false;
+    quint64 context = 0;
+    QString cid;
+    if (!splitContextPath(path.mid(4), &context, &cid))
+        return false;
+    const auto ctxIt = m_contexts.constFind(context);
+    if (ctxIt == m_contexts.constEnd())
+        return false;
+    const auto it = ctxIt->inlineParts.constFind(cid);
+    if (it == ctxIt->inlineParts.constEnd())
+        return false;
+    *mimeType = it->mimeType;
+    *data = it->data;
+    return true;
+}
+
+QStringList ViewerSchemeHandler::imagesInHtml(const QByteArray &html)
+{
+    const QString text = QString::fromUtf8(html);
+    // The body carries its own policy (messageCsp): remote images are listed
+    // only when that policy let them load.
+    const bool remoteAllowed = text.contains(QLatin1String("img-src mailove: data: https:"));
+    static const QRegularExpression imgRe(QStringLiteral("<img\\b[^>]*>"),
+                                          QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression srcRe(
+        QStringLiteral("\\bsrc\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))"),
+        QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression sizeRe(
+        QStringLiteral("\\b(width|height)\\s*=\\s*[\"']?\\s*(\\d+)"),
+        QRegularExpression::CaseInsensitiveOption);
+    QStringList out;
+    QSet<QString> seen;
+    for (auto it = imgRe.globalMatch(text); it.hasNext();) {
+        const QString tag = it.next().captured(0);
+        const QRegularExpressionMatch src = srcRe.match(tag);
+        if (!src.hasMatch())
+            continue;
+        QString url = src.captured(1) + src.captured(2) + src.captured(3);
+        url.replace(QLatin1String("&amp;"), QLatin1String("&"));
+        url = url.trimmed();
+        // A declared 1×1 is a tracking pixel, not a picture anyone wants.
+        bool pixel = false;
+        for (auto s = sizeRe.globalMatch(tag); s.hasNext();) {
+            if (s.next().captured(2).toInt() <= 1)
+                pixel = true;
+        }
+        if (pixel || url.isEmpty() || seen.contains(url))
+            continue;
+        const bool local = url.startsWith(QLatin1String("mailove:cid/"))
+            || url.startsWith(QLatin1String("data:image/"), Qt::CaseInsensitive);
+        const bool remote = url.startsWith(QLatin1String("https://"), Qt::CaseInsensitive)
+            || url.startsWith(QLatin1String("http://"), Qt::CaseInsensitive);
+        if (!local && !(remote && remoteAllowed))
+            continue;
+        seen.insert(url);
+        out.append(url);
+    }
+    return out;
+}
+
+QStringList ViewerSchemeHandler::pageImages(const QUrl &pageUrl) const
+{
+    const QString path = pageUrl.path();
+    if (pageUrl.scheme() != QLatin1String("mailove") || !path.startsWith(QLatin1String("message/")))
+        return {};
+    quint64 context = 0;
+    QString rest;
+    if (!splitContextPath(path.mid(8), &context, &rest))
+        return {};
+    const auto it = m_contexts.constFind(context);
+    if (it == m_contexts.constEnd())
+        return {};
+    QStringList images = imagesInHtml(it->html);
+    // An inline part the body names but the message does not carry shows as
+    // a broken image; there is nothing to save for it.
+    images.removeIf([this](const QString &url) {
+        QByteArray m, d;
+        return url.startsWith(QLatin1String("mailove:cid/")) && !inlinePart(QUrl(url), &m, &d);
+    });
+    return images;
+}
+
 void ViewerSchemeHandler::requestStarted(QWebEngineUrlRequestJob *job)
 {
     const QString path = job->requestUrl().path();

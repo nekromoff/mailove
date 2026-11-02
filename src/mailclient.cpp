@@ -18,6 +18,8 @@
 
 #include <QClipboard>
 #include <QMimeData>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
 #include <QCryptographicHash>
 #include <QDesktopServices>
 #include <QGuiApplication>
@@ -4443,6 +4445,148 @@ void MailClient::copyToClipboard(const QString &text) const
         cb->setText(text);
 }
 
+static QString imageSaveDir()
+{
+    const QString configured = AdvancedConfig::s("attachments/imageSaveDir").trimmed();
+    if (configured.isEmpty())
+        return QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+    // "~/Pictures" is how anyone types a folder into a config line.
+    if (configured == QLatin1String("~") || configured.startsWith(QLatin1String("~/")))
+        return QDir::homePath() + configured.mid(1);
+    return configured;
+}
+
+QStringList MailClient::pageImages(const QUrl &pageUrl) const
+{
+    return m_viewerHandler ? m_viewerHandler->pageImages(pageUrl) : QStringList();
+}
+
+QUrl MailClient::imageSaveFolder() const
+{
+    return QUrl::fromLocalFile(imageSaveDir());
+}
+
+/// A file name for one saved image: the part's own name where the URL carries
+/// one (a content-id is often "image001.png@01D…"), else image-<n>, with an
+/// extension that matches what the bytes are.
+static QString imageFileName(const QUrl &url, const QByteArray &mimeType, int n)
+{
+    QString name;
+    if (url.scheme() != QLatin1String("data"))
+        name = url.path().section(QLatin1Char('/'), -1).section(QLatin1Char('@'), 0, 0);
+    static const QRegularExpression unsafe(QStringLiteral("[\\\\/:*?\"<>|\\x00-\\x1f]"));
+    name.replace(unsafe, QStringLiteral("_"));
+    name = name.trimmed();
+    if (name.isEmpty() || name.startsWith(QLatin1Char('.')))
+        name = QStringLiteral("image-%1").arg(n);
+    if (QFileInfo(name).suffix().isEmpty()) {
+        const QString ext =
+            QMimeDatabase().mimeTypeForName(QString::fromLatin1(mimeType)).preferredSuffix();
+        name += QLatin1Char('.') + (ext.isEmpty() ? QStringLiteral("png") : ext);
+    }
+    return name;
+}
+
+/// \a dir/\a name, or "name (2).ext"… when that is taken — same as attachments.
+static QString freeFilePath(const QString &dir, const QString &name)
+{
+    const QFileInfo info(name);
+    const QString suffix =
+        info.completeSuffix().isEmpty() ? QString() : QLatin1Char('.') + info.completeSuffix();
+    QString candidate = dir + QLatin1Char('/') + name;
+    for (int i = 1; QFile::exists(candidate); ++i)
+        candidate = QStringLiteral("%1/%2 (%3)%4").arg(dir, info.baseName()).arg(i).arg(suffix);
+    return candidate;
+}
+
+void MailClient::saveImages(const QStringList &urls)
+{
+    const QString dir = imageSaveDir();
+    if (!QDir().mkpath(dir)) {
+        Q_EMIT errorOccurred(tr("Cannot create %1").arg(dir));
+        return;
+    }
+    // Shared by the remote fetches below, which finish whenever they do; the
+    // last one to finish reports the total.
+    struct Progress {
+        int saved = 0;
+        int failed = 0;
+        int pending = 0;
+    };
+    auto progress = std::make_shared<Progress>();
+    auto write = [dir, progress](const QUrl &url, const QByteArray &mime,
+                                 const QByteArray &data, int n) {
+        QFile out(freeFilePath(dir, imageFileName(url, mime, n)));
+        if (!data.isEmpty() && out.open(QIODevice::WriteOnly) && out.write(data) == data.size())
+            ++progress->saved;
+        else
+            ++progress->failed;
+    };
+    auto report = [this, dir, progress] {
+        if (progress->failed == 0)
+            setStatus(tr("Saved %n image(s) to %1", "", progress->saved).arg(dir));
+        else
+            setStatus(tr("Saved %n image(s) to %1, %2 failed", "", progress->saved)
+                          .arg(dir)
+                          .arg(progress->failed));
+    };
+
+    int n = 0;
+    QSet<QString> seen;
+    for (const QString &s : urls) {
+        if (seen.contains(s))
+            continue;
+        seen.insert(s);
+        ++n;
+        const QUrl url(s);
+        QByteArray mime;
+        QByteArray data;
+        if (url.scheme() == QLatin1String("mailove")) {
+            if (m_viewerHandler && m_viewerHandler->inlinePart(url, &mime, &data))
+                write(url, mime, data, n);
+            else
+                ++progress->failed;
+        } else if (url.scheme() == QLatin1String("data")) {
+            // data:<mime>[;base64],<payload>
+            const int comma = s.indexOf(QLatin1Char(','));
+            const QString meta = s.mid(5, comma - 5);
+            const QByteArray payload = s.mid(comma + 1).toLatin1();
+            mime = meta.section(QLatin1Char(';'), 0, 0).toLatin1();
+            data = meta.endsWith(QLatin1String(";base64"), Qt::CaseInsensitive)
+                ? QByteArray::fromBase64(QByteArray::fromPercentEncoding(payload))
+                : QByteArray::fromPercentEncoding(payload);
+            if (comma > 5)
+                write(url, mime, data, n);
+            else
+                ++progress->failed;
+        } else if (url.scheme() == QLatin1String("http") || url.scheme() == QLatin1String("https")) {
+            // Only ever handed images the page already shows, so a remote one
+            // here is one the reader allowed for this message.
+            if (!m_imageNam)
+                m_imageNam = new QNetworkAccessManager(this);
+            ++progress->pending;
+            QNetworkReply *reply = m_imageNam->get(QNetworkRequest(url));
+            connect(reply, &QNetworkReply::finished, this,
+                    [reply, url, n, write, report, progress] {
+                        reply->deleteLater();
+                        if (reply->error() == QNetworkReply::NoError)
+                            write(url,
+                                  reply->header(QNetworkRequest::ContentTypeHeader)
+                                      .toString().section(QLatin1Char(';'), 0, 0).toLatin1(),
+                                  reply->readAll(), n);
+                        else
+                            ++progress->failed;
+                        if (--progress->pending == 0)
+                            report();
+                    });
+        } else {
+            ++progress->failed;
+        }
+    }
+    if (progress->pending == 0)
+        report();
+}
+
 QString MailClient::aboutText() const
 {
     // ABOUT.md is compiled into the binary as a Qt resource at build time.
@@ -7226,11 +7370,17 @@ quint64 MailClient::localKeywordFilter(const QString &keyword, bool headersOnly)
                 if (m_searchSeq.loadAcquire() != seq)
                     return; // superseded; whoever replaced us owns the status line
                 m_searchLocalDone = true;
-                // The server's answer is still coming: the overlay stays and
-                // nothing is pruned yet, or its hits would land in a list the
-                // user already saw settle.
-                if (m_searchServerPending)
+                // The server's answer is still coming, but the cache's answer
+                // is complete: the list settles on it now. Holding the prune
+                // for the server made every search over cached mail wait on
+                // it — and the server half runs on the background connection,
+                // queued behind whatever header window the sync is fetching.
+                // Its hits, when they come, are appended to the settled list;
+                // the overlay stays until then.
+                if (m_searchServerPending) {
+                    pruneSearchResults();
                     return;
+                }
                 finishSearch();
                 if (delivered->loadAcquire() > 0)
                     return;
@@ -7298,10 +7448,30 @@ void MailClient::fetchHeadersByUids(const QList<qint64> &uids, quint64 seq)
         ids.append(QString::number(uid));
 
     m_backend->fetchHeadersById(folder, ids,
-            [this, folder, seq](MailBackend::Error error, const QString &message) {
-        const QList<MessageListModel::Header> fetched = m_sync->takePendingHeaders(folder);
+            [this, folder, seq, uids](MailBackend::Error error, const QString &message) {
+        // The folder's buffer is shared: a header window of the same folder
+        // streaming meanwhile puts its rows there too, and a window may have
+        // taken (and cached) these. So: only the uids asked for, and whatever
+        // of them is not in the buffer is read back from the cache.
+        const QSet<qint64> asked(uids.cbegin(), uids.cend());
+        QList<MessageListModel::Header> fetched;
+        QSet<qint64> got;
+        for (const auto &h : m_sync->takePendingHeaders(folder)) {
+            if (asked.contains(h.uid) && !got.contains(h.uid)) {
+                fetched.append(h);
+                got.insert(h.uid);
+            }
+        }
         if (m_searchSeq.loadAcquire() != seq)
             return;
+        if (got.size() < asked.size()) {
+            QList<qint64> missing;
+            for (qint64 uid : uids) {
+                if (!got.contains(uid))
+                    missing.append(uid);
+            }
+            fetched += m_store.cachedHeadersByUids(folder, missing);
+        }
         if (error != MailBackend::Error::None) {
             // The local hits are already showing; the top-up is what failed.
             qCDebug(logTrace, "search top-up fetch failed: %s", qUtf8Printable(message));

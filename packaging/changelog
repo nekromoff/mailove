@@ -1,3 +1,29 @@
+mailove (3.8.2) unstable; urgency=medium
+
+  * Search over cached mail no longer waits for header fetching. The
+    list settles on the local index's answer as soon as it is in; the
+    server's SEARCH, which runs on the background connection behind any
+    header window being fetched, only appends what the cache lacks.
+  * Search top-up fetches keep only the uids they asked for. A header
+    window of the same folder landing meanwhile could add unrelated
+    rows to the results.
+  * Headers of the open folder appear as each batch arrives instead of
+    all at once when the window completes. Each batch is spam-filtered,
+    cached and shown on arrival; rows above the cache's high-water mark
+    when the fetch began go through the arrival filter.
+  * Message viewer: right-click on an image offers Copy image and Save
+    image as; with more than one image shown, Save all images (N)
+    saves inline, pasted and allowed remote images in one go. Tracking
+    pixels are skipped and existing files are never overwritten.
+  * New advanced setting attachments/imageSaveDir: where images are
+    saved. Empty uses the Downloads folder.
+  * Right-click on an account in the folder pane opens its settings.
+  * Advanced settings: groups are listed alphabetically by title. The
+    reference column follows the editor's cursor, bringing the setting
+    or section being edited to the top and marking it.
+
+ -- dusoft <dusoft@staznosti.sk>  Mon, 02 Nov 2026 21:00:00 +0100
+
 mailove (3.8.1) unstable; urgency=medium
 
   * The GUI could freeze for 10+ seconds when a dead IMAP connection was

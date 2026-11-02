@@ -75,6 +75,62 @@ import Mailove.Core
             return false
         }
 
+        // The key (group/name) and [group] the editor's cursor is in, which
+        // the reference follows: whatever is being typed on the left has its
+        // explanation in view on the right.
+        property string editingKey: ""
+        property string editingGroup: ""
+
+        function followCursor() {
+            const text = advancedEditor.text
+            const pos = advancedEditor.cursorPosition
+            const lineStart = text.lastIndexOf("\n", pos - 1) + 1
+            let lineEnd = text.indexOf("\n", pos)
+            if (lineEnd < 0)
+                lineEnd = text.length
+            // The nearest heading at or above the cursor's line.
+            let group = ""
+            const heading = /^[ \t]*\[([^\]\n]+)\][ \t]*$/gm
+            const above = text.substring(0, lineEnd)
+            let m
+            while ((m = heading.exec(above)) !== null)
+                group = m[1].trim()
+            // A key line, set or commented out — "Insert all defaults" writes
+            // them as "# name = value", and those are worth explaining too.
+            const line = text.substring(lineStart, lineEnd)
+            const key = /^[ \t]*(?:[#;][ \t]*)?([A-Za-z0-9_.-]+)[ \t]*=/.exec(line)
+            const editing = group !== "" && key ? group + "/" + key[1] : ""
+            if (editing === editingKey && group === editingGroup)
+                return // same place: leave the reader's own scrolling alone
+            editingKey = editing
+            editingGroup = group
+            if (group === "")
+                return
+            const rows = filteredReference
+            let headerAt = -1
+            for (let i = 0; i < rows.length; ++i) {
+                if (editing !== "" && rows[i].header !== true && rows[i].key === editing) {
+                    showAtTop(i)
+                    return
+                }
+                if (headerAt < 0 && rows[i].header === true && rows[i].group === group)
+                    headerAt = i
+            }
+            // An unknown key, or the heading line itself: the section.
+            if (headerAt >= 0)
+                showAtTop(headerAt)
+        }
+
+        // Puts row \a index at the very top of the reference. Twice: rows
+        // not built yet are placed by a height guess (see the delegate), so
+        // the first jump can land a little off; the second runs once those
+        // rows exist and have their real heights.
+        function showAtTop(index) {
+            advancedReference.positionViewAtIndex(index, ListView.Beginning)
+            advancedFollowSettle.index = index
+            advancedFollowSettle.restart()
+        }
+
         function recheck() {
             issues = Advanced.problems(advancedEditor.text)
             restartKeys = Advanced.restartKeys(advancedEditor.text)
@@ -129,10 +185,29 @@ import Mailove.Core
                 readonly property var entry: parent ? parent.entry : null
                 width: parent ? parent.width : 0
                 enabled: entry !== null
-                // Set keys are the answer to "what have I changed?" — the
-                // file itself only shows what was typed, not what it
-                // overrides.
-                highlighted: entry !== null && entry.set === true
+                // The key the editor's cursor is on. Not the delegate's
+                // selection state: that fills the row with the highlight
+                // colour and leaves these labels in their normal colours on
+                // it, which does not read. A light tint and an edge bar keep
+                // the text as it is everywhere else.
+                readonly property bool editing: entry !== null
+                                               && entry.key === advancedPage.editingKey
+                Rectangle {
+                    // Above the delegate's own background, below its content.
+                    z: -0.5
+                    anchors.fill: parent
+                    visible: keyRow.editing
+                    color: Qt.alpha(Kirigami.Theme.highlightColor, 0.15)
+                    radius: Kirigami.Units.smallSpacing
+                    Rectangle {
+                        anchors.left: parent.left
+                        anchors.top: parent.top
+                        anchors.bottom: parent.bottom
+                        width: 3
+                        radius: 1
+                        color: Kirigami.Theme.highlightColor
+                    }
+                }
                 // Adds the key at its default under the section it belongs
                 // to, reusing that section if the file already has one.
                 onClicked: {
@@ -166,6 +241,7 @@ import Mailove.Core
                         QQC2.Label {
                             visible: keyRow.entry !== null && keyRow.entry.set === true
                             text: "set"
+                            font.bold: true
                             color: Kirigami.Theme.positiveTextColor
                             font.pointSize: Kirigami.Theme.smallFont.pointSize
                         }
@@ -188,6 +264,19 @@ import Mailove.Core
             id: advancedCheckTimer
             interval: 300
             onTriggered: advancedPage.recheck()
+        }
+        // Following the cursor waits for it to settle: a held arrow key
+        // should not drag the reference through every line it passes.
+        Timer {
+            id: advancedFollowTimer
+            interval: 150
+            onTriggered: advancedPage.followCursor()
+        }
+        Timer {
+            id: advancedFollowSettle
+            property int index: -1
+            interval: 50
+            onTriggered: advancedReference.positionViewAtIndex(index, ListView.Beginning)
         }
 
         RowLayout {
@@ -239,6 +328,7 @@ import Mailove.Core
                             advancedPage.saveError = ""
                             advancedCheckTimer.restart()
                         }
+                        onCursorPositionChanged: advancedFollowTimer.restart()
                     }
                 }
 

@@ -3,6 +3,7 @@
 
 import QtQuick
 import QtQuick.Controls as QQC2
+import QtQuick.Dialogs
 import QtWebEngine
 import Mailove.Core
 
@@ -59,21 +60,124 @@ WebEngineView {
 
     // Our own context menu in place of Chromium's default, whose entries
     // (Back, Reload, View page source…) do nothing useful inside a mail
-    // sandbox. Only what acts on mail content: copying — a link's address
-    // (first, when the click is on one), plain, as Markdown (the interchange
-    // format issue trackers and notes speak) — and Select all.
+    // sandbox. Only what acts on mail content: an image's copy and save
+    // (first, when the click is on one), a link's address, copying plain or
+    // as Markdown (the interchange format issue trackers and notes speak) —
+    // and Select all.
     onContextMenuRequested: function (request) {
         request.accepted = true
         contextMenu.hasSelection = request.selectedText.length > 0
         contextMenu.linkUrl = request.linkUrl
+        contextMenu.onImage = request.mediaType === ContextMenuRequest.MediaTypeImage
+            && request.mediaUrl.toString().length > 0
+        contextMenu.imageUrl = contextMenu.onImage ? request.mediaUrl : ""
+        // Which images the page shows, for Save all images — read from the
+        // body the page was served, since scripts cannot run in here to ask
+        // the page itself.
+        contextMenu.images = contextMenu.onImage ? Mail.pageImages(view.url) : []
         contextMenu.popup()
     }
+
+    // A file name for the image under the pointer. Inline parts arrive as
+    // mailove:cid/<slot>/<content-id>, whose id is often "image001.png@…";
+    // pasted ones as data: URIs, which name only a type.
+    function imageFileName(url) {
+        const s = url.toString()
+        const data = /^data:image\/([a-z0-9.+-]+)/i.exec(s)
+        if (data)
+            return "image." + (data[1].toLowerCase() === "jpeg" ? "jpg"
+                               : data[1].toLowerCase().replace("svg+xml", "svg"))
+        let name = s.split(/[?#]/)[0].split("/").pop() || ""
+        try {
+            name = decodeURIComponent(name)
+        } catch (e) {
+            // a malformed escape in a sender's content-id: keep it as written
+        }
+        name = name.split("@")[0].replace(/[\\/:*?"<>|]/g, "_").trim()
+        if (name.length === 0)
+            name = "image"
+        if (name.indexOf(".") < 0)
+            name += ".png"
+        return name
+    }
+
+    // Save image as: the path is chosen first, then the renderer is asked to
+    // download the image it already has — the same bytes on screen, whichever
+    // way they arrived (an inline part, a data: URI, an allowed remote load),
+    // with no second fetch of our own. A download request must be accepted
+    // while its signal is being handled, which is why the dialog comes first.
+    // The profile is shared by every view (the composer's quote preview too),
+    // so only the view that asked answers it.
+    property url pendingImageSave: ""
+    FileDialog {
+        id: saveImageDialog
+        fileMode: FileDialog.SaveFile
+        nameFilters: ["Images (*.png *.jpg *.jpeg *.gif *.webp *.bmp *.svg)", "All files (*)"]
+        onAccepted: {
+            view.pendingImageSave = selectedFile
+            view.triggerWebAction(WebEngineView.DownloadImageToDisk)
+        }
+    }
+    Connections {
+        target: view.profile
+        function onDownloadRequested(download) {
+            const target = view.pendingImageSave.toString()
+            if (target.length === 0)
+                return
+            view.pendingImageSave = ""
+            const path = decodeURIComponent(target.replace(/^file:\/\//, ""))
+            const slash = path.lastIndexOf("/")
+            download.downloadDirectory = path.substring(0, slash)
+            download.downloadFileName = path.substring(slash + 1)
+            download.accept()
+        }
+    }
+
     QQC2.Menu {
         id: contextMenu
         property bool hasSelection: false
         property url linkUrl: ""
+        property bool onImage: false
+        property url imageUrl: ""
+        property var images: [] ///< every image the page shows, for Save all
         readonly property bool onLink: linkUrl.toString().length > 0
         readonly property bool onMailto: linkUrl.toString().toLowerCase().indexOf("mailto:") === 0
+
+        // On an image, the image comes first: that is what the right click
+        // was aimed at, even when the image is also a link.
+        QQC2.MenuItem {
+            visible: contextMenu.onImage
+            height: visible ? implicitHeight : 0
+            text: "Copy image"
+            icon.name: "edit-copy"
+            // The decoded bitmap, as the renderer holds it — pastes as a
+            // picture into editors, chats and image tools.
+            onTriggered: view.triggerWebAction(WebEngineView.CopyImageToClipboard)
+        }
+        QQC2.MenuItem {
+            visible: contextMenu.onImage
+            height: visible ? implicitHeight : 0
+            text: "Save image as…"
+            icon.name: "document-save-as"
+            onTriggered: {
+                saveImageDialog.selectedFile = Mail.imageSaveFolder() + "/"
+                    + view.imageFileName(contextMenu.imageUrl)
+                saveImageDialog.open()
+            }
+        }
+        // Straight into the save folder (Downloads unless Advanced settings
+        // say otherwise) — no dialog per image; the status bar says where.
+        QQC2.MenuItem {
+            visible: contextMenu.onImage && contextMenu.images.length > 1
+            height: visible ? implicitHeight : 0
+            text: "Save all images (" + contextMenu.images.length + ")"
+            icon.name: "document-save-all"
+            onTriggered: Mail.saveImages(contextMenu.images)
+        }
+        QQC2.MenuSeparator {
+            visible: contextMenu.onImage
+            height: visible ? implicitHeight : 0
+        }
 
         // On a link, the link comes first: that is what the right click was
         // aimed at. A mail address copies as the address alone — the

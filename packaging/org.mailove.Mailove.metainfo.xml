@@ -33,6 +33,21 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.8.2" date="2026-11-02" type="stable">
+      <description>
+        <ul>
+          <li>Searching cached mail no longer waits for the folder to finish
+              syncing.</li>
+          <li>New messages appear in the list as they download, not in
+              bulk.</li>
+          <li>Images in messages can be copied, saved, or all saved at
+              once from the right-click menu.</li>
+          <li>Right-click an account to open its settings.</li>
+          <li>Advanced settings: alphabetical groups, and the help column
+              follows what you are editing.</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.8.1" date="2026-10-29" type="stable">
       <description>
         <ul>
