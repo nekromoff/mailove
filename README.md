@@ -69,7 +69,8 @@ Every email is validated using DKIM, SPF, DMARC, ARC (and COMPAUTH)
 
 ## Installation
 
-Packaged as DEB and RPM packages and AppImage. Go to https://github.com/nekromoff/mailove/releases (open assets) to download.
+Packaged as DEB, RPM packages and AppImage. Go to https://github.com/nekromoff/mailove/releases (open assets) to download.
+AUR package available for Arch via: `yay -S mailove-git`
 
 ## Technology
 
