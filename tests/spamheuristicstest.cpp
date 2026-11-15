@@ -1195,6 +1195,36 @@ void testOwnAddressSpoof()
     check(!sf.exempt && fired(sf, "own-address-forged"),
           QStringLiteral("auth=pass does not outrank an outright failure (%1)").arg(hitList(sf)));
 
+    // A note to self written in Gmail's web interface: one stored message
+    // under both labels, never delivered, so no Received line and no verdict.
+    // Nothing a forger sends can arrive like that — the user's own server
+    // stamps Received on everything it accepts.
+    const char *noteToSelf =
+        "MIME-Version: 1.0\r\n"
+        "Date: Fri, 6 Nov 2026 15:24:10 +0100\r\n"
+        "Message-ID: <CAK+abc123@mail.gmail.com>\r\n"
+        "Subject: \r\n"
+        "From: You <you@example.org>\r\n"
+        "To: You <you@example.org>\r\n"
+        "Content-Type: multipart/alternative; boundary=\"000000000000abc\"\r\n";
+    SpamHeuristics::Context own;
+    own.ownAddresses = {QStringLiteral("you@example.org")};
+    const SpamHeuristics::Score note = SpamHeuristics::score(headOnly(noteToSelf), own);
+    check(note.exempt && note.verdict == SpamHeuristics::Verdict::Ham
+              && !fired(note, "own-address-unverified"),
+          QStringLiteral("own-address mail with no Received line is exempt (%1: %2)")
+              .arg(note.exemptReason, hitList(note)));
+    SpamHeuristics::Context ownFailed = own;
+    ownFailed.authFailed = true;
+    check(!SpamHeuristics::score(headOnly(noteToSelf), ownFailed).exempt,
+          QStringLiteral("...but not when the server recorded an authentication failure"));
+    SpamHeuristics::Context notOwn;
+    notOwn.ownAddresses = {QStringLiteral("other@example.org")};
+    const SpamHeuristics::Score foreign = SpamHeuristics::score(headOnly(noteToSelf), notOwn);
+    check(!foreign.exempt && fired(foreign, "no-received"),
+          QStringLiteral("...and a stranger's mail with no Received line is still scored (%1)")
+              .arg(hitList(foreign)));
+
     // Somebody else's address is not this rule's business.
     SpamHeuristics::Context stranger;
     stranger.ownAddresses = {QStringLiteral("other@example.org")};

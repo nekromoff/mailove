@@ -240,6 +240,33 @@ if [[ -f "$qt_plugins/kf6/sonnet/sonnet_hunspell.so" ]]; then
                  "$appdir/usr/plugins/kf6/sonnet/sonnet_hunspell.so"
 fi
 
+# 3h. The rest of NSS. linuxdeploy bundles what QtWebEngine links (libnss3,
+#     libnssutil3, libsmime3, …) but not the modules NSS dlopens at runtime:
+#     the soft token (libsoftokn3) and its crypto core (libfreeblpriv3). NSS
+#     looks for them next to libnss3 first and falls back to the host's — and
+#     a host softokn newer than the bundled libnssutil3 cannot load against it.
+#     On Fedora/openSUSE WebEngine then aborted at startup ("version
+#     `NSSUTIL_3.108' not found (required by /usr/lib64/libsoftokn3.so)",
+#     SIGTRAP). Shipping the matching modules keeps NSS one consistent version.
+#     The .chk files are their FIPS self-check signatures. libnssckbi (root
+#     certificates) stays the host's: it needs nothing from nssutil, and on
+#     many distros it is p11-kit's bridge to the system trust store.
+log "Bundling NSS modules"
+nss_libs=()
+nss_dir="$(dirname "$(ldconfig -p | awk '!f && $1=="libnss3.so" && /x86-64/{print $NF; f=1}')")"   # no early exit: SIGPIPE vs pipefail
+for cand in "$nss_dir" "$nss_dir/nss"; do   # older Debian keeps the modules in nss/
+  [[ -f "$cand/libsoftokn3.so" ]] || continue
+  for mod in libsoftokn3 libfreeblpriv3 libfreebl3 libnssdbm3; do
+    [[ -f "$cand/$mod.so" ]] || continue
+    nss_libs+=(--library "$cand/$mod.so")
+    [[ -f "$cand/$mod.chk" ]] && install -Dm644 "$cand/$mod.chk" "$appdir/usr/lib/$mod.chk"
+  done
+  break
+done
+((${#nss_libs[@]})) \
+  || echo "warning: libsoftokn3.so not found near $nss_dir — the AppImage" \
+          "will use the host's NSS modules and may abort on newer hosts" >&2
+
 # --- 4. runtime hook: env for the bundled Qt/WebEngine/style -------------
 # linuxdeploy runs apprun-hooks/*.sh before launching the app.
 log "Writing AppRun hooks"
@@ -286,6 +313,7 @@ cd "$here"
 "$tools_dir/linuxdeploy" \
   --appdir "$appdir" \
   --plugin qt \
+  "${nss_libs[@]}" \
   --desktop-file "$appdir/usr/share/applications/org.mailove.Mailove.desktop" \
   --icon-file "$appdir/usr/share/icons/hicolor/scalable/apps/org.mailove.Mailove.svg"
 

@@ -27,6 +27,30 @@
 QString sanitizeMessageHtml(QString html);
 
 /**
+ * Replaces the pictures Outlook / Microsoft 365 puts in its "X reacted to your
+ * message" notifications with the emoji they depict.
+ *
+ * Those mails name the reaction only by a remote image
+ * (https://outlook-1.cdn.office.net/assets/reaction/like.png), which the
+ * viewer rightly refuses to fetch — so the one thing the message exists to
+ * say was invisible until remote content was switched on. The set is small
+ * and fixed, so the emoji is substituted locally and nothing is requested.
+ *
+ * Only an <img> whose src is on a *.cdn.office.net host under
+ * /assets/reaction/ and whose file name is one of the known reactions is
+ * touched; anything else is returned exactly as it came.
+ */
+QString replaceReactionImages(QString html);
+
+/**
+ * The emoji replaceReactionImages() would put into \a html, in order and
+ * without repeats; empty when it holds no Outlook reaction picture. This is
+ * how an Outlook "reacted to your message" notification is told from other
+ * mail: it follows neither reaction format, the picture is all it has.
+ */
+QStringList reactionImageEmoji(const QString &html);
+
+/**
  * A <meta> Content-Security-Policy to prepend to a served message body.
  * \a allowRemote mirrors the per-message remote-content opt-in.
  *

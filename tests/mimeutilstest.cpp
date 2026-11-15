@@ -98,6 +98,166 @@ std::shared_ptr<KMime::Message> buildMessage(const QByteArray &big, const QByteA
 }
 }
 
+/// A parsed message from literal source (LF line ends are fine here).
+std::shared_ptr<KMime::Message> parsed(const QByteArray &source)
+{
+    auto m = std::make_shared<KMime::Message>();
+    m->setContent(KMime::CRLFtoLF(source));
+    m->parse();
+    return m;
+}
+
+QByteArray gmailReaction(const QByteArray &json, const QByteArray &inReplyTo,
+                         const QByteArray &partExtra = {})
+{
+    return "From: Alice <alice@example.com>\n"
+           "To: Bob <bob@example.com>\n"
+           "Subject: Re: Lunch\n"
+           "Message-ID: <reaction-1@example.com>\n"
+           + inReplyTo +
+           "MIME-Version: 1.0\n"
+           "Content-Type: multipart/alternative; boundary=\"b1\"\n"
+           "\n"
+           "--b1\n"
+           "Content-Type: text/plain; charset=\"UTF-8\"\n"
+           "\n"
+           "\xF0\x9F\x91\x8D\n"
+           "--b1\n"
+           "Content-Type: text/vnd.google.email-reaction+json; charset=\"UTF-8\"\n"
+           + partExtra +
+           "\n"
+           + json + "\n"
+           "--b1\n"
+           "Content-Type: text/html; charset=\"UTF-8\"\n"
+           "\n"
+           "<p>\xF0\x9F\x91\x8D</p>\n"
+           "--b1--\n";
+}
+
+void testReactions()
+{
+    const QString thumb = QString::fromUtf8("\xF0\x9F\x91\x8D");
+    const QByteArray irt = "In-Reply-To: <orig-1@example.com>\n";
+    const QByteArray good = "{\"emoji\":\"\xF0\x9F\x91\x8D\",\"version\":1}";
+
+    check(MimeUtils::isSingleEmoji(thumb), "emoji: thumbs up");
+    check(MimeUtils::isSingleEmoji(QString::fromUtf8("\xE2\x9D\xA4\xEF\xB8\x8F")),
+          "emoji: red heart with presentation selector");
+    check(MimeUtils::isSingleEmoji(QString::fromUtf8("\xF0\x9F\x91\x8D\xF0\x9F\x8F\xBD")),
+          "emoji: skin-toned hand is one");
+    check(MimeUtils::isSingleEmoji(QString::fromUtf8("\xF0\x9F\x87\xB8\xF0\x9F\x87\xB0")),
+          "emoji: a flag is one");
+    check(MimeUtils::isSingleEmoji(QString::fromUtf8(
+              "\xF0\x9F\x91\xA8\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7")),
+          "emoji: a ZWJ family is one");
+    check(MimeUtils::isSingleEmoji(QString::fromUtf8("1\xEF\xB8\x8F\xE2\x83\xA3")),
+          "emoji: keycap");
+    check(!MimeUtils::isSingleEmoji(thumb + thumb), "emoji: two are not one");
+    check(!MimeUtils::isSingleEmoji(QStringLiteral("a")), "emoji: a letter is not");
+    check(!MimeUtils::isSingleEmoji(QStringLiteral("1")), "emoji: a bare digit is not");
+    check(!MimeUtils::isSingleEmoji(QStringLiteral(":)")), "emoji: a smiley in ASCII is not");
+    check(!MimeUtils::isSingleEmoji(QString()), "emoji: empty is not");
+
+    auto r = MimeUtils::reactionOf(parsed(gmailReaction(good, irt)).get());
+    check(r.valid() && r.emoji == QStringList{thumb}
+              && r.targetId == QLatin1String("orig-1@example.com"),
+          "reaction: Gmail form is read");
+
+    check(!MimeUtils::reactionOf(parsed(gmailReaction(good, {})).get()).valid(),
+          "reaction: no In-Reply-To, no reaction");
+    check(!MimeUtils::reactionOf(
+               parsed(gmailReaction(good, "In-Reply-To: <a@example.com> <b@example.com>\n"))
+                   .get())
+               .valid(),
+          "reaction: two In-Reply-To ids, no reaction");
+    check(!MimeUtils::reactionOf(
+               parsed(gmailReaction("{\"emoji\":\"\xF0\x9F\x91\x8D\",\"version\":2}", irt)).get())
+               .valid(),
+          "reaction: unknown version is ordinary mail");
+    check(!MimeUtils::reactionOf(
+               parsed(gmailReaction("{\"emoji\":\"\xF0\x9F\x91\x8D\",\"version\":\"1\"}", irt))
+                   .get())
+               .valid(),
+          "reaction: version as a string is ordinary mail");
+    check(!MimeUtils::reactionOf(
+               parsed(gmailReaction("{\"emoji\":\"\xF0\x9F\x91\x8D\xF0\x9F\x91\x8D\",\"version\":1}",
+                                    irt))
+                   .get())
+               .valid(),
+          "reaction: two emoji in Gmail's part is ordinary mail");
+    check(!MimeUtils::reactionOf(
+               parsed(gmailReaction("{\"emoji\":\"ok\",\"version\":1}", irt)).get())
+               .valid(),
+          "reaction: text instead of an emoji is ordinary mail");
+    check(!MimeUtils::reactionOf(parsed(gmailReaction("not json", irt)).get()).valid(),
+          "reaction: broken JSON is ordinary mail");
+    check(!MimeUtils::reactionOf(
+               parsed(gmailReaction(good, irt, "Content-Disposition: attachment\n")).get())
+               .valid(),
+          "reaction: the part as an attachment is ordinary mail");
+
+    // RFC 9078, its own example shape: a single text part.
+    const QByteArray rfc =
+        "From: Alice <alice@example.com>\n"
+        "To: Bob <bob@example.com>\n"
+        "Subject: Re: Meeting\n"
+        "Message-ID: <r2@example.com>\n"
+        "In-Reply-To: <12345@example.com>\n"
+        "MIME-Version: 1.0\n"
+        "Content-Type: text/plain; charset=utf-8\n"
+        "Content-Disposition: reaction\n"
+        "\n"
+        "\xF0\x9F\x91\x8D \xE2\x9D\xA4\xEF\xB8\x8F nope \xF0\x9F\x91\x8D\n";
+    r = MimeUtils::reactionOf(parsed(rfc).get());
+    check(r.valid() && r.emoji.size() == 2 && r.emoji.first() == thumb
+              && r.targetId == QLatin1String("12345@example.com"),
+          "reaction: RFC 9078 part, non-emoji and repeats dropped");
+
+    // What we send must be read back by both conventions, by our own reader.
+    const QByteArray replyHead =
+        "From: Bob <bob@example.com>\n"
+        "To: Alice <alice@example.com>\n"
+        "Subject: Re: Lunch\n"
+        "Message-ID: <sent-1@example.com>\n"
+        "In-Reply-To: <orig-1@example.com>\n"
+        "References: <orig-1@example.com>\n"
+        "MIME-Version: 1.0\n"
+        "Content-Type: multipart/alternative;\n"
+        " boundary=\"old\"\n"
+        "Content-Transfer-Encoding: 7Bit\n"
+        "\n";
+    const QByteArray wire =
+        MimeUtils::reactionWire(replyHead, thumb, QStringLiteral("reacted via Mailove"));
+    check(!wire.isEmpty() && !wire.contains("boundary=\"old\"")
+              && wire.count("MIME-Version:") == 1 && wire.count("Content-Disposition: reaction") == 1,
+          "reaction wire: reply headers kept, old MIME headers replaced");
+    {
+        auto sent = parsed(wire);
+        const auto sr = MimeUtils::reactionOf(sent.get());
+        check(sr.valid() && sr.emoji == QStringList{thumb}
+                  && sr.targetId == QLatin1String("orig-1@example.com"),
+              "reaction wire: reads back as a reaction");
+        check(sent->contents().size() == 3
+                  && sent->contents().at(0)->decodedText().trimmed() == thumb
+                  && sent->contents().at(1)->contentType()->mimeType()
+                         == "text/vnd.google.email-reaction+json"
+                  && sent->contents().at(2)->decodedText().contains(QLatin1String("reacted via Mailove")),
+              "reaction wire: plain emoji, Gmail part, html fallback, in that order");
+        // The Gmail part alone must carry it too (a reader ignoring RFC 9078).
+        QByteArray noDisp = wire;
+        noDisp.replace("Content-Disposition: reaction\r\n", "");
+        check(MimeUtils::reactionOf(parsed(noDisp).get()).valid(),
+              "reaction wire: Gmail's part stands on its own");
+    }
+    check(MimeUtils::reactionWire(replyHead, QStringLiteral("ok"), QString()).isEmpty(),
+          "reaction wire: refuses anything that is not one emoji");
+
+    QByteArray plain = rfc;
+    plain.replace("Content-Disposition: reaction\n", "");
+    check(!MimeUtils::reactionOf(parsed(plain).get()).valid(),
+          "reaction: an emoji-only reply without the disposition is ordinary mail");
+}
+
 int main(int argc, char **argv)
 {
     // QTextDocument::toMarkdown() asks QFontDatabase whether a block is fixed
@@ -743,6 +903,8 @@ int main(int argc, char **argv)
         check(!MimeUtils::parseCalendarInvite(QByteArrayLiteral("BEGIN:VCALENDAR\nEND:VCALENDAR\n")).valid,
               "no VEVENT, no invite");
     }
+
+    testReactions();
 
     out << (failures == 0 ? "all mime utils tests passed\n"
                           : QStringLiteral("%1 check(s) failed\n").arg(failures));

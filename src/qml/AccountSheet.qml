@@ -2175,6 +2175,7 @@ Item {
                     {label: "Compose:", key: "shortcutCompose", def: "C"},
                     {label: "Reply:", key: "shortcutReply", def: "R"},
                     {label: "Forward:", key: "shortcutForward", def: "F"},
+                    {label: "React with emoji:", key: "shortcutReact", def: "E"},
                     {label: "Attach file:", key: "shortcutAttach", def: "Ctrl+Shift+A"},
                     {label: "Send message:", key: "shortcutSend", def: "Ctrl+Return"},
                     // Acts only while undo send is enabled in General — the

@@ -180,6 +180,9 @@ class MailClient : public QObject
     Q_PROPERTY(bool debugLogging READ debugLogging WRITE setDebugLogging
                    NOTIFY debugLoggingChanged)
     Q_PROPERTY(int outboxCount READ outboxCount NOTIFY outboxChanged)
+    /// Bumped whenever a reaction is learned or sent; the message list reads
+    /// reactionEmojiOf() under it so a row's mark appears without a relist.
+    Q_PROPERTY(int reactionRevision READ reactionRevision NOTIFY reactionsChanged)
     Q_PROPERTY(bool undoSend READ undoSend WRITE setUndoSend NOTIFY undoSendChanged)
     Q_PROPERTY(qint64 undoSendDeadline READ undoSendDeadline NOTIFY undoSendDeadlineChanged)
     // A bulk send in progress, for the progress banner. All read off the
@@ -351,12 +354,18 @@ public:
     /// remote-image-laden for the editor — see quotedBody) appended to the
     /// outgoing HTML here; \a appendStrip runs the remote-content strip on it
     /// first, deferred from the open for the same reason.
+    /// \a inReplyTo and \a references are the threading headers of a reply,
+    /// exactly as replyData() handed them out ("<id>", and "<id> <id> …");
+    /// empty for a message that answers nothing. Without them a reply is a
+    /// new conversation to every client that threads by header.
     Q_INVOKABLE void sendMail(const QString &to, const QString &cc, const QString &bcc,
                               const QString &subject, const QString &html,
                               const QList<QUrl> &attachments, bool sign = false,
                               bool encrypt = false,
                               const QString &appendQuote = QString(),
-                              bool appendStrip = false);
+                              bool appendStrip = false,
+                              const QString &inReplyTo = QString(),
+                              const QString &references = QString());
     /// The bulk send (compose/bulkSend in the advanced settings): one
     /// separate message per address in \a addresses — its own To header, its
     /// own Message-ID, encrypted to that one recipient — all queued into the
@@ -399,7 +408,9 @@ public:
                                const QList<QUrl> &attachments, qint64 replacesUid = -1,
                                bool sign = false, bool encrypt = false,
                                const QString &appendQuote = QString(),
-                               bool appendStrip = false);
+                               bool appendStrip = false,
+                               const QString &inReplyTo = QString(),
+                               const QString &references = QString());
     /// Whether a Drafts folder is known, so the UI can hide the action when
     /// there is nowhere to put one.
     Q_PROPERTY(bool hasDraftsFolder READ hasDraftsFolder NOTIFY draftsFolderChanged)
@@ -815,6 +826,10 @@ public:
     /// Rows waiting (or having failed) to be sent, for the Outbox badge. The
     /// pane shows the folder only while this is non-zero.
     int outboxCount() const { return m_outboxCount; }
+    int reactionRevision() const { return m_reactionRevision; }
+    /// The emoji the message at \a uid in the open folder carries, when it is
+    /// a reaction mail whose body has been seen; "" otherwise.
+    Q_INVOKABLE QString reactionEmojiOf(qint64 uid);
     /// Whether a pressed Send is held for a few seconds before the drain may
     /// touch it, leaving a window to change your mind. Off by default; the
     /// delay is compose/undoSendDelaySecs in the advanced settings.
@@ -863,6 +878,7 @@ Q_SIGNALS:
     /// The outbox gained, lost or changed a row — the badge, the folder row's
     /// visibility and the list all read off the same rows.
     void outboxChanged();
+    void reactionsChanged();
     void undoSendChanged();
     void undoSendDeadlineChanged();
     void bulkProgressChanged();
@@ -1100,6 +1116,10 @@ private:
     /// than by the size of the folder, and skips a folder with an implausible
     /// amount of it.
     void verifyCachedUnread(const QString &folder);
+    /// The round trip behind verifyCachedUnread(), for exactly \a ids. An id
+    /// the server does not answer for is asked about once more (\a recheck)
+    /// and then removed from the cache: the message is gone from the folder.
+    void verifyUnreadIds(const QString &folder, const QStringList &ids, bool recheck);
     /// Makes the cache agree with server-reported unread counts: every listed
     /// folder the server calls fully read gets its stale cached flags cleared.
     /// See clearUnseenIn() for why they go stale in the first place.
@@ -1214,7 +1234,8 @@ private:
         const QString &to, const QString &cc, const QString &bcc, const QString &subject,
         const QString &html, const QList<QUrl> &attachments, bool strict,
         QStringList *toList = nullptr, QStringList *ccList = nullptr,
-        QStringList *bccList = nullptr);
+        QStringList *bccList = nullptr, const QString &inReplyTo = QString(),
+        const QString &references = QString());
     // --- Per-context message presentation (reading pane + detached windows) ---
     /// Corrects a listed row's OpenPGP mark from the full body — see the
     /// definition. Runs wherever refineAttachKind does.
@@ -1250,6 +1271,17 @@ private:
     // Context-parameterised backends of the public message API; MessageContext
     // delegates here (friend both ways keeps the logic in one place).
     QVariantMap replyDataFor(MessageContext *ctx, bool replyAll);
+    void sendReactionFor(MessageContext *ctx, const QString &emoji);
+    /// Fills \a ctx's reaction fields from the cache: the chips for the
+    /// message it shows, the card if it is itself a reaction, and whether one
+    /// may be sent.
+    void fillReactionsFor(MessageContext *ctx);
+    /// Why no reaction may be sent to \a msg; "" when one may.
+    QString reactBlockedReasonFor(const KMime::Message *msg, const QString &folder,
+                                  bool isReaction);
+    /// Records \a msg as a reaction if it is one. Called wherever a body
+    /// arrives, after it has been scored — mail marked as spam is not counted.
+    void noteReaction(const QString &folder, qint64 uid, KMime::Message *msg);
     QVariantMap forwardDataFor(MessageContext *ctx);
     QVariantMap forwardAsAttachmentDataFor(MessageContext *ctx);
     /// Writes \a raw out as a .eml temp file for the composer to attach,
@@ -1505,6 +1537,10 @@ private:
     QString m_pendingFolder; ///< folder to reopen after (re)connect
     QString m_sentFolder;    ///< where sent mail gets APPENDed
     QString m_draftsFolder;  ///< where "Save as draft" APPENDs
+    int m_reactionRevision = 0;
+    /// The reaction mails of one folder (uid -> emoji), loaded on first ask.
+    QString m_reactionMailFolder;
+    QHash<qint64, QString> m_reactionMail;
     /// Trash and Junk as the *server* named them (FolderInfo::role). Empty
     /// when it named neither, which is when trashFolderName()/isJunkFolder()
     /// fall back to guessing from folder names. All of these are refilled from

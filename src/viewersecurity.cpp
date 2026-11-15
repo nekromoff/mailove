@@ -352,6 +352,97 @@ QString sanitizeMessageHtml(QString html)
     return out;
 }
 
+static QString swapReactionImages(QString html, QStringList *found)
+{
+    // The cheap way out for nearly every message: the path segment has to be
+    // there in the clear for the image to have loaded in Outlook either.
+    if (!html.contains(QLatin1String("/assets/reaction/"), Qt::CaseInsensitive))
+        return html;
+
+    // File name (without extension) -> the emoji it draws and what to call it.
+    struct Reaction {
+        QString emoji;
+        QString label;
+    };
+    static const QHash<QString, Reaction> known = {
+        {QStringLiteral("like"), {QStringLiteral("\U0001F44D"), QStringLiteral("Like")}},
+        {QStringLiteral("heart"), {QStringLiteral("\u2764\uFE0F"), QStringLiteral("Heart")}},
+        {QStringLiteral("laugh"), {QStringLiteral("\U0001F606"), QStringLiteral("Laugh")}},
+        {QStringLiteral("surprised"),
+         {QStringLiteral("\U0001F62E"), QStringLiteral("Surprised")}},
+    };
+    static const QRegularExpression imgOpenRe(QStringLiteral("<img\\b"),
+                                              QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression srcRe(
+        QStringLiteral("\\bsrc\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))"),
+        QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression pathRe(
+        QStringLiteral("^/assets/reaction/([a-z0-9_-]+)\\.(?:png|svg|gif|webp)$"),
+        QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression sizeRe(
+        QStringLiteral("\\b(?:height|width)\\s*[=:]\\s*[\"']?\\s*(\\d+)"),
+        QRegularExpression::CaseInsensitiveOption);
+
+    QString out;
+    out.reserve(html.size());
+    qsizetype pos = 0;
+    for (auto it = imgOpenRe.globalMatch(html); it.hasNext();) {
+        const qsizetype lt = it.next().capturedStart();
+        if (lt < pos)
+            continue;
+        const qsizetype end = tagEnd(html, lt);
+        if (end < 0)
+            break;
+        const QString tag = html.mid(lt, end - lt);
+        const QRegularExpressionMatch src = srcRe.match(tag);
+        if (!src.hasMatch())
+            continue;
+        const QUrl url(normalizedUrl(src.captured(1) + src.captured(2) + src.captured(3)));
+        const QString scheme = url.scheme().toLower();
+        const QString host = url.host().toLower();
+        if ((scheme != QLatin1String("https") && scheme != QLatin1String("http"))
+            || !host.endsWith(QLatin1String(".cdn.office.net")))
+            continue;
+        const QRegularExpressionMatch path = pathRe.match(url.path());
+        if (!path.hasMatch())
+            continue;
+        const auto reaction = known.constFind(path.captured(1).toLower());
+        if (reaction == known.constEnd())
+            continue; // a reaction we cannot name: leave the (blocked) image
+
+        // As tall as the picture was meant to be, within reason.
+        int px = 20;
+        if (const QRegularExpressionMatch size = sizeRe.match(tag); size.hasMatch())
+            px = qBound(12, size.captured(1).toInt(), 64);
+
+        if (found)
+            found->append(reaction->emoji);
+        out.append(QStringView{html}.mid(pos, lt - pos));
+        out.append(QStringLiteral("<span title=\"%1\" style=\"font-size:%2px;line-height:1;"
+                                  "font-family:'Noto Color Emoji','Apple Color Emoji',"
+                                  "'Segoe UI Emoji',sans-serif\">%3</span>")
+                       .arg(reaction->label)
+                       .arg(px)
+                       .arg(reaction->emoji));
+        pos = end;
+    }
+    out.append(QStringView{html}.mid(pos));
+    return out;
+}
+
+QString replaceReactionImages(QString html)
+{
+    return swapReactionImages(std::move(html), nullptr);
+}
+
+QStringList reactionImageEmoji(const QString &html)
+{
+    QStringList found;
+    swapReactionImages(html, &found);
+    found.removeDuplicates();
+    return found;
+}
+
 /// The resource types a message body may legitimately pull in: things that are
 /// painted, never things that are *documents*. Anything outside this set —
 /// subframes above all — can host markup and forms of its own.

@@ -98,6 +98,12 @@ QString MessageContext::sourceViewUrl()
     return m_client ? m_client->sourceViewUrlFor(this) : QString();
 }
 
+void MessageContext::sendReaction(const QString &emoji)
+{
+    if (m_client)
+        m_client->sendReactionFor(this, emoji);
+}
+
 QVariantMap MessageContext::replyData(bool replyAll)
 {
     return m_client ? m_client->replyDataFor(this, replyAll) : QVariantMap();
@@ -168,6 +174,11 @@ void MessageContext::clear()
     m_pgpFromCache = false;
     m_attachmentParts.clear();
     m_attachments.clear();
+    m_reactions.clear();
+    m_reactionEmoji.clear();
+    m_reactionTarget.clear();
+    m_reactBlocked.clear();
+    Q_EMIT reactionsChanged();
     m_raw.clear();
     m_uid = -1;
     m_folder.clear();

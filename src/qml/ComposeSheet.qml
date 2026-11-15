@@ -261,7 +261,8 @@ Item {
         else
             Mail.sendMail(toField.text, ccField.text, bccField.text,
                           subjectField.text, bodyEdit.text, attachments,
-                          pgpSign, pgpEncrypt, resolvedAppendQuote(), appendStrip)
+                          pgpSign, pgpEncrypt, resolvedAppendQuote(), appendStrip,
+                          replyInReplyTo, replyReferences)
         markForwardedSource()
     }
 
@@ -292,7 +293,8 @@ Item {
         docHandler.flushQuoteStream()
         Mail.saveDraft(toField.text, ccField.text, bccField.text,
                        subjectField.text, bodyEdit.text, attachments,
-                       sourceDraftUid, pgpSign, pgpEncrypt, resolvedAppendQuote(), appendStrip)
+                       sourceDraftUid, pgpSign, pgpEncrypt, resolvedAppendQuote(), appendStrip,
+                       replyInReplyTo, replyReferences)
     }
 
     /// The quoted original of a reply/forward too heavy for the editor: held
@@ -302,6 +304,11 @@ Item {
     /// edit or send.
     property string appendQuote: ""
     property bool appendStrip: false
+    /// The threading headers of a reply (In-Reply-To, References), exactly as
+    /// replyData() handed them out; given back on Send and on a draft save.
+    /// Empty for anything that answers nothing — a new message, a forward.
+    property string replyInReplyTo: ""
+    property string replyReferences: ""
     /// Full-fidelity read-only rendering of appendQuote: a mailove: URL into
     /// the viewer's sandboxed pipeline, shown in the WebEngine preview pane —
     /// the user writes against what they are quoting without the editor
@@ -494,6 +501,8 @@ Item {
         forwardedUids = []
         appendQuote = ""
         appendStrip = false
+        replyInReplyTo = ""
+        replyReferences = ""
         releasePreview()
         sourceDraftUid = -1
         forwardedFolder = ""
@@ -580,6 +589,8 @@ Item {
         subjectField.text = d.subject
         bodyEdit.text = d.body
         attachments = []
+        replyInReplyTo = d.inReplyTo ? d.inReplyTo : ""
+        replyReferences = d.references ? d.references : ""
         sourceDraftUid = d.uid
         content.ccExpanded = d.cc.length > 0 || d.bcc.length > 0
         focusBodyOnOpen = true
@@ -600,6 +611,8 @@ Item {
         forwardedFolder = ""
         forwardedUids = []
         titleBase = "Reply"
+        replyInReplyTo = r.inReplyTo ? r.inReplyTo : ""
+        replyReferences = r.references ? r.references : ""
         bulkField.text = ""
         bulkMode = false
         toField.text = r.to
@@ -648,6 +661,8 @@ Item {
         forwardedFolder = ""
         forwardedUids = []
         titleBase = "Forward"
+        replyInReplyTo = ""
+        replyReferences = ""
         toField.text = r.to
         ccField.text = r.cc
         bccField.text = ""
@@ -850,7 +865,9 @@ Item {
                     else
                         Mail.sendMail(toField.text, ccField.text, bccField.text,
                                       subjectField.text, bodyEdit.text, sheet.attachments,
-                                      sheet.pgpSign, false)
+                                      sheet.pgpSign, false,
+                                      sheet.resolvedAppendQuote(), sheet.appendStrip,
+                                      sheet.replyInReplyTo, sheet.replyReferences)
                     sheet.markForwardedSource()
                 }
             }

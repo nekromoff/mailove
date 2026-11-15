@@ -282,6 +282,22 @@ bool MailStore::open()
     q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS junk_content_hashes ("
                           " hash TEXT PRIMARY KEY, added INTEGER NOT NULL DEFAULT 0)"));
 
+    // Emoji reactions (RFC 9078, and Gmail's JSON part): who answered which
+    // message with what. Keyed by the Message-ID reacted *to*, because the
+    // reaction and its target are different messages, usually in different
+    // folders, and the target is where the reaction is shown. src/src_uid
+    // name the message that carried it (empty for one sent from here before
+    // its Sent copy has been seen), so a folder's reaction mails can be
+    // marked in the list without opening them.
+    q.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS reactions ("
+                          " account TEXT NOT NULL, target TEXT NOT NULL,"
+                          " sender TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',"
+                          " emoji TEXT NOT NULL, date INTEGER NOT NULL DEFAULT 0,"
+                          " src TEXT NOT NULL DEFAULT '', src_uid INTEGER NOT NULL DEFAULT 0,"
+                          " PRIMARY KEY (account, target, sender, emoji))"));
+    q.exec(QStringLiteral(
+        "CREATE INDEX IF NOT EXISTS idx_reactions_src ON reactions (src, src_uid)"));
+
     // How much mail each sending organization has a history of here — the
     // spam scorer's familiarity signal (SpamHeuristics::Context::seenFromOrg).
     //
@@ -1915,6 +1931,17 @@ void MailStore::setAttachKind(const QString &folder, qint64 uid, int kind)
     q.addBindValue(scoped(folder));
     q.addBindValue(uid);
     q.exec();
+}
+
+int MailStore::spamScoreOf(const QString &folder, qint64 uid)
+{
+    if (!m_db.isOpen())
+        return 0;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT spam_score FROM messages WHERE folder = ? AND uid = ?"));
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    return (q.exec() && q.next()) ? q.value(0).toInt() : 0;
 }
 
 void MailStore::setAttachCounts(const QString &folder, qint64 uid, int files, int calendars)
@@ -3679,6 +3706,110 @@ static QSet<QString> lookupMessageIds(QSqlDatabase &db, const QSet<QString> &msg
 QSet<QString> MailStore::knownMessageIds(const QSet<QString> &msgids)
 {
     return lookupMessageIds(m_db, msgids, QString());
+}
+
+static QString bareMessageId(const QString &raw)
+{
+    QString id = raw.trimmed();
+    if (id.startsWith(QLatin1Char('<')) && id.endsWith(QLatin1Char('>')))
+        id = id.mid(1, id.size() - 2);
+    return id;
+}
+
+void MailStore::addReaction(const QString &target, const QString &sender, const QString &name,
+                            const QStringList &emoji, qint64 date, const QString &folder,
+                            qint64 uid)
+{
+    const QString id = bareMessageId(target);
+    const QString who = sender.trimmed().toLower();
+    if (!m_db.isOpen() || id.isEmpty() || who.isEmpty() || emoji.isEmpty())
+        return;
+    const QString src = folder.isEmpty() ? QString() : scoped(folder);
+    QSqlQuery q(m_db);
+    for (const QString &e : emoji) {
+        q.prepare(QStringLiteral(
+            "INSERT INTO reactions (account, target, sender, name, emoji, date, src, src_uid)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(account, target, sender, emoji) DO UPDATE SET"
+            " name = CASE WHEN excluded.name != '' THEN excluded.name ELSE name END,"
+            " date = excluded.date,"
+            // A known carrier is never replaced by "none": the Sent copy of a
+            // reaction made here names the message, the send itself cannot.
+            " src = CASE WHEN excluded.src != '' THEN excluded.src ELSE src END,"
+            " src_uid = CASE WHEN excluded.src != '' THEN excluded.src_uid ELSE src_uid END"));
+        q.addBindValue(m_accountKey);
+        q.addBindValue(id);
+        q.addBindValue(who);
+        q.addBindValue(name);
+        q.addBindValue(e);
+        q.addBindValue(date);
+        q.addBindValue(src);
+        q.addBindValue(uid);
+        q.exec();
+    }
+}
+
+void MailStore::removeReactionsFrom(const QString &folder, qint64 uid)
+{
+    if (!m_db.isOpen() || folder.isEmpty())
+        return;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("DELETE FROM reactions WHERE src = ? AND src_uid = ?"));
+    q.addBindValue(scoped(folder));
+    q.addBindValue(uid);
+    q.exec();
+}
+
+QList<MailStore::ReactionRow> MailStore::reactionsTo(const QString &target)
+{
+    QList<ReactionRow> out;
+    const QString id = bareMessageId(target);
+    if (!m_db.isOpen() || id.isEmpty())
+        return out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("SELECT emoji, sender, name, date FROM reactions"
+                             " WHERE account = ? AND target = ? ORDER BY date, rowid"));
+    q.addBindValue(m_accountKey);
+    q.addBindValue(id);
+    if (!q.exec())
+        return out;
+    while (q.next()) {
+        out.append({q.value(0).toString(), q.value(1).toString(), q.value(2).toString(),
+                    q.value(3).toLongLong()});
+    }
+    return out;
+}
+
+QHash<qint64, QString> MailStore::reactionMailIn(const QString &folder)
+{
+    QHash<qint64, QString> out;
+    if (!m_db.isOpen() || folder.isEmpty())
+        return out;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral(
+        "SELECT src_uid, emoji FROM reactions WHERE src = ? ORDER BY rowid"));
+    q.addBindValue(scoped(folder));
+    if (!q.exec())
+        return out;
+    while (q.next())
+        out[q.value(0).toLongLong()] += q.value(1).toString();
+    return out;
+}
+
+QString MailStore::subjectOfMessageId(const QString &msgid)
+{
+    const QString id = bareMessageId(msgid);
+    if (!m_db.isOpen() || id.isEmpty())
+        return {};
+    QSqlQuery q(m_db);
+    // The account's own copy: the same Message-ID in another account's cache
+    // is another mailbox's mail. The folder column is "<account>\x1f<path>".
+    q.prepare(QStringLiteral("SELECT subject FROM messages WHERE msgid = ?"
+                             " AND folder >= ? AND folder < ? LIMIT 1"));
+    q.addBindValue(id);
+    q.addBindValue(m_accountKey + QChar(0x1f));
+    q.addBindValue(m_accountKey + QChar(0x20));
+    return (q.exec() && q.next()) ? q.value(0).toString() : QString();
 }
 
 void MailStore::setNotSpamSender(const QString &address, bool notSpam)

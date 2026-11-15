@@ -106,6 +106,50 @@ void collectBodies(KMime::Content *node, QString *text, QString *html);
 /// reader is being invited to click.
 void collectAttachments(KMime::Content *node, QStringList *names);
 
+// --- emoji reactions ---------------------------------------------------------
+
+/// What a reaction message says: which emoji, about which message.
+struct Reaction {
+    QStringList emoji;  ///< distinct, in the order written; Gmail's form has one
+    QString targetId;   ///< the Message-ID reacted to, without angle brackets
+    bool valid() const { return !emoji.isEmpty() && !targetId.isEmpty(); }
+};
+
+/// Reads \a msg as an emoji reaction, in either form in use:
+///
+///  - Gmail's: a `text/vnd.google.email-reaction+json` part holding
+///    {"emoji":"👍","version":1}, at the top level or inside a multipart, not
+///    marked as an attachment;
+///  - RFC 9078's: a text/plain part with `Content-Disposition: reaction`, at
+///    the top level or the first level of a multipart, holding emoji separated
+///    by whitespace. Anything on that line that is not an emoji is dropped on
+///    its own, as the RFC asks; the rest still count.
+///
+/// Both tie the reaction to the message named by In-Reply-To, which must name
+/// exactly one. A message failing any of this is an ordinary message — the
+/// result is then !valid(), and the caller shows it as the mail it is.
+Reaction reactionOf(KMime::Message *msg);
+
+/// The complete message to send as a reaction, CRLF line ends.
+///
+/// \a head is an assembled header block for the reply (From, To, Subject,
+/// Message-ID, In-Reply-To, …); its MIME headers are replaced. The body is
+/// one multipart/alternative that both conventions read:
+///
+///  1. text/plain with Content-Disposition: reaction, holding only the emoji
+///     (RFC 9078 — and what a client knowing neither convention shows);
+///  2. Gmail's text/vnd.google.email-reaction+json part;
+///  3. text/html, the emoji large with \a note beneath it — what Outlook and
+///     every other client that has no notion of reactions displays.
+///
+/// That order is the one Gmail documents. Empty when \a emoji is not one.
+QByteArray reactionWire(const QByteArray &head, const QString &emoji, const QString &note);
+
+/// True when \a s is one emoji as a reader would count it: a single grapheme
+/// cluster (so a flag, a skin-toned hand or a ZWJ family is one) made of
+/// emoji code points and their joiners, with no letters hiding in it.
+bool isSingleEmoji(const QString &s);
+
 /// The subject a reply carries: exactly one "Re: " in front of the original's
 /// text. Every leading reply marker is cut first — "Re: re: RE:", "Re[2]:",
 /// "Re :", and the localized ones other clients write ("AW:", "SV:", "Odp:",

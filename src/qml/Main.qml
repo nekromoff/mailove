@@ -738,6 +738,24 @@ Kirigami.ApplicationWindow {
             onTriggered: unread ? Mail.markMessagesRead(messageMenu.rows)
                                 : Mail.markMessagesUnread(messageMenu.rows)
         }
+        // Same gate as Copy as Markdown below: a reaction answers the *open*
+        // message (its headers decide who receives it and whether it may be
+        // sent at all), and a right-click follows the open message in practice.
+        QQC2.Menu {
+            title: "React" + root.keyHint(uiSettings.shortcutReact)
+            enabled: messageMenu.rowCount === 1
+                     && Mail.messageModel.uidAt(messageMenu.rows[0]) === messageList.openedUid
+                     && Mail.readingContext.hasMessage
+                     && Mail.readingContext.reactBlockedReason === ""
+            Repeater {
+                model: ["👍", "❤️", "😂", "🎉", "🙏", "😮"]
+                QQC2.MenuItem {
+                    required property string modelData
+                    text: modelData
+                    onTriggered: Mail.readingContext.sendReaction(modelData)
+                }
+            }
+        }
         QQC2.MenuSeparator {}
         // Goes through the list's own handlers rather than calling Mail
         // directly, so the menu and the keyboard shortcuts cannot drift apart —
@@ -3754,8 +3772,15 @@ Kirigami.ApplicationWindow {
                                         // What is painted: demo mode's fake words,
                                         // or the real values. Everything that acts on
                                         // a row reads subject and from, never these.
+                                        /// The emoji a reaction mail carries, once its body
+                                        /// has been seen — it leads the subject, since "Re: X"
+                                        /// alone says nothing of what the message is.
+                                        required property var uid
+                                        readonly property string reactionMark:
+                                            (Mail.reactionRevision, Mail.reactionEmojiOf(uid))
                                         readonly property string shownSubject:
-                                            Demo.on ? Demo.text(subject) : subject
+                                            (reactionMark !== "" ? reactionMark + " " : "")
+                                            + (Demo.on ? Demo.text(subject) : subject)
                                         readonly property string shownCorrespondent:
                                             Demo.on ? Demo.text(correspondent) : correspondent
                                         required property bool seen
@@ -4325,6 +4350,7 @@ Kirigami.ApplicationWindow {
                             // tab has its own viewer, and both answering Find
                             // or View source makes the shortcut ambiguous.
                             shortcutsActive: tabStack.currentIndex === 0
+                            letterShortcutsLive: root.messageShortcutsLive
                             // The viewer is the pane that takes the leftovers in
                             // either layout; SplitView reads whichever of these
                             // matches its orientation and ignores the other.

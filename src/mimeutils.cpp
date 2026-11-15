@@ -6,6 +6,9 @@
 #include "attachmentstore.h"
 
 #include <QHash>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QTextBoundaryFinder>
 #include <QLocale>
 #include <QRegularExpression>
 #include <QTimeZone>
@@ -381,6 +384,209 @@ QString forwardSubject(const QString &subject)
                                  "πρθ|пересл|הועבר|转发|轉寄|轉發|転送|전달")),
         QRegularExpression::CaseInsensitiveOption);
     return withSinglePrefix(subject, leading, QStringLiteral("Fwd: "));
+}
+
+bool isSingleEmoji(const QString &s)
+{
+    // The longest sequences in use (a four-person ZWJ family with skin tones,
+    // a subdivision flag) stay well under this; anything longer is prose.
+    if (s.isEmpty() || s.size() > 40)
+        return false;
+    QTextBoundaryFinder finder(QTextBoundaryFinder::Grapheme, s);
+    if (finder.toNextBoundary() != s.size())
+        return false;
+    const QList<uint> cps = s.toUcs4();
+    bool pictographic = false;
+    bool keycapBase = false;
+    bool keycap = false;
+    for (const uint c : cps) {
+        if (c == 0x200D || c == 0xFE0F || c == 0xFE0E      // joiner, presentation
+            || (c >= 0x1F3FB && c <= 0x1F3FF)              // skin tone
+            || (c >= 0xE0020 && c <= 0xE007F))             // subdivision-flag tags
+            continue;
+        if (c == 0x20E3) {
+            keycap = true;
+            continue;
+        }
+        if ((c >= '0' && c <= '9') || c == '#' || c == '*') {
+            keycapBase = true;
+            continue;
+        }
+        const bool emoji = (c >= 0x1F000 && c <= 0x1FAFF) // pictographs, flags, symbols
+            || (c >= 0x2600 && c <= 0x27BF)               // misc symbols, dingbats
+            || (c >= 0x2190 && c <= 0x21FF) || (c >= 0x2300 && c <= 0x23FF)
+            || (c >= 0x25A0 && c <= 0x25FF) || (c >= 0x2900 && c <= 0x297F)
+            || (c >= 0x2B00 && c <= 0x2BFF) || c == 0x00A9 || c == 0x00AE
+            || c == 0x203C || c == 0x2049 || c == 0x2122 || c == 0x2139
+            || c == 0x24C2 || c == 0x3030 || c == 0x303D || c == 0x3297 || c == 0x3299;
+        if (!emoji)
+            return false;
+        pictographic = true;
+    }
+    // A bare digit is a digit; it is an emoji only as a keycap (1️⃣).
+    if (keycapBase)
+        return keycap && !pictographic;
+    return pictographic;
+}
+
+namespace {
+
+/// The one Message-ID an In-Reply-To names, or empty when it names none or
+/// several — a reaction to "one of these" is not a reaction to anything.
+QString singleInReplyTo(const KMime::Message *msg)
+{
+    const auto *irt = msg->inReplyTo();
+    if (!irt)
+        return {};
+    static const QRegularExpression idRe(QStringLiteral("<([^<>\\s]+)>"));
+    auto it = idRe.globalMatch(QString::fromLatin1(irt->as7BitString()));
+    if (!it.hasNext())
+        return {};
+    const QString id = it.next().captured(1);
+    return it.hasNext() ? QString() : id;
+}
+
+bool isAttachmentPart(const KMime::Content *part)
+{
+    const auto *cd = part->contentDisposition();
+    return cd && cd->disposition() == KMime::Headers::CDattachment;
+}
+
+/// Gmail's part: exactly {"emoji": one emoji, "version": 1}.
+QString googleReactionEmoji(KMime::Content *part)
+{
+    const auto *ct = std::as_const(*part).contentType();
+    if (!ct || ct->mimeType().toLower() != "text/vnd.google.email-reaction+json"
+        || isAttachmentPart(part))
+        return {};
+    const QJsonObject o = QJsonDocument::fromJson(part->decodedBody()).object();
+    const QJsonValue version = o.value(QLatin1String("version"));
+    // An integer 1, as the format says: "1" the string and 1.5 are not it.
+    if (!version.isDouble() || version.toDouble() != 1.0)
+        return {};
+    const QString emoji = o.value(QLatin1String("emoji")).toString();
+    return isSingleEmoji(emoji) ? emoji : QString();
+}
+
+/// RFC 9078's part: text/plain, Content-Disposition: reaction.
+QStringList rfcReactionEmoji(KMime::Content *part)
+{
+    // KMime's parser knows inline and attachment only and reads anything
+    // else as no disposition at all, so the token is taken from the header
+    // block as written.
+    static const QRegularExpression dispRe(
+        QStringLiteral("(?:^|\\n)Content-Disposition:\\s*reaction\\s*(?:;|\\r?\\n|$)"),
+        QRegularExpression::CaseInsensitiveOption);
+    if (!dispRe.match(QString::fromLatin1(part->head())).hasMatch())
+        return {};
+    const auto *ct = std::as_const(*part).contentType();
+    if (ct && !ct->isEmpty() && ct->mimeType().toLower() != "text/plain")
+        return {};
+    QStringList out;
+    static const QRegularExpression ws(QStringLiteral("\\s+"));
+    const QStringList tokens = part->decodedText().split(ws, Qt::SkipEmptyParts);
+    for (const QString &t : tokens) {
+        if (isSingleEmoji(t) && !out.contains(t))
+            out.append(t);
+    }
+    return out;
+}
+
+} // namespace
+
+Reaction reactionOf(KMime::Message *msg)
+{
+    Reaction r;
+    if (!msg)
+        return r;
+    const QString target = singleInReplyTo(msg);
+    if (target.isEmpty())
+        return r;
+    // Top level, then the first level of a multipart — and for Gmail's part,
+    // whose type cannot be mistaken for anything else, one level further, so
+    // a relay that wrapped the alternative in a mixed part does not hide it.
+    QList<KMime::Content *> first = msg->contents();
+    if (first.isEmpty())
+        first.append(msg);
+    QList<KMime::Content *> second;
+    for (KMime::Content *c : std::as_const(first))
+        second += c->contents();
+    for (KMime::Content *c : first + second) {
+        if (const QString e = googleReactionEmoji(c); !e.isEmpty()) {
+            r.emoji = {e};
+            r.targetId = target;
+            return r;
+        }
+    }
+    for (KMime::Content *c : std::as_const(first)) {
+        if (!c->contents().isEmpty())
+            continue;
+        if (const QStringList e = rfcReactionEmoji(c); !e.isEmpty()) {
+            r.emoji = e;
+            r.targetId = target;
+            return r;
+        }
+    }
+    return r;
+}
+
+QByteArray reactionWire(const QByteArray &head, const QString &emoji, const QString &note)
+{
+    if (!isSingleEmoji(emoji))
+        return {};
+    // The reply's own headers, minus whatever described the body it was
+    // assembled with: this message brings its own.
+    QByteArray out;
+    {
+        QByteArray lf = head;
+        lf.replace("\r\n", "\n");
+        bool skipping = false;
+        const QList<QByteArray> lines = lf.split('\n');
+        for (const QByteArray &line : lines) {
+            if (line.isEmpty())
+                break; // end of the header block
+            const bool continuation = line.startsWith(' ') || line.startsWith('\t');
+            if (!continuation) {
+                const QByteArray lower = line.toLower();
+                skipping = lower.startsWith("content-") || lower.startsWith("mime-version:");
+            }
+            if (!skipping)
+                out += line + "\r\n";
+        }
+    }
+    const QByteArray boundary =
+        "mailove-reaction-" + QUuid::createUuid().toByteArray(QUuid::Id128);
+    const QByteArray utf8 = emoji.toUtf8();
+    QByteArray qp;
+    for (const char c : utf8)
+        qp += '=' + QByteArray::number(uchar(c), 16).toUpper().rightJustified(2, '0');
+    const QByteArray html =
+        "<div style=\"font-size:32px;line-height:1.2\">" + utf8 + "</div>"
+        + (note.isEmpty() ? QByteArray()
+                          : "<div style=\"color:#666;font-size:12px\">"
+                                + note.toHtmlEscaped().toUtf8() + "</div>");
+
+    out += "MIME-Version: 1.0\r\n"
+           "Content-Type: multipart/alternative; boundary=\"" + boundary + "\"\r\n"
+           "\r\n"
+           "--" + boundary + "\r\n"
+           "Content-Type: text/plain; charset=utf-8\r\n"
+           "Content-Disposition: reaction\r\n"
+           "Content-Transfer-Encoding: base64\r\n"
+           "\r\n"
+           + utf8.toBase64() + "\r\n"
+           "--" + boundary + "\r\n"
+           "Content-Type: text/vnd.google.email-reaction+json; charset=\"UTF-8\"\r\n"
+           "Content-Transfer-Encoding: quoted-printable\r\n"
+           "\r\n"
+           "{\"emoji\":\"" + qp + "\",\"version\":1}\r\n"
+           "--" + boundary + "\r\n"
+           "Content-Type: text/html; charset=utf-8\r\n"
+           "Content-Transfer-Encoding: base64\r\n"
+           "\r\n"
+           + html.toBase64() + "\r\n"
+           "--" + boundary + "--\r\n";
+    return out;
 }
 
 void collectAttachments(KMime::Content *node, QStringList *names)

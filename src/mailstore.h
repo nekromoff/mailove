@@ -215,6 +215,8 @@ public:
     /// The stored verdict state, or 0 when the message is not cached. Read
     /// before a body-stage re-score, which must leave state 3 alone.
     int spamStateOf(const QString &folder, qint64 uid);
+    /// The stored score beside it, 0 when there is none.
+    int spamScoreOf(const QString &folder, qint64 uid);
     /// Marks a cached header as read, so the state survives a restart even
     /// before the next header sync confirms it from the server.
     void setSeen(const QString &folder, qint64 uid);
@@ -601,6 +603,29 @@ public:
     /// known-contact-spoofed — accepted deliberately, because the alternative is
     /// a "Not spam" button that does not work on the mail it is pressed on.
     void setNotSpamSender(const QString &address, bool notSpam);
+
+    // --- emoji reactions ---------------------------------------------------
+    struct ReactionRow {
+        QString emoji;
+        QString sender; ///< addr-spec, lower case
+        QString name;   ///< display name, may be empty
+        qint64 date = 0;
+    };
+    /// Records that \a sender answered the message \a target (a Message-ID)
+    /// with \a emoji. \a folder / \a uid name the message that carried the
+    /// reaction; empty for one just sent from here. One row per sender and
+    /// emoji, so seeing the same reaction mail twice changes nothing.
+    void addReaction(const QString &target, const QString &sender, const QString &name,
+                     const QStringList &emoji, qint64 date, const QString &folder, qint64 uid);
+    /// Forgets what the message at \a folder / \a uid said — it turned out
+    /// to be spam, or not a reaction after all.
+    void removeReactionsFrom(const QString &folder, qint64 uid);
+    /// Everything said about \a target in this account, oldest first.
+    QList<ReactionRow> reactionsTo(const QString &target);
+    /// The reaction mails of \a folder: uid -> the emoji it carries.
+    QHash<qint64, QString> reactionMailIn(const QString &folder);
+    /// The cached subject of the message with this Message-ID, "" if unknown.
+    QString subjectOfMessageId(const QString &msgid);
 
     /// The junk-content corpus: normalized plain-text fingerprints
     /// (SpamHeuristics::contentHash()) of messages the user moved to spam —

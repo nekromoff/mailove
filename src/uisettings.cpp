@@ -48,6 +48,7 @@ const QList<Knob> &knobs()
         {QLatin1StringView("shortcutCompose"), QStringLiteral("C")},
         {QLatin1StringView("shortcutReply"), QStringLiteral("R")},
         {QLatin1StringView("shortcutForward"), QStringLiteral("F")},
+        {QLatin1StringView("shortcutReact"), QStringLiteral("E")},
         {QLatin1StringView("shortcutSelect"), QStringLiteral("Ins")},
         {QLatin1StringView("shortcutAttach"), QStringLiteral("Ctrl+Shift+A")},
         {QLatin1StringView("shortcutSend"), QStringLiteral("Ctrl+Return")},

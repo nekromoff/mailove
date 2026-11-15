@@ -51,6 +51,15 @@ class MessageContext : public QObject
     Q_PROPERTY(QString bodyUrl READ bodyUrl NOTIFY messageChanged)
     /// [{name, sizeText}, …] of this message's attachments.
     Q_PROPERTY(QVariantList attachments READ attachments NOTIFY messageChanged)
+    /// Emoji reactions to this message, one entry per emoji:
+    /// {emoji, count, who (names, comma separated), mine}.
+    Q_PROPERTY(QVariantList reactions READ reactions NOTIFY reactionsChanged)
+    /// Non-empty when this message *is* a reaction: the emoji it carries.
+    Q_PROPERTY(QString reactionEmoji READ reactionEmoji NOTIFY reactionsChanged)
+    /// The subject of the message it reacts to, "" when that is not cached.
+    Q_PROPERTY(QString reactionTarget READ reactionTarget NOTIFY reactionsChanged)
+    /// Why a reaction cannot be sent to this message; "" when it can.
+    Q_PROPERTY(QString reactBlockedReason READ reactBlockedReason NOTIFY reactionsChanged)
     /// True when the message came from a junk/spam folder: plain text by
     /// default, HTML only on explicit request.
     Q_PROPERTY(bool junkTextOnly READ junkTextOnly NOTIFY messageChanged)
@@ -137,6 +146,10 @@ public:
     QString authInfo() const { return m_authInfo; }
     QString bodyUrl() const { return m_bodyUrl; }
     QVariantList attachments() const { return m_attachments; }
+    QVariantList reactions() const { return m_reactions; }
+    QString reactionEmoji() const { return m_reactionEmoji; }
+    QString reactionTarget() const { return m_reactionTarget; }
+    QString reactBlockedReason() const { return m_reactBlocked; }
     bool junkTextOnly() const { return m_junk; }
     bool quotePlainText() const { return m_quotePlain; }
     void setQuotePlainText(bool plain)
@@ -180,6 +193,10 @@ public:
     Q_INVOKABLE QVariantMap replyData(bool replyAll);
     /// Compose prefill for forwarding this message — see MailClient::forwardData.
     Q_INVOKABLE QVariantMap forwardData();
+    /// Answers this message with one emoji (RFC 9078 + Gmail's format), to
+    /// everyone a reply-all would reach. Does nothing, with a status line
+    /// saying why, when reactBlockedReason is set.
+    Q_INVOKABLE void sendReaction(const QString &emoji);
     /// Compose prefill for forwarding this message as a message/rfc822
     /// attachment — see MailClient::forwardAsAttachmentData.
     Q_INVOKABLE QVariantMap forwardAsAttachmentData();
@@ -200,6 +217,7 @@ Q_SIGNALS:
     void messageChanged();
     void remoteContentAllowedChanged();
     void quotePlainTextChanged();
+    void reactionsChanged();
     void dkimChanged();
     void cryptoChanged();
 
@@ -254,6 +272,10 @@ private:
     bool m_plaintextHeld = false;
     QList<KMime::Content *> m_attachmentParts; ///< owned by m_message
     QVariantList m_attachments;
+    QVariantList m_reactions;
+    QString m_reactionEmoji;
+    QString m_reactionTarget;
+    QString m_reactBlocked;
     QString m_htmlBody;  ///< raw HTML part
     QString m_textBody;  ///< plain-text part
     QByteArray m_raw;    ///< complete RFC-822 source

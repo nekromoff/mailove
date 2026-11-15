@@ -33,6 +33,22 @@
   </categories>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.9.0" date="2026-11-15" type="stable">
+      <description>
+        <ul>
+          <li>React to messages with an emoji; reactions from Gmail,
+              RFC 9078 clients and Outlook show on the message they
+              answer.</li>
+          <li>Replies thread correctly in other mail clients.</li>
+          <li>Messages deleted or moved elsewhere no longer linger as
+              unread.</li>
+          <li>Notes to yourself from Gmail's web interface are no longer
+              flagged as spam.</li>
+          <li>AppImage starts on systems with a newer NSS (Fedora,
+              openSUSE).</li>
+        </ul>
+      </description>
+    </release>
     <release version="3.8.2" date="2026-11-02" type="stable">
       <description>
         <ul>

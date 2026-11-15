@@ -2062,6 +2062,36 @@ void MailClient::switchAccountInternal(int index, const QString &sessionPassword
         m_connectWhenReady = true;
 }
 
+/// The "<id>" tokens in \a raw, space-joined, at most the last \a max of them.
+/// Everything that is not a bracketed id — line breaks above all — is dropped.
+static QByteArray cleanMessageIds(const QString &raw, int max)
+{
+    static const QRegularExpression idRe(QStringLiteral("<[^<>\\s]+>"));
+    QList<QByteArray> ids;
+    for (auto it = idRe.globalMatch(raw); it.hasNext();) {
+        const QByteArray id = it.next().captured(0).toLatin1();
+        if (!ids.contains(id))
+            ids.append(id);
+    }
+    // The oldest ancestors go first when a thread is longer than is worth
+    // carrying; the recent ones are what a client threads by.
+    while (ids.size() > max)
+        ids.removeFirst();
+    return ids.join(' ');
+}
+
+/// The threading headers \a msg carries, in the shape sendMail() takes them
+/// back: what a reply to nothing in particular is reopened with.
+static void threadHeadersOf(const KMime::Message *msg, QVariantMap *out)
+{
+    const auto *irt = msg->inReplyTo();
+    const auto *refs = msg->references();
+    out->insert(QStringLiteral("inReplyTo"),
+                irt ? QString::fromLatin1(irt->as7BitString()) : QString());
+    out->insert(QStringLiteral("references"),
+                refs ? QString::fromLatin1(refs->as7BitString()) : QString());
+}
+
 /// The MIME construction shared by sendMail() and saveDraft(). \a strict is
 /// what separates them: sending refuses a malformed recipient, while a draft
 /// is saved from whatever is on screen — including an address halfway through
@@ -2069,7 +2099,8 @@ void MailClient::switchAccountInternal(int index, const QString &sessionPassword
 std::shared_ptr<KMime::Message> MailClient::composeMessage(
     const QString &to, const QString &cc, const QString &bcc, const QString &subject,
     const QString &html, const QList<QUrl> &attachments, bool strict,
-    QStringList *toOut, QStringList *ccOut, QStringList *bccOut)
+    QStringList *toOut, QStringList *ccOut, QStringList *bccOut,
+    const QString &inReplyTo, const QString &references)
 {
     // Defense against header/SMTP-command injection: no CR/LF survives into a
     // header. Everything past that is KMime's RFC 5322 address parser rather
@@ -2180,6 +2211,12 @@ std::shared_ptr<KMime::Message> MailClient::composeMessage(
     msg->messageID()->generate(idDomain.toUtf8());
     msg->userAgent()->fromUnicodeString(
         QStringLiteral("mailove/" MAILOVE_VERSION " (https://github.com/nekromoff/mailove)"));
+    // What this answers. Only well-formed <id> tokens are written — the values
+    // come back from the composer, and a header is no place for anything else.
+    if (const QByteArray ids = cleanMessageIds(inReplyTo, 1); !ids.isEmpty())
+        msg->inReplyTo()->from7BitString(ids);
+    if (const QByteArray ids = cleanMessageIds(references, 30); !ids.isEmpty())
+        msg->references()->from7BitString(ids);
 
     // Images pasted into the body are local files while the composer is open —
     // that is the only kind of reference a QTextDocument renders. They travel
@@ -2580,7 +2617,8 @@ static QString appendQuoteHtml(QString html, QString quote, bool strip)
 void MailClient::sendMail(const QString &to, const QString &cc, const QString &bcc,
                           const QString &subject, const QString &html,
                           const QList<QUrl> &attachments, bool sign, bool encrypt,
-                          const QString &appendQuote, bool appendStrip)
+                          const QString &appendQuote, bool appendStrip,
+                          const QString &inReplyTo, const QString &references)
 {
     const bool haveCredential = m_acct.authType != 0
         ? !m_accounts.accessToken().isEmpty()
@@ -2601,7 +2639,8 @@ void MailClient::sendMail(const QString &to, const QString &cc, const QString &b
     QStringList toList, ccList, bccList;
     auto msg = composeMessage(to, cc, bcc, subject,
                               appendQuoteHtml(html, appendQuote, appendStrip),
-                              attachments, true, &toList, &ccList, &bccList);
+                              attachments, true, &toList, &ccList, &bccList,
+                              inReplyTo, references);
     if (!msg)
         return;
     if (toList.isEmpty()) {
@@ -2908,7 +2947,8 @@ void MailClient::saveDraft(const QString &to, const QString &cc, const QString &
                            const QString &subject, const QString &html,
                            const QList<QUrl> &attachments, qint64 replacesUid,
                            bool sign, bool encrypt,
-                           const QString &appendQuote, bool appendStrip)
+                           const QString &appendQuote, bool appendStrip,
+                           const QString &inReplyTo, const QString &references)
 {
     if (!connected()) {
         Q_EMIT sendFailed(tr("Cannot save a draft while offline."));
@@ -2925,7 +2965,8 @@ void MailClient::saveDraft(const QString &to, const QString &cc, const QString &
     // content it promises to send would be silent data loss.
     auto msg = composeMessage(to, cc, bcc, subject,
                               appendQuoteHtml(html, appendQuote, appendStrip),
-                              attachments, false);
+                              attachments, false, nullptr, nullptr, nullptr,
+                              inReplyTo, references);
     if (!msg)
         return;
 
@@ -3418,6 +3459,31 @@ QString MailClient::loadHtmlFile(const QUrl &fileUrl)
     return QString::fromUtf8(file.readAll());
 }
 
+/// The threading headers a response to \a msg carries (RFC 5322 §3.6.4):
+/// In-Reply-To is the original's Message-ID; References is the original's
+/// References — or, lacking those, its In-Reply-To — with that id appended.
+/// Both empty when the original has no Message-ID to point at.
+struct ThreadRef {
+    QString inReplyTo;
+    QString references;
+};
+static ThreadRef threadRefFor(const KMime::Message *msg)
+{
+    ThreadRef out;
+    const auto *mid = msg->messageID();
+    if (!mid || mid->isEmpty())
+        return out;
+    const QString id = QString::fromLatin1(mid->as7BitString());
+    QString chain;
+    if (const auto *refs = msg->references(); refs && !refs->isEmpty())
+        chain = QString::fromLatin1(refs->as7BitString());
+    else if (const auto *irt = msg->inReplyTo(); irt && !irt->isEmpty())
+        chain = QString::fromLatin1(irt->as7BitString());
+    out.inReplyTo = id;
+    out.references = chain.isEmpty() ? id : chain + QLatin1Char(' ') + id;
+    return out;
+}
+
 QVariantMap MailClient::replyData(bool replyAll)
 {
     return replyDataFor(m_reading, replyAll);
@@ -3517,6 +3583,8 @@ QVariantMap MailClient::replyDataFor(MessageContext *ctx, bool replyAll)
     const QString previewUrl = appendQuote.isEmpty()
         ? QString() : m_presenter->composePreviewUrl(ctx, &previewSlot);
 
+    const ThreadRef thread = threadRefFor(msg);
+
     return {{QStringLiteral("to"), to.join(QStringLiteral(", "))},
             {QStringLiteral("cc"), cc.join(QStringLiteral(", "))},
             {QStringLiteral("subject"), subject},
@@ -3525,6 +3593,10 @@ QVariantMap MailClient::replyDataFor(MessageContext *ctx, bool replyAll)
             {QStringLiteral("appendStrip"), appendStrip},
             {QStringLiteral("quotePreviewUrl"), previewUrl},
             {QStringLiteral("quotePreviewSlot"), previewSlot},
+            // What this answers, handed back on Send (and on a draft save) so
+            // the reply threads under its original at the other end.
+            {QStringLiteral("inReplyTo"), thread.inReplyTo},
+            {QStringLiteral("references"), thread.references},
             // What this is a forward OF, so the composer can hand it back on
             // Send and the original gets its $Forwarded mark. Carried through
             // the prefill rather than remembered here: several composers can
@@ -3585,6 +3657,10 @@ QVariantMap MailClient::draftData()
         setStatus(tr("⏳ Large draft — its content loads progressively."));
     }
 
+    // A draft of a reply stays a reply across a save and a reopen.
+    QVariantMap thread;
+    threadHeadersOf(msg, &thread);
+
     return {{QStringLiteral("to"), addressesOf(msg->to()).join(QStringLiteral(", "))},
             {QStringLiteral("cc"), addressesOf(msg->cc()).join(QStringLiteral(", "))},
             {QStringLiteral("bcc"), addressesOf(msg->bcc()).join(QStringLiteral(", "))},
@@ -3592,6 +3668,8 @@ QVariantMap MailClient::draftData()
              msg->subject() ? msg->subject()->asUnicodeString() : QString()},
             {QStringLiteral("body"), body},
             {QStringLiteral("bodyChunks"), bodyChunks},
+            {QStringLiteral("inReplyTo"), thread.value(QStringLiteral("inReplyTo"))},
+            {QStringLiteral("references"), thread.value(QStringLiteral("references"))},
             {QStringLiteral("uid"), ctx->m_uid}};
 }
 
@@ -6678,21 +6756,65 @@ void MailClient::verifyCachedUnread(const QString &folder)
     ids.reserve(unseen.size());
     for (const MailStore::AgedMessage &m : unseen)
         ids.append(m.remoteId);
+    verifyUnreadIds(folder, ids, false);
+}
+
+void MailClient::verifyUnreadIds(const QString &folder, const QStringList &ids, bool recheck)
+{
+    if (ids.isEmpty() || !connected() || !m_backend || folderHasPendingOps(folder))
+        return;
     const int asked = ids.size();
     m_backend->fetchHeadersById(folder, ids,
-                                [this, folder, asked](MailBackend::Error error, const QString &) {
+                                [this, folder, ids, asked, recheck](MailBackend::Error error,
+                                                                    const QString &) {
         // Drained whether or not it worked: left behind, these rows would be
         // handed to whatever asks for this folder's pending headers next.
         const QList<MessageListModel::Header> fetched = m_sync->takePendingHeaders(folder);
-        if (error != MailBackend::Error::None || fetched.isEmpty()) {
-            // Both of these leave the badge exactly as it was, which is the
-            // shape every "supposedly fixed" report has taken: the correction
-            // ran and corrected nothing, and said nothing about it.
-            qCWarning(logUnread) << "verify" << folder << "answered nothing —"
-                                 << "error" << int(error) << ", headers" << fetched.size()
-                                 << "of" << asked << "asked; the badge stands unchecked";
+        if (error != MailBackend::Error::None) {
+            qCWarning(logUnread) << "verify" << folder << "failed — error" << int(error)
+                                 << "; the badge stands unchecked";
             return;
         }
+        // The rows the server said nothing about. A fetch that succeeds and
+        // leaves an id unanswered is the server saying the message is not in
+        // this folder any more — over IMAP the only notice of a deletion made
+        // elsewhere there will ever be, since nothing pushes one. This used
+        // to be logged as "answered nothing" and left alone, which kept a
+        // ghost: an unread row counted in the badge whose body could never be
+        // loaded. The usual maker is Gmail, where moving a message to Spam or
+        // Trash from one label removes it from every other label's folder.
+        QSet<QString> answered;
+        answered.reserve(fetched.size());
+        for (const MessageListModel::Header &h : fetched)
+            answered.insert(h.remoteId.isEmpty() ? QString::number(h.uid) : h.remoteId);
+        QStringList missing;
+        for (const QString &id : ids) {
+            if (!id.isEmpty() && !answered.contains(id))
+                missing.append(id);
+        }
+        if (!missing.isEmpty()) {
+            if (!recheck) {
+                // Asked twice before anything is removed. The pending-header
+                // buffer is shared per folder, so an answer can be taken by
+                // another reader in the same moment; a second question a few
+                // seconds later, about just these, cannot be explained that way.
+                qCInfo(logUnread) << "verify" << folder << ":" << missing.size() << "of"
+                                  << asked << "unanswered — asking once more before"
+                                  << "calling them gone";
+                QTimer::singleShot(4000, this, [this, folder, missing, account = accountKey()] {
+                    if (account == accountKey())
+                        verifyUnreadIds(folder, missing, true);
+                });
+            } else if (!folderHasPendingOps(folder)) {
+                qCInfo(logUnread) << "verify" << folder << ":" << missing.size()
+                                  << "cached rows are no longer on the server — removed";
+                m_sync->applyMessagesVanished(folder, missing);
+                invalidateMissingBodies();
+                scheduleUnreadRecount();
+            }
+        }
+        if (fetched.isEmpty())
+            return;
         // Straight to the cache. Not through the model: this is a background
         // correction of rows the user is not looking at, and appending to the
         // visible list would reorder it under them.
@@ -7566,6 +7688,345 @@ void MailClient::ensureAttachmentCount(int row)
     // as a plain attachment set and would show one glyph where it has two.
     m_store.setAttachKind(m_selectedFolder, uid, kind);
     m_messageModel.setAttachKind(uid, kind);
+}
+
+// --- emoji reactions ----------------------------------------------------------
+
+/// What \a msg reacts with and to, in any of the three shapes in the wild:
+/// the two real formats (MimeUtils::reactionOf), and Outlook's notification —
+/// an ordinary HTML mail whose only statement is a reaction picture. Exchange
+/// keeps its reactions to itself and mails this instead, so it is the one way
+/// a reaction from Outlook ever reaches another client.
+///
+/// A notification is tied to the message it names in In-Reply-To when it
+/// names exactly one. Without that it is still marked as a reaction in the
+/// list and the viewer; it just cannot be shown on its original, and the
+/// target is then a key of its own that no message answers to.
+static MimeUtils::Reaction reactionCarriedBy(KMime::Message *msg)
+{
+    MimeUtils::Reaction r = MimeUtils::reactionOf(msg);
+    if (r.valid() || !msg)
+        return r;
+    KMime::Content *htmlPart = msg->mainBodyPart("text/html");
+    if (!htmlPart)
+        htmlPart = MimeUtils::findPartByType(msg, "text/html");
+    if (!htmlPart)
+        return r;
+    const QStringList emoji = reactionImageEmoji(htmlPart->decodedText());
+    if (emoji.isEmpty())
+        return r;
+    const auto *irt = std::as_const(*msg).inReplyTo();
+    const QList<QByteArray> ids =
+        cleanMessageIds(irt ? QString::fromLatin1(irt->as7BitString()) : QString(), 2)
+            .split(' ');
+    if (ids.size() == 1 && ids.first().size() > 2) {
+        r.targetId = QString::fromLatin1(ids.first().mid(1, ids.first().size() - 2));
+    } else if (const auto *mid = std::as_const(*msg).messageID(); mid && !mid->isEmpty()) {
+        r.targetId = QStringLiteral("notice:") + QString::fromLatin1(mid->identifier());
+    } else {
+        return r;
+    }
+    r.emoji = {emoji.first()};
+    return r;
+}
+
+QString MailClient::reactionEmojiOf(qint64 uid)
+{
+    if (m_reactionMailFolder != m_selectedFolder) {
+        m_reactionMailFolder = m_selectedFolder;
+        m_reactionMail = m_store.reactionMailIn(m_selectedFolder);
+    }
+    return m_reactionMail.value(uid);
+}
+
+void MailClient::noteReaction(const QString &folder, qint64 uid, KMime::Message *msg)
+{
+    if (!msg || uid <= 0 || m_acct.local)
+        return;
+    // Not from junk, and not from mail the scorer marked: a reaction is shown
+    // on *another* message, the one it claims to answer, so counting spam
+    // would let a stranger decorate the user's real correspondence.
+    if (isJunkFolderKey(folder) || (!m_draftsFolder.isEmpty() && folder == m_draftsFolder))
+        return;
+    const MimeUtils::Reaction r = reactionCarriedBy(msg);
+    if (!r.valid())
+        return;
+    const int state = m_store.spamStateOf(folder, uid);
+    if (state != MessageListModel::SpamNotScored && state < MessageListModel::SpamExempt
+        && m_store.spamScoreOf(folder, uid) >= SpamHeuristics::spamThreshold()) {
+        m_store.removeReactionsFrom(folder, uid);
+        return;
+    }
+    const auto *from = std::as_const(*msg).from();
+    if (!from || from->mailboxes().isEmpty())
+        return;
+    const KMime::Types::Mailbox who = from->mailboxes().first();
+    const auto *date = std::as_const(*msg).date();
+    m_store.addReaction(r.targetId, QString::fromLatin1(who.address()), who.name(), r.emoji,
+                        date ? date->dateTime().toSecsSinceEpoch()
+                             : QDateTime::currentSecsSinceEpoch(),
+                        folder, uid);
+    if (folder == m_reactionMailFolder)
+        m_reactionMail.insert(uid, r.emoji.join(QString()));
+    ++m_reactionRevision;
+    Q_EMIT reactionsChanged();
+    // The message it answers may be the one on screen.
+    if (m_reading && m_reading->m_hasMessage)
+        fillReactionsFor(m_reading);
+}
+
+QString MailClient::reactBlockedReasonFor(const KMime::Message *msg, const QString &folder,
+                                          bool isReaction)
+{
+    if (!msg)
+        return tr("No message is open.");
+    if (m_acct.local)
+        return tr("This is a local archive — there is nobody to send a reaction to.");
+    if (isJunkFolderKey(folder))
+        return tr("Reactions are not sent to mail in the spam folder.");
+    if (!m_draftsFolder.isEmpty() && folder == m_draftsFolder)
+        return tr("A draft cannot be reacted to.");
+    const auto *mid = msg->messageID();
+    if (!mid || mid->isEmpty())
+        return tr("This message has no Message-ID, so a reaction could not be tied to it.");
+    if (isReaction)
+        return tr("This is itself a reaction — react to the message it answers.");
+    // Gmail's own limits, applied by the sender so the reaction is not sent
+    // only to be shown as a stray one-emoji mail at the other end.
+    if (msg->hasHeader("List-Id") || msg->hasHeader("List-Unsubscribe"))
+        return tr("Reactions are not sent to mailing lists.");
+    if (const auto *prec = msg->headerByType("Precedence")) {
+        const QString p = prec->asUnicodeString().trimmed().toLower();
+        if (p == QLatin1String("bulk") || p == QLatin1String("list")
+            || p == QLatin1String("junk"))
+            return tr("Reactions are not sent to bulk mail.");
+    }
+    QStringList direct;
+    for (const auto *h : {static_cast<const KMime::Headers::Generics::AddressList *>(msg->to()),
+                          static_cast<const KMime::Headers::Generics::AddressList *>(msg->cc())}) {
+        if (!h)
+            continue;
+        const auto boxes = h->mailboxes();
+        for (const auto &mb : boxes)
+            direct.append(SpamHeuristics::normalizeAddress(QString::fromLatin1(mb.address())));
+    }
+    if (direct.size() > 20)
+        return tr("This message has more than 20 recipients — too many for a reaction.");
+    const QStringList own = ownAddresses();
+    bool addressed = false;
+    for (const QString &a : std::as_const(direct))
+        addressed = addressed || own.contains(a);
+    if (const auto *from = msg->from(); !addressed && from) {
+        const auto boxes = from->mailboxes();
+        for (const auto &mb : boxes)
+            addressed = addressed
+                || own.contains(SpamHeuristics::normalizeAddress(
+                       QString::fromLatin1(mb.address())));
+    }
+    if (!addressed)
+        return tr("You are not among this message's To or Cc recipients, so a reaction "
+                  "would not be accepted.");
+    int mine = 0;
+    const auto rows = m_store.reactionsTo(QString::fromLatin1(mid->identifier()));
+    for (const auto &row : rows)
+        mine += own.contains(SpamHeuristics::normalizeAddress(row.sender)) ? 1 : 0;
+    if (mine >= 20)
+        return tr("You have already reacted to this message 20 times.");
+    return {};
+}
+
+void MailClient::fillReactionsFor(MessageContext *ctx)
+{
+    if (!ctx)
+        return;
+    ctx->m_reactions.clear();
+    ctx->m_reactionEmoji.clear();
+    ctx->m_reactionTarget.clear();
+    ctx->m_reactBlocked.clear();
+    KMime::Message *msg = ctx->m_message.get();
+    if (!msg || !ctx->m_hasMessage) {
+        Q_EMIT ctx->reactionsChanged();
+        return;
+    }
+    const QString folder = ctx->m_folder.isEmpty() ? m_selectedFolder : ctx->m_folder;
+
+    // The card: this message is a reaction to another one.
+    const MimeUtils::Reaction own = reactionCarriedBy(msg);
+    if (own.valid() && !isJunkFolderKey(folder)) {
+        ctx->m_reactionEmoji = own.emoji.join(QLatin1Char(' '));
+        ctx->m_reactionTarget = m_store.subjectOfMessageId(own.targetId);
+    }
+
+    // The chips: what others (and the user) answered this message with.
+    if (const auto *mid = std::as_const(*msg).messageID(); mid && !mid->isEmpty()) {
+        const QStringList mineAddrs = ownAddresses();
+        const auto rows = m_store.reactionsTo(QString::fromLatin1(mid->identifier()));
+        QStringList order;
+        QHash<QString, QStringList> who;
+        QSet<QString> mine;
+        for (const auto &row : rows) {
+            if (!who.contains(row.emoji))
+                order.append(row.emoji);
+            const bool isMine =
+                mineAddrs.contains(SpamHeuristics::normalizeAddress(row.sender));
+            if (isMine)
+                mine.insert(row.emoji);
+            who[row.emoji].append(isMine ? tr("You")
+                                  : row.name.isEmpty() ? row.sender : row.name);
+        }
+        for (const QString &emoji : std::as_const(order)) {
+            ctx->m_reactions.append(QVariantMap{
+                {QStringLiteral("emoji"), emoji},
+                {QStringLiteral("count"), who.value(emoji).size()},
+                {QStringLiteral("who"), who.value(emoji).join(QStringLiteral(", "))},
+                {QStringLiteral("mine"), mine.contains(emoji)}});
+        }
+    }
+    ctx->m_reactBlocked = reactBlockedReasonFor(msg, folder, own.valid());
+    Q_EMIT ctx->reactionsChanged();
+}
+
+void MailClient::sendReactionFor(MessageContext *ctx, const QString &emojiIn)
+{
+    const QString emoji = emojiIn.trimmed();
+    if (!ctx || !ctx->m_message || !ctx->m_hasMessage)
+        return;
+    if (!MimeUtils::isSingleEmoji(emoji)) {
+        setStatus(tr("A reaction is a single emoji."));
+        return;
+    }
+    const KMime::Message *msg = ctx->m_message.get();
+    const QString folder = ctx->m_folder.isEmpty() ? m_selectedFolder : ctx->m_folder;
+    const QString blocked =
+        reactBlockedReasonFor(msg, folder, reactionCarriedBy(ctx->m_message.get()).valid());
+    if (!blocked.isEmpty()) {
+        setStatus(blocked);
+        return;
+    }
+    const bool haveCredential = m_acct.authType != 0
+        ? !m_accounts.accessToken().isEmpty()
+        : !m_accounts.password().isEmpty();
+    if (m_acct.user.isEmpty() || !haveCredential || !m_backend
+        || (m_backend->protocol() == MailBackend::Protocol::Imap && m_acct.smtpHost.isEmpty())) {
+        setStatus(tr("Sending is not configured for this account."));
+        return;
+    }
+    const QString targetId = QString::fromLatin1(msg->messageID()->identifier());
+    const QStringList own = ownAddresses();
+    const QString me = ownAddress();
+    for (const auto &row : m_store.reactionsTo(targetId)) {
+        if (row.emoji == emoji && own.contains(SpamHeuristics::normalizeAddress(row.sender))) {
+            setStatus(tr("You already reacted with %1").arg(emoji));
+            return;
+        }
+    }
+
+    // Everyone a reply-all would reach: a reaction is shown to the whole
+    // conversation at the other end, and Gmail only accepts one from somebody
+    // it can see among the recipients.
+    auto addressesOf = [](const auto *h) {
+        QStringList out;
+        if (!h)
+            return out;
+        const auto boxes = h->mailboxes();
+        for (const auto &mb : boxes) {
+            const QString addr = QString::fromLatin1(mb.address());
+            if (addr.contains(QLatin1Char('@')))
+                out.append(addr);
+        }
+        return out;
+    };
+    auto isOwn = [&own](const QString &addr) {
+        return own.contains(SpamHeuristics::normalizeAddress(addr));
+    };
+    const QStringList fromAddrs = addressesOf(msg->from());
+    const bool fromSelf = !fromAddrs.isEmpty() && isOwn(fromAddrs.first());
+    QStringList to = fromSelf ? addressesOf(msg->to()) : addressesOf(msg->replyTo());
+    if (to.isEmpty())
+        to = fromAddrs;
+    to.removeDuplicates();
+    QStringList cc;
+    {
+        QSet<QString> seen;
+        for (const QString &addr : std::as_const(to))
+            seen.insert(addr.toLower());
+        const QStringList others = addressesOf(msg->to()) + addressesOf(msg->cc());
+        for (const QString &addr : others) {
+            if (!seen.contains(addr.toLower()) && !isOwn(addr)) {
+                seen.insert(addr.toLower());
+                cc.append(addr);
+            }
+        }
+    }
+    if (to.isEmpty()) {
+        setStatus(tr("This message names nobody to send a reaction to."));
+        return;
+    }
+
+    const QString subject =
+        MimeUtils::replySubject(msg->subject() ? msg->subject()->asUnicodeString() : QString());
+    const ThreadRef thread = threadRefFor(msg);
+    QStringList toList, ccList, bccList;
+    // Built by the composer's own path for its headers — From, Date, a fresh
+    // Message-ID, the threading pair, address encoding — and then given the
+    // reaction body in place of the placeholder one.
+    auto reply = composeMessage(to.join(QStringLiteral(", ")), cc.join(QStringLiteral(", ")),
+                                QString(), subject, QStringLiteral("<p>%1</p>").arg(emoji), {},
+                                true, &toList, &ccList, &bccList, thread.inReplyTo,
+                                thread.references);
+    if (!reply || toList.isEmpty()) {
+        setStatus(tr("The reaction could not be addressed."));
+        return;
+    }
+    const QString signedAs = m_acct.displayName.isEmpty() ? me : m_acct.displayName;
+    MailStore::OutboxMessage row;
+    row.wire = MimeUtils::reactionWire(reply->head(), emoji,
+                                       tr("%1 reacted via Mailove").arg(signedAs));
+    if (row.wire.isEmpty()) {
+        setStatus(tr("The reaction could not be built."));
+        return;
+    }
+    row.envelope = toList + ccList;
+    row.sender = me;
+    row.subject = emoji + QLatin1Char(' ') + subject;
+    // Never signed or encrypted: both wrap the body in a part of their own,
+    // and a reaction part that is not at the top of the message is, by both
+    // conventions, not a reaction. Gating Edit the way an attachment does —
+    // the composer would rebuild it as an ordinary one-emoji mail.
+    row.hasAttachments = true;
+    // The undo hold applies exactly as it does to a message: a reaction is
+    // one key press, which is the easiest thing in the client to do by
+    // accident.
+    if (m_undoSend) {
+        row.nextTry = QDateTime::currentSecsSinceEpoch()
+            + qMax(1, AdvancedConfig::i("compose/undoSendDelaySecs"));
+    }
+    const qint64 id = m_store.enqueueOutbox(row);
+    if (id == 0) {
+        setStatus(tr("The reaction could not be queued for sending."));
+        return;
+    }
+    // Shown at once on the message it answers; the Sent copy, when its body
+    // is seen, lands on the same row.
+    m_store.addReaction(targetId, me, m_acct.displayName, {emoji},
+                        QDateTime::currentSecsSinceEpoch(), QString(), 0);
+    ++m_reactionRevision;
+    Q_EMIT reactionsChanged();
+    fillReactionsFor(ctx);
+    if (ctx != m_reading && m_reading && m_reading->m_hasMessage)
+        fillReactionsFor(m_reading);
+
+    refreshOutboxCount();
+    setUndoableSend(m_undoSend ? id : 0, m_undoSend ? row.nextTry : 0);
+    if (m_undoSend) {
+        armOutboxTimer();
+    } else if (connected()) {
+        setStatus(tr("Reacted with %1").arg(emoji));
+        drainOutbox();
+    } else {
+        setStatus(tr("Reaction queued — will be sent when the connection is back"));
+        armOutboxTimer();
+    }
 }
 
 void MailClient::refineAttachKind(const QString &folder, qint64 uid, KMime::Message *msg)
@@ -8524,12 +8985,16 @@ QVariantMap MailClient::outboxEditData(qint64 id)
             body = textPart->decodedText().toHtmlEscaped().replace(
                 QLatin1Char('\n'), QLatin1String("<br>"));
     }
+    QVariantMap thread;
+    threadHeadersOf(msg.get(), &thread);
     return {{QStringLiteral("id"), row.id},
             {QStringLiteral("to"), addressesOf(msg->to()).join(QStringLiteral(", "))},
             {QStringLiteral("cc"), addressesOf(msg->cc()).join(QStringLiteral(", "))},
             {QStringLiteral("bcc"), bcc.join(QStringLiteral(", "))},
             {QStringLiteral("subject"),
              msg->subject() ? msg->subject()->asUnicodeString() : QString()},
+            {QStringLiteral("inReplyTo"), thread.value(QStringLiteral("inReplyTo"))},
+            {QStringLiteral("references"), thread.value(QStringLiteral("references"))},
             {QStringLiteral("body"), body}};
 }
 
@@ -9138,6 +9603,7 @@ void MailClient::fetchMessage(int row)
         m_verifier->setPresentingFromCache(false);
         refineAttachKind(m_selectedFolder, uid, msg.get());
         rescoreWithBody(m_selectedFolder, uid, msg.get());
+        noteReaction(m_selectedFolder, uid, msg.get());
         // By uid, not by the row captured with the click: the re-score above
         // may have filed this message into Junk and closed the gap in the
         // list, and marking "row" read would then mark its neighbour.
@@ -9242,6 +9708,7 @@ void MailClient::requestMessageBody(int row, qint64 uid, const QString &remoteId
             m_store.storeBody(m_selectedFolder, uid, m_reading->m_raw, indexText);
             refineAttachKind(m_selectedFolder, uid, message.get());
             rescoreWithBody(m_selectedFolder, uid, message.get());
+            noteReaction(m_selectedFolder, uid, message.get());
             setStatus({});
             // The row-based side effects want the row this uid sits on NOW.
             const int liveRow = m_messageModel.rowForUid(uid);
@@ -9317,6 +9784,14 @@ void MailClient::requestMessageBody(int row, qint64 uid, const QString &remoteId
             setStatus(tr("Message load failed"));
             if (error != MailBackend::Error::None && !message.isEmpty())
                 Q_EMIT errorOccurred(message);
+            // Asked twice, refused neither time, and nothing came: the likely
+            // reason is that the message is not in this folder any more —
+            // deleted or filed from another device, which IMAP never reports.
+            // One header question settles it, and removes the row if so,
+            // rather than leaving a message that fails the same way on every
+            // click.
+            if (error == MailBackend::Error::None)
+                verifyUnreadIds(m_selectedFolder, {remoteId}, true);
         },
         /*interactive=*/true);
 }
@@ -9543,6 +10018,7 @@ void MailClient::storeFetchedBody(const QString &folder, qint64 uid,
         // message too big to cache is not a message too big to judge.
         rescoreWithBody(folder, uid, msg);
         noteBodyStored(folder);
+        noteReaction(folder, uid, msg);
         return;
     }
     m_jobs->queueBodyWrite({m_store.scopedKey(folder), uid, raw, indexTextFor(msg)});
@@ -9550,6 +10026,7 @@ void MailClient::storeFetchedBody(const QString &folder, qint64 uid,
     refineAttachKind(folder, uid, msg);
     refineCrypto(folder, uid, msg);
     rescoreWithBody(folder, uid, msg);
+    noteReaction(folder, uid, msg);
     if (!m_sentFolder.isEmpty() && folder == m_sentFolder)
         harvestRecipients(msg, folder, uid);
 }
@@ -9717,6 +10194,7 @@ void MailClient::presentMessage(const std::shared_ptr<KMime::Message> &message)
     ctx->m_authInfo = authInfo;
     ctx->m_bodyUrl = bodyUrl;
     ctx->m_hasMessage = true;
+    fillReactionsFor(ctx);
     Q_EMIT ctx->messageChanged();
     Q_EMIT ctx->cryptoChanged();
     Q_EMIT messageLoaded(subject, from, to, cc, date, bodyUrl, authInfo);
@@ -9763,6 +10241,10 @@ MessageContext *MailClient::detachReading()
     ctx->m_date = src->m_date;
     ctx->m_authInfo = src->m_authInfo;
     ctx->m_hasMessage = src->m_hasMessage;
+    ctx->m_reactions = src->m_reactions;
+    ctx->m_reactionEmoji = src->m_reactionEmoji;
+    ctx->m_reactionTarget = src->m_reactionTarget;
+    ctx->m_reactBlocked = src->m_reactBlocked;
     // Whatever we already know about the signature, so the window opens with
     // the badge the reading pane was showing rather than a blank space.
     ctx->m_dkimStatus = src->m_dkimStatus;

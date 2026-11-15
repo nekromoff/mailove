@@ -50,6 +50,30 @@ ColumnLayout {
     property int findCurrent: 0
 
     /// Reply / Reply all was clicked for the shown message.
+    /// Single-letter shortcuts (React) are live. The main window clears this
+    /// while a text field has focus; a message tab has none to type into.
+    property bool letterShortcutsLive: true
+    /// The quick reactions offered by the picker, in the order of keys 1–6.
+    readonly property var quickReactions: ["👍", "❤️", "😂", "🎉", "🙏", "😮"]
+    readonly property string reactKey: viewer.ui ? viewer.ui.shortcutReact : "E"
+    readonly property string reactBlocked:
+        viewer.context && viewer.hasMessage ? viewer.context.reactBlockedReason : ""
+    /// Opens the emoji picker, or says why this message takes no reaction.
+    function openReactPicker() {
+        if (!viewer.hasMessage)
+            return
+        if (viewer.reactBlocked !== "") {
+            reactWhy.show(viewer.reactBlocked, 4000)
+            return
+        }
+        reactPopup.open()
+    }
+    function react(emoji) {
+        reactPopup.close()
+        if (viewer.context && viewer.hasMessage)
+            viewer.context.sendReaction(emoji)
+    }
+
     signal replyRequested(bool replyAll)
     /// Forward was clicked for the shown message.
     signal forwardRequested()
@@ -245,6 +269,12 @@ ColumnLayout {
         sequences: [viewer.ui ? viewer.ui.shortcutFind : "Ctrl+F"]
         enabled: viewer.shortcutsActive && viewer.hasMessage
         onActivated: viewer.openFind()
+    }
+    Shortcut {
+        sequences: [viewer.reactKey]
+        enabled: viewer.reactKey !== "" && viewer.shortcutsActive && viewer.hasMessage
+                 && viewer.letterShortcutsLive && !viewer.findActive && !reactPopup.opened
+        onActivated: viewer.openReactPicker()
     }
     Shortcut {
         sequences: [viewer.ui ? viewer.ui.shortcutSource : "Ctrl+U"]
@@ -549,6 +579,180 @@ ColumnLayout {
                     }
                 }
 
+            }
+            // An emoji answer (RFC 9078, and Gmail's reaction format in the
+            // same message). Sits with Reply and Forward because that is what
+            // it is: the shortest reply there is. Never disabled outright — a
+            // greyed button explains nothing — it dims, and a click or the
+            // shortcut says why this message takes no reaction.
+            QQC2.ToolButton {
+                id: reactButton
+                // Drawn by hand rather than through `text`: the face in front
+                // of the caption gives way to the reactions this message has —
+                // what others (or the reader) answered it with, or, when the
+                // message is itself a reaction, what it says. Several are
+                // fanned out over one another, so the button grows by a
+                // sliver per reaction instead of by a whole emoji.
+                readonly property var reactedList: {
+                    if (!viewer.hasMessage || !viewer.context)
+                        return []
+                    if (viewer.context.reactionEmoji !== "")
+                        return [viewer.context.reactionEmoji]
+                    const r = viewer.context.reactions
+                    let out = []
+                    for (let i = 0; i < r.length && out.length < 5; ++i)
+                        out.push(r[i].emoji)
+                    return out
+                }
+                readonly property bool reacted: reactedList.length > 0
+                readonly property string reactedWho: {
+                    if (!reacted)
+                        return ""
+                    if (viewer.context.reactionEmoji !== "") {
+                        const t = viewer.context.reactionTarget
+                        return viewer.context.reactionEmoji + "  "
+                            + (t !== "" ? "Reaction to “" + viewer.shown(t) + "”"
+                                        : "Reaction to an earlier message")
+                    }
+                    const r = viewer.context.reactions
+                    let out = []
+                    for (let i = 0; i < r.length; ++i)
+                        out.push(r[i].emoji + "  " + viewer.shown(r[i].who))
+                    return out.join("\n")
+                }
+                // A reaction mail takes no reaction of its own, but what it
+                // says must not be dimmed along with the refusal.
+                opacity: reacted || viewer.reactBlocked === "" ? 1 : 0.5
+                Accessible.name: "React"
+                Layout.preferredWidth: reactFace.implicitWidth + 2 * Kirigami.Units.largeSpacing
+                // No `text`, so the style would size it as an empty button.
+                Layout.preferredHeight: forwardButton.implicitHeight
+                QQC2.Label { id: reactFontProbe; visible: false; text: "React" }
+                Row {
+                    id: reactFace
+                    anchors.centerIn: parent
+                    spacing: Kirigami.Units.smallSpacing
+                    Item {
+                        id: reactStack
+                        readonly property var shown:
+                            reactButton.reacted ? reactButton.reactedList : ["☺"]
+                        readonly property real step: reactFontProbe.implicitHeight * 0.55
+                        anchors.verticalCenter: parent.verticalCenter
+                        implicitHeight: reactFontProbe.implicitHeight
+                        implicitWidth: reactFontProbe.implicitHeight * 1.1
+                                       + (shown.length - 1) * step
+                        width: implicitWidth
+                        height: implicitHeight
+                        Repeater {
+                            model: reactStack.shown
+                            QQC2.Label {
+                                required property string modelData
+                                required property int index
+                                x: index * reactStack.step
+                                // The first reaction lies on top.
+                                z: reactStack.shown.length - index
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: modelData
+                            }
+                        }
+                    }
+                    QQC2.Label {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "React"
+                        font.pixelSize: reactFontProbe.fontInfo.pixelSize
+                                        - (reactButton.reacted ? 2 : 0)
+                    }
+                }
+                onClicked: viewer.openReactPicker()
+                QQC2.ToolTip.text: {
+                    const why = viewer.reactBlocked !== ""
+                        ? viewer.reactBlocked
+                        : "React with an emoji"
+                          + (viewer.reactKey !== "" ? " (" + viewer.reactKey + ")" : "")
+                    return reactedWho !== "" ? reactedWho + "\n" + why : why
+                }
+                QQC2.ToolTip.visible: hovered && !reactPopup.opened && !reactWhy.visible
+                // Its own instance: the answer to a click or the shortcut,
+                // which has to show without the pointer being over the button.
+                QQC2.ToolTip { id: reactWhy }
+
+                QQC2.Popup {
+                    id: reactPopup
+                    y: reactButton.height
+                    padding: Kirigami.Units.smallSpacing
+                    // Kept inside the window: the button sits near the right
+                    // edge, and a popup opened under it would otherwise run
+                    // off screen. With margins set, it slides left instead and
+                    // leaves this much room to the edge.
+                    margins: Kirigami.Units.largeSpacing
+                    focus: true
+                    onOpened: {
+                        otherEmoji.text = ""
+                        quickRow.children[0].forceActiveFocus()
+                    }
+                    // A column, not a row: under a button near the window's
+                    // right edge a row has nowhere to go.
+                    contentItem: ColumnLayout {
+                        spacing: Kirigami.Units.smallSpacing
+                        // 1–6 pick straight away, wherever focus is inside the
+                        // popup — except in the free field, where a digit is
+                        // something the reader may be typing as a keycap.
+                        Keys.onPressed: event => {
+                            const n = event.key - Qt.Key_1
+                            if (!otherEmoji.activeFocus && n >= 0
+                                && n < viewer.quickReactions.length) {
+                                viewer.react(viewer.quickReactions[n])
+                                event.accepted = true
+                            }
+                        }
+                        Column {
+                            id: quickRow
+                            Layout.alignment: Qt.AlignHCenter
+                            spacing: 0
+                            Repeater {
+                                model: viewer.quickReactions
+                                QQC2.ToolButton {
+                                    required property string modelData
+                                    required property int index
+                                    text: modelData
+                                    font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.5
+                                    activeFocusOnTab: true
+                                    onClicked: viewer.react(modelData)
+                                    Keys.onReturnPressed: viewer.react(modelData)
+                                    Keys.onEnterPressed: viewer.react(modelData)
+                                    Keys.onUpPressed: {
+                                        if (index > 0)
+                                            quickRow.children[index - 1].forceActiveFocus()
+                                    }
+                                    Keys.onDownPressed: {
+                                        if (index < viewer.quickReactions.length - 1)
+                                            quickRow.children[index + 1].forceActiveFocus()
+                                        else
+                                            otherEmoji.forceActiveFocus()
+                                    }
+                                    QQC2.ToolTip.text: String(index + 1)
+                                    QQC2.ToolTip.visible: hovered
+                                }
+                            }
+                        }
+                        QQC2.TextField {
+                            id: otherEmoji
+                            Layout.preferredWidth: Kirigami.Units.gridUnit * 2.5
+                            // No placeholder: none fits a box this narrow.
+                            Accessible.name: "Other emoji"
+                            QQC2.ToolTip.text: "Type or paste any other emoji, then Enter"
+                            QQC2.ToolTip.visible: hovered
+                            Keys.onUpPressed:
+                                quickRow.children[viewer.quickReactions.length - 1]
+                                    .forceActiveFocus()
+                            maximumLength: 20
+                            onAccepted: {
+                                if (text.trim().length > 0)
+                                    viewer.react(text.trim())
+                            }
+                        }
+                    }
+                }
             }
             QQC2.ToolButton {
                 icon.name: "image-x-generic"

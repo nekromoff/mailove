@@ -1,3 +1,35 @@
+mailove (3.9.0) unstable; urgency=medium
+
+  * Emoji reactions. React (default shortcut E, or the message menu)
+    answers the open message with one emoji, to everyone a reply-all
+    would reach. The message carries both RFC 9078's reaction part and
+    Gmail's JSON part, plus an HTML fallback for clients that know
+    neither. Never signed or encrypted; the undo-send hold applies.
+  * Incoming reactions in either format are recorded per Message-ID and
+    shown on the message they answer: the React button fans out the
+    emoji, the tooltip lists who sent what. A reaction mail shows its
+    emoji ahead of its subject in the list. Reactions from junk or from
+    mail scored as spam are not counted.
+  * Outlook's "reacted to your message" notifications show the reaction
+    as an emoji instead of a blocked remote image; nothing is fetched.
+  * Replies now carry In-Reply-To and References, and keep them across a
+    draft save and reopen. Before, every reply started a new thread in
+    clients that thread by header.
+  * Ghost unread messages are removed. A cached row the server no longer
+    answers for (deleted or moved from another device, e.g. Gmail moving
+    to Spam/Trash) is asked about twice, then dropped from the cache and
+    the unread badge. A body that fails to load twice triggers the same
+    check.
+  * Spam: mail from your own address with no Received header at all
+    (written to yourself in Gmail's web interface, or APPENDed) is no
+    longer scored as a forgery of yourself.
+  * AppImage: bundles NSS's runtime modules (softokn3, freebl, nssdbm3)
+    so NSS stays one version. On hosts with a newer NSS (Fedora,
+    openSUSE) the AppImage aborted at startup with "NSSUTIL_3.108 not
+    found".
+
+ -- dusoft <dusoft@staznosti.sk>  Sun, 15 Nov 2026 12:15:00 +0100
+
 mailove (3.8.2) unstable; urgency=medium
 
   * Search over cached mail no longer waits for header fetching. The

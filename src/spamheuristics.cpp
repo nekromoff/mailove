@@ -1431,6 +1431,32 @@ Score score(const Message &msg, const Context &ctx)
         return out;
     }
 
+    // The other way mail from the user's own address gets into their mailbox
+    // without a verdict: it never crossed a mail server at all. A message
+    // written to oneself in Gmail's web interface is not delivered — it is
+    // one stored message wearing both the Sent and the Inbox label — so it
+    // carries no Received line and no Authentication-Results, and "nothing
+    // vouches for it" was scored as a forgery of the user by the user.
+    //
+    // The absence is not something a forger can arrange. Whatever a sender
+    // strips or invents, the user's own server stamps a Received line on
+    // every message it accepts over SMTP (RFC 5321 §4.4 makes that a MUST),
+    // and that line is added after the sender's last say. A header block in
+    // this mailbox with none can only have been put there through a login
+    // to the mailbox — the web interface, or an IMAP APPEND. Both backends
+    // fetch the complete header block, so "none" is the server's answer and
+    // not an artefact of what was asked for.
+    if (fromIsOwn && !authFailed && !ctx.alwaysScore && !ctx.inJunkFolder
+        && countFields(fields, QLatin1String("received")) == 0) {
+        out.exempt = true;
+        out.verdict = Verdict::Ham;
+        out.exemptReason =
+            QStringLiteral("Sent from your own address %1 and never passed through a mail "
+                           "server — it was placed in this mailbox through your own login.")
+                .arg(fromAddr);
+        return out;
+    }
+
     // ------------------------------------------------------------------
     // The user's own junk folder, by content: the same text they already
     // threw away, arriving again under a fresh envelope. Sender rules miss

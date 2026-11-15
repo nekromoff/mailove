@@ -154,6 +154,58 @@ int main(int argc, char *argv[])
         failures.append(QStringLiteral("body text was rewritten: %1")
                             .arg(sanitizeMessageHtml(prose)));
 
+    // Outlook's reaction pictures: the known ones become an emoji with no
+    // remote reference left, everything else is returned untouched.
+    struct Swap {
+        const char *what;
+        QString in;
+        QString mustContain;    ///< empty = output must equal input
+    };
+    const QList<Swap> swaps = {
+        {"reaction: like.png",
+         QStringLiteral("<p><img width=\"16\" height=\"16\" alt=\"\" "
+                        "src=\"https://outlook-1.cdn.office.net/assets/reaction/like.png\"> x</p>"),
+         QStringLiteral("\U0001F44D")},
+        {"reaction: heart, single quotes, upper case",
+         QStringLiteral("<IMG SRC='https://outlook-2.cdn.office.net/assets/reaction/heart.png'>"),
+         QStringLiteral("\u2764")},
+        {"reaction: unknown name left alone",
+         QStringLiteral("<img src=\"https://outlook-1.cdn.office.net/assets/reaction/zzz.png\">"),
+         QString()},
+        {"reaction: other host left alone",
+         QStringLiteral("<img src=\"https://evil.example/assets/reaction/like.png\">"),
+         QString()},
+        {"reaction: lookalike host left alone",
+         QStringLiteral("<img src=\"https://cdn.office.net.evil.example/assets/reaction/like.png\">"),
+         QString()},
+        {"reaction: prose mention left alone",
+         QStringLiteral("<p>see /assets/reaction/like.png</p>"), QString()},
+    };
+    for (const auto &s : swaps) {
+        const QString out = replaceReactionImages(s.in);
+        const bool ok = s.mustContain.isEmpty()
+            ? out == s.in
+            : out.contains(s.mustContain) && !out.contains(QLatin1String("office.net"))
+                  && !out.contains(QLatin1String("<img"), Qt::CaseInsensitive);
+        if (!ok)
+            failures.append(QStringLiteral("%1\n      out: %2").arg(QLatin1String(s.what), out));
+        LOG("%-46s %s", s.what, ok ? "ok" : "FAIL");
+    }
+
+    {
+        const QStringList e = reactionImageEmoji(QStringLiteral(
+            "<p><img src=\"https://outlook-1.cdn.office.net/assets/reaction/like.png\">"
+            "<img src=\"https://outlook-1.cdn.office.net/assets/reaction/like.png\">"
+            "<img src=\"https://outlook-1.cdn.office.net/assets/reaction/heart.png\"></p>"));
+        const bool ok = e.size() == 2 && e.first() == QStringLiteral("\U0001F44D")
+            && reactionImageEmoji(QStringLiteral("<p>plain</p>")).isEmpty()
+            && reactionImageEmoji(QStringLiteral(
+                   "<img src=\"https://evil.example/assets/reaction/like.png\">")).isEmpty();
+        if (!ok)
+            failures.append(QStringLiteral("reactionImageEmoji: %1").arg(e.join(QLatin1Char(' '))));
+        LOG("%-46s %s", "reaction: emoji named by the pictures", ok ? "ok" : "FAIL");
+    }
+
     LOG("%s", "");
     if (!failures.isEmpty()) {
         for (const QString &f : failures)

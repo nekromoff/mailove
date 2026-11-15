@@ -510,7 +510,9 @@ void MessagePresenter::applyBodyParts(MessageContext *ctx, KMime::Message *root,
             textPart = root->textContent();
     }
 
-    ctx->m_htmlBody = htmlPart ? htmlPart->decodedText() : QString();
+    // Outlook's reaction pictures become the emoji they stand for right here,
+    // so the view, the composer's quote and the text fallback all agree.
+    ctx->m_htmlBody = htmlPart ? replaceReactionImages(htmlPart->decodedText()) : QString();
     ctx->m_textBody = textPart ? textPart->decodedText() : QString();
 
     // A meeting invitation: the text and HTML alternatives Outlook sends are
